@@ -2,6 +2,7 @@
 #include "strata/core/batch_rows.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/expert_source.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
@@ -2240,6 +2241,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
+        g_pool_weights = (remote_opt_ || always_publish_) ? h_w_ + (size_t) tb * ss.k : nullptr;   // STRATA_EXPERT_SKIP
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -2911,6 +2913,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         // The recorded graph consumes the helper mask and weighted sum just as
         // the solo graph does. Reset both and supply this layer's routing weights.
         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
+        g_pool_weights = (remote_opt_ || always_publish_) ? h_w_ + 0 : nullptr;   // STRATA_EXPERT_SKIP
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
         if (remote_opt_) remote_opt_->end();
         progress_tick();
@@ -3066,6 +3069,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         cur_layer_ = want - 1;
         set_plan_slot(0);
         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
+        g_pool_weights = (remote_opt_ || always_publish_) ? h_w_ + 0 : nullptr;   // STRATA_EXPERT_SKIP
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
         if (remote_opt_) remote_opt_->end();
         progress_tick();
@@ -3344,6 +3348,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window (pipelined): the CPU experts of layer", l);
+        g_pool_weights = (remote_opt_ || always_publish_) ? h_w_ + (size_t) tb * ss.k : nullptr;   // STRATA_EXPERT_SKIP
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);

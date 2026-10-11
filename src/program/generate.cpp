@@ -246,6 +246,114 @@ bool refill_blocking() {
     return v;
 }
 
+// STRATA_REFILL_BATCH=N (opt-in, low-RAM work): a prompt's lent slots are refilled N experts at a time - the batch read by
+// STRATA_REFILL_THREADS (default 8) threads into one of two pinned staging buffers, its copies queued while the next
+// batch reads.  The per-expert loop read one blob at a time from the mapping, so with the experts on an SSD one read was
+// in flight.  The same bytes land in the same slots.
+int refill_batch() {
+    static const int v = [] { const char* e = std::getenv("STRATA_REFILL_BATCH"); return e ? std::max(0, std::atoi(e)) : 0; }();
+    return v;
+}
+bool refill_batched(strata::core::ExpertSource& src, strata::core::ExpertCache& cache,
+                    const std::vector<std::pair<int32_t, int32_t>>& lent, int64_t n_expert, std::string& err) {
+    static const int threads = [] {
+        const char* e = std::getenv("STRATA_REFILL_THREADS");
+        return e ? std::max(1, std::atoi(e)) : 8;
+    }();
+    const size_t B = (size_t) refill_batch();
+    size_t maxb = 0;
+    for (const auto& pr : lent)
+        maxb = std::max(maxb, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first / n_expert));
+    maxb = (maxb + 4095) / 4096 * 4096;
+    uint8_t* stage[2] = {nullptr, nullptr};
+    for (auto& st : stage)
+        if (cudaMallocHost((void**) &st, B * maxb) != cudaSuccess) {
+            cudaGetLastError();
+            for (auto& x : stage) if (x != nullptr) cudaFreeHost(x);
+            err = "refill: cannot pin the staging buffers";
+            return false;
+        }
+    bool ok = true;
+    // the reading threads live for the whole refill: an unbuffered read keeps an aligned buffer and an AIO context per
+    // thread, which threads started per batch set up and tore down again every 64 experts
+    std::mutex mu;
+    std::condition_variable go_cv, done_cv;
+    uint64_t go = 0;
+    int done = 0;
+    bool quit = false;
+    size_t cur_at = 0, cur_n = 0, cur_k = 0;
+    std::atomic<size_t> next{0};
+    std::atomic<bool> good{true};
+    auto work = [&] {
+        constexpr size_t R = 8;   // a run per call: copy_blobs reads it as one batch (unbuffered: one io_submit)
+        int32_t rl[R], re[R];
+        uint8_t* rd[R];
+        for (size_t j0; (j0 = next.fetch_add(R)) < cur_n;) {
+            const size_t m = std::min(R, cur_n - j0);
+            for (size_t q = 0; q < m; ++q) {
+                const auto& pr = lent[cur_at + j0 + q];
+                rl[q] = (int32_t) (pr.first / n_expert);
+                re[q] = (int32_t) (pr.first % n_expert);
+                rd[q] = stage[cur_k] + (j0 + q) * maxb;
+            }
+            if (!src.copy_blobs(rl, re, rd, m)) good = false;
+        }
+    };
+    std::vector<std::thread> ts;
+    for (int t = 1; t < threads; ++t)
+        ts.emplace_back([&] {
+            for (uint64_t seen = 0;;) {
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    go_cv.wait(lk, [&] { return quit || go != seen; });
+                    if (quit) return;
+                    seen = go;
+                }
+                work();
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    ++done;
+                }
+                done_cv.notify_one();
+            }
+        });
+    for (size_t at = 0, k = 0; ok && at < lent.size(); at += B, k ^= 1) {
+        const size_t n = std::min(B, lent.size() - at);
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            cur_at = at;
+            cur_n = n;
+            cur_k = k;
+            next.store(0);
+            done = 0;
+            ++go;
+        }
+        go_cv.notify_all();
+        work();
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            done_cv.wait(lk, [&] { return done == (int) ts.size(); });
+        }
+        if (!good) { err = "refill: reading a lent expert failed"; ok = false; break; }
+        // the previous batch's copies (out of the other buffer) land before that buffer is read into again
+        if (!cache.sync_queued(err)) { ok = false; break; }
+        for (size_t j = 0; ok && j < n; ++j) {
+            const auto& pr = lent[at + j];
+            const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first / n_expert);
+            if (!cache.fill_slot_queued(pr.second, stage[k] + j * maxb, err, nb)) ok = false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        quit = true;
+    }
+    go_cv.notify_all();
+    for (auto& t : ts) t.join();
+    if (ok && !cache.sync_queued(err)) ok = false;
+    for (auto& st : stage) cudaFreeHost(st);
+    return ok;
+}
+
 using Clock = std::chrono::steady_clock;
 
 // --pipeline-windows: every STRATA_PIPELINE_* test and tuning variable (THETA, FORCE_MISS, SWITCH, LOG, TRACE, DOOM_SKIP,
@@ -4696,6 +4804,31 @@ int main(int argc, char** argv) {
         } else if (const char* sv = std::getenv("STRATA_IO_STATS"); sv != nullptr && std::atoi(sv) != 0) {
             src.set_io_stats(true);
         }
+        // STRATA_PROMPT_DIRECT=1: the prompt's expert copies and the refill read straight from the drive, the rest
+        // as above (under a tight RAM cap the cached reads, not the drives, set the prompt's rate)
+        bool prompt_direct = false;
+        if (const char* pv = std::getenv("STRATA_PROMPT_DIRECT"); pv != nullptr && std::atoi(pv) != 0 && !src.unbuffered()) {
+            std::string why;
+            prompt_direct = src.open_prompt_direct(why);
+            std::fprintf(stderr, "strata generate: prompt reads %s (STRATA_PROMPT_DIRECT=1: %s)\n",
+                         prompt_direct ? "unbuffered" : "through the file cache", why.c_str());
+        }
+        // STRATA_DECODE_DIRECT=1: the decode's blob reads straight from the drive(s) as well (they land in stage buffers,
+        // never in the file cache's pages); STRATA_STAGE_KEEP=N keeps the last N of them in RAM instead
+        if (const char* dv = std::getenv("STRATA_DECODE_DIRECT"); dv != nullptr && std::atoi(dv) != 0 && !src.unbuffered()) {
+            std::string why;
+            if (!prompt_direct) prompt_direct = src.open_prompt_direct(why);
+            src.set_decode_direct(prompt_direct);
+            std::fprintf(stderr, "strata generate: decode reads %s (STRATA_DECODE_DIRECT=1%s%s)\n",
+                         src.decode_direct() ? "unbuffered" : "as before", why.empty() ? "" : ": ", why.c_str());
+        }
+        if (const char* kv = std::getenv("STRATA_STAGE_KEEP"); kv != nullptr && std::atoll(kv) > 0) {
+            src.set_stage_keep((size_t) std::atoll(kv));
+            std::fprintf(stderr, "strata generate: the stage pool keeps up to %lld blobs (STRATA_STAGE_KEEP)\n", std::atoll(kv));
+        }
+        if (src.mirrored() && !prompt_direct && !src.unbuffered())
+            std::fprintf(stderr, "strata generate: note: STRATA_EXPERT_MIRROR serves only the direct reads "
+                                 "(STRATA_PROMPT_DIRECT=1, or an unbuffered file tier); none run here\n");
         srcp = &src;
     } else {
         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
@@ -7535,6 +7668,8 @@ int main(int argc, char** argv) {
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
         }
         ver.set_remote_expert_opt(remote_opt.get());
+        if (const char* sk = std::getenv("STRATA_EXPERT_SKIP"); sk != nullptr && std::atof(sk) > 0.0)
+            ver.set_always_publish(true);   // the routing weights reach the host (STRATA_EXPERT_SKIP reads them)
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
@@ -10714,6 +10849,11 @@ int main(int argc, char** argv) {
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
+                if (refill_batch() > 0) {   // STRATA_REFILL_BATCH: batched, parallel reads (see refill_batched)
+                    if (!refill_batched(*srcp, *p.cache, p.lent, g.n_expert, e)) return false;
+                    for (const auto& [i, slot] : p.lent) host_res[(size_t) i] = slot;
+                    return true;
+                }
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
@@ -12492,7 +12632,14 @@ int main(int argc, char** argv) {
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
-            for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+            if (refill_batch() > 0) {   // STRATA_REFILL_BATCH: batched, parallel reads (see refill_batched)
+                if (!refill_batched(*srcp, xcache, lent, g.n_expert, err)) {
+                    std::fprintf(stderr, "strata generate: refilling the lent slots failed: %s\n", err.c_str());
+                    return 1;
+                }
+                for (const auto& [i, slot] : lent) host_res[(size_t) i] = slot;
+            }
+            else for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
                 const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                 if (b == nullptr || !(refill_blocking() ? xcache.fill_slot_blocking(slot, b, err, nb)
@@ -12798,6 +12945,8 @@ int main(int argc, char** argv) {
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
+        if (const char* sk = std::getenv("STRATA_EXPERT_SKIP"); sk != nullptr && std::atof(sk) > 0.0)
+            ver.set_always_publish(true);   // the routing weights reach the host (STRATA_EXPERT_SKIP reads them)
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -13229,6 +13378,17 @@ int main(int argc, char** argv) {
                             (unsigned long long) ic.pf_dropped, (double) ic.pread_bytes / 1e6,
                             (unsigned long long) ic.pread_n, ic.pread_n > 0 ? (double) ic.pread_us / 1e3 / (double) ic.pread_n : 0.0,
                             rounds > 0 ? (double) ic.crit_us / 1e3 / rounds : 0.0);
+                if (rounds > 0)
+                    std::printf("%-24s per round: %.1f staged already, %.1f being read ahead (layers waited %.2f ms), %.1f read on "
+                                "the spot in %.1f layer calls (%.2f ms)\n", "hand-out",
+                                (double) ic.hand_hit / rounds, (double) ic.hand_late / rounds, (double) ic.hand_late_us / 1e3 / rounds,
+                                (double) ic.hand_now / rounds, (double) ic.hand_now_calls / rounds, (double) ic.hand_now_us / 1e3 / rounds);
+                if (rounds > 0 && ic.rd_n > 0)
+                    std::printf("%-24s %.1f blobs per round: drive %.3f ms, bounce copy %.3f ms each (thread time)\n", "direct reads",
+                                (double) ic.rd_n / rounds, (double) ic.rd_io_us / 1e3 / (double) ic.rd_n, (double) ic.rd_copy_us / 1e3 / (double) ic.rd_n);
+                if (rounds > 0 && drive.d.skipped > 0)
+                    std::printf("%-24s %.1f entries per round left out (STRATA_EXPERT_SKIP)\n", "expert skip",
+                                (double) drive.d.skipped / rounds);
             }
             if (drive.d.lookahead != nullptr)
                 std::printf("%-24s %lld experts warmed, %lld of the file tier's %lld blob reads had been warmed (%.1f%%); "

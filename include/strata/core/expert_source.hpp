@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -174,6 +175,11 @@ public:
     /// pointers are never recycled ignores it.  (#1237: a page-locked stage buffer is read by the DMA after the copy call
     /// returned, where a pageable one is staged by the driver before it returns.)
     virtual void note_async_read(const uint8_t* blob, void* stream) { (void) blob; (void) stream; }
+    /// `blob`, but nullptr instead of waiting when the blob is still being read (STRATA_POOL_EARLY: the pool computes
+    /// what is here first).  Defaults to `blob`.
+    virtual const uint8_t* blob_if_ready(int64_t layer, int64_t expert) { return blob(layer, expert); }
+    /// STRATA_EXPERT_SKIP: whether the blob is in RAM already or on its way (no new read needed).  Defaults to true.
+    virtual bool has_blob(int64_t layer, int64_t expert) { (void) layer; (void) expert; return true; }
 
     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
     virtual int64_t reads() const { return 0; }
@@ -335,6 +341,10 @@ struct GpuPlanSink {
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ForesightSwap;
 
+/// STRATA_EXPERT_SKIP: the routing weights of the window the verifier is serving (its mapped host copy, published
+/// with Verifier::set_always_publish), set around each pool call; nullptr when not published.
+extern thread_local const float* g_pool_weights;
+
 struct ExpertDispatch {
     ForesightSwap* fs = nullptr;   ///< Foresight swap space (STRATA_FS_SLOTS; null = off)
     strata::kernels::cpu::ExpertPool* pool = nullptr;
@@ -367,6 +377,7 @@ struct ExpertDispatch {
     int64_t cache_hits = 0;      ///< lookups already resident
     int64_t cache_admitted = 0;  ///< lookups that took a slot
     int64_t cache_refused = 0;   ///< lookups with no slot free (the cache is full)
+    int64_t skipped = 0;         ///< STRATA_EXPERT_SKIP: entries left out (their expert in no tier, light)
     void* cache_stream = nullptr;
     const char* cache_fail = nullptr;
 
@@ -656,6 +667,22 @@ public:
     /// expert bytes outside it; switches either way (startup only, nothing reading).  Returns whether unbuffered.
     bool recheck_unbuffered(std::string& why);
     bool unbuffered() const { return !direct_.empty(); }
+    /// STRATA_PROMPT_DIRECT=1 (Linux; the GGUF in place without a RAM budget): O_DIRECT descriptors for the prompt
+    /// path only - copy_blobs (the prompt stager, the refill after a prompt) reads through read_direct, while the
+    /// mapped reads and the io prefetch keep the file cache.  Under a tight RAM cap the cached reads, not the drive,
+    /// set the prompt's rate.  False (and `why`) when it cannot open them; startup only.
+    bool open_prompt_direct(std::string& why);
+    /// STRATA_EXPERT_MIRROR is open: the direct reads split every layer between the shard and its copy.
+    bool mirrored() const { return mirror_fd_ >= 0; }
+    /// STRATA_DECODE_DIRECT=1 (after open_prompt_direct; the GGUF in place): the decode's blob reads - the read-ahead
+    /// workers and a layer's misses - go through read_direct too, on both drives with STRATA_EXPERT_MIRROR.  The GGUF
+    /// in place assembles every blob in a stage buffer anyway, so no kernel reads those pages from the file cache.
+    void set_decode_direct(bool on) { decode_direct_ = on && !pp_direct_.empty() && !role_ptr_.empty(); }
+    bool decode_direct() const { return decode_direct_; }
+    /// STRATA_STAGE_KEEP=N: the stage pool grows to N buffers before it reuses one, so the last N blobs read stay in
+    /// RAM (with direct reads nothing else keeps them).  The buffers are sized exactly per blob size, and each size
+    /// keeps its share of N (by the layers that have it): N x the mean blob of RAM.  0 (the default): as before.
+    void set_stage_keep(size_t n);
     /// pp-opt (Windows, experts.bin, unbuffered): close the mapped view once startup no longer needs it.  NTFS runs
     /// the unbuffered reads of a mapped file one at a time - on a PCIe 4 NVMe (WD SN580) 2 MiB reads at queue depth
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
@@ -681,6 +708,8 @@ public:
     bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override;
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
+    const uint8_t* blob_if_ready(int64_t layer, int64_t expert) override;
+    bool has_blob(int64_t layer, int64_t expert) override;
     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
     void note_async_read(const uint8_t* blob, void* stream) override;
@@ -738,6 +767,9 @@ public:
         uint64_t pf_used = 0, pf_unused = 0;                 ///< prefetched blobs a layer then used / never used
         uint64_t crit_us = 0;                                ///< wall time the decode waited on file reads (prefetch + staged_blob)
         uint64_t crit_n = 0;
+        uint64_t hand_hit = 0, hand_late = 0, hand_late_us = 0;   ///< decode hand-out: staged already / still being read (wait)
+        uint64_t hand_now = 0, hand_now_us = 0, hand_now_calls = 0; ///< read on the spot by the layer (prefetch's fill_many)
+        uint64_t rd_io_us = 0, rd_copy_us = 0, rd_n = 0;           ///< the decode's direct reads: drive wait, bounce copy
     };
     IoCounters io_counters() const;
 
@@ -745,7 +777,8 @@ private:
     const uint8_t* resident_blob(size_t index) const;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
-    bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
+    /// `stage_dst`: dst is a stage buffer (4 KiB-aligned, whole 4 KiB blocks: a packed blob may be read straight in).
+    bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst, bool stage_dst = false) const;
     bool open_gguf(std::string& err);
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
@@ -756,12 +789,28 @@ private:
     void fill_many(const std::vector<Fill>& todo);
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
-    bool read_direct(const Fill* fills, size_t n) const;
+    /// `decode`: the decode's scattered blobs (STRATA_EXPERT_MIRROR_DECODE_SHARE splits them), else the prompt's.
+    bool read_direct(const Fill* fills, size_t n, bool decode = false, bool stage_dst = false) const;
     bool open_direct(std::string& why);
     /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).
     bool map_view(std::string& why);
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
+    std::vector<void*> pp_direct_;            ///< open_prompt_direct: per file, an O_DIRECT fd for copy_blobs only
+    int mirror_main_ = -1;                    ///< STRATA_EXPERT_MIRROR: the shard's index in maps_ (-1: no mirror)
+    int mirror_fd_ = -1;                      ///< the copy, O_DIRECT (read_direct only)
+    int64_t mirror_cut_ = 0;                  ///< read_direct: a layer's experts from this one on come from the copy
+    int64_t mirror_cut_decode_ = 0;           ///< the same for the decode's reads (STRATA_EXPERT_MIRROR_DECODE_SHARE)
+    bool packed_ = false;                     ///< the copy is expert_pack.py's: whole blobs from packed_first_ on
+    int64_t packed_first_ = 0;
+    std::vector<uint64_t> packed_off_, packed_stride_;   ///< per layer: its first blob's offset, the blob stride
+    bool decode_direct_ = false;              ///< set_decode_direct
+    size_t stage_keep_ = 0;                   ///< set_stage_keep
+    std::vector<uint64_t> stage_cap_;         ///< per stage buffer: its bytes
+    std::map<uint64_t, size_t> stage_class_keep_;              ///< STRATA_STAGE_KEEP: buffers kept per blob size
+    std::map<uint64_t, std::vector<size_t>> stage_class_bufs_; ///< STRATA_STAGE_KEEP: the buffers of each blob size
+    bool open_mirror(const std::string& path, double share, std::string& err);
+    bool open_packed(const std::string& path, std::string& err);
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }
@@ -831,12 +880,15 @@ private:
     std::mutex io_mu_;
     std::condition_variable io_cv_;
     std::deque<std::pair<int32_t, int32_t>> io_q_;   ///< (layer, expert) to read ahead
+    std::deque<Fill> io_now_q_;                      ///< STRATA_DECODE_DIRECT: a layer's claimed blobs, read before io_q_
     bool io_quit_ = false;
     std::vector<char> stage_pf_;                      ///< per stage buffer: filled ahead, not yet used by a layer
     std::vector<int> io_fds_;                         ///< per mapped file: a plain descriptor (POSIX_FADV_RANDOM) for the preads
     mutable std::atomic<uint64_t> io_cached_{0}, io_uncached_{0}, io_pread_bytes_{0}, io_pread_us_{0}, io_pread_n_{0};
     std::atomic<uint64_t> io_pf_jobs_{0}, io_pf_demand_{0}, io_pf_blobs_{0}, io_pf_skips_{0}, io_pf_dropped_{0}, io_pf_used_{0}, io_pf_unused_{0},
         io_crit_us_{0}, io_crit_n_{0};
+    mutable std::atomic<uint64_t> hand_hit_{0}, hand_late_{0}, hand_late_us_{0}, hand_now_{0}, hand_now_us_{0}, hand_now_calls_{0};
+    mutable std::atomic<uint64_t> rd_io_us_{0}, rd_copy_us_{0}, rd_n_{0};
     struct Span { const uint8_t* p; uint64_t n; int fd; uint64_t off; uint64_t at; };
     /// The (up to 3) file ranges of a blob: pointer in the mapping, size, descriptor and file offset, offset in the blob.
     int spans(int64_t layer, int64_t expert, Span* out) const;
