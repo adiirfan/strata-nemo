@@ -427,6 +427,11 @@ __device__ __forceinline__ float rt_x16(float v) { return __int_as_float(rt_x16(
 // sigmoids normalized x kRouteScale; idx / wts are (T, k). One warp a row (8 rows a block of 256, n <= 512, k <= 16):
 // each lane holds n/32 scores, k rounds of a warp argmax by shuffles, no barriers (a 512-wide LDS reduction per round
 // took ~80 barriers a row)
+// rows of n floats (n % 1024 == 0; grid (n / 1024, rows)) from src (row stride lds) to dst (row stride ldd)
+__global__ void __launch_bounds__(256) k_copy_rows(float* dst, int ldd, const float* src, int lds) {
+    const int r = blockIdx.y, i = blockIdx.x * 256 + threadIdx.x;
+    reinterpret_cast<float4*>(dst + size_t(r) * ldd)[i] = reinterpret_cast<const float4*>(src + size_t(r) * lds)[i];
+}
 // one row's choice by one warp (k_route_warp's body): r is the row's raw scores, VOL reads them past the vector caches
 template <bool VOL = false>
 __device__ __forceinline__ void route_row(const float* r, const float* bias, int n, int k, int row, int lane, int32_t* idx, float* wts) {

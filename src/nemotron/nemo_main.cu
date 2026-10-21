@@ -832,12 +832,11 @@ struct Model {
     const float* extra = nullptr;     // a second output to add with d (the MoE's shared expert)
 
     // after block i: if it is one of the drafter's taps, its T rows go to column block (tap index) of dst
+    // (a kernel: the graphs hold kernel nodes only)
     void tap(size_t i, const float* src, float* dst, int T) {
         if (!dst) return;
         for (int t = 0; t < 6; ++t)
-            if (int(i) == kTaps[t])
-                CK(cudaMemcpy2DAsync(dst + size_t(t) * kHidden, size_t(kAux) * 4, src, size_t(kHidden) * 4, size_t(kHidden) * 4, T,
-                                     cudaMemcpyDeviceToDevice, stream));
+            if (int(i) == kTaps[t]) k_copy_rows<<<dim3(kHidden / 1024, T), 256, 0, stream>>>(dst + size_t(t) * kHidden, kAux, src, kHidden);
     }
 
     void moe(Block& b, int T) {
@@ -947,8 +946,8 @@ struct Model {
 
     // run body() on the stream, recorded as a graph the first time (e) and replayed after; body must take every
     // per-call value from device memory, since the launches' own arguments are frozen at the recording
-    template <class F> void graphed(cudaGraphExec_t& e, F&& body) {
-        if (!use_graph) { body(); return; }
+    template <class F> void graphed(cudaGraphExec_t& e, F&& body, bool launch = true) {
+        if (!use_graph) { if (launch) body(); return; }
         if (!e) {
             cudaGraph_t g;
             CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
@@ -957,7 +956,7 @@ struct Model {
             CK(cudaGraphInstantiate(&e, g, nullptr, nullptr, 0));
             CK(cudaGraphDestroy(g));
         }
-        CK(cudaGraphLaunch(e, stream));
+        if (launch) CK(cudaGraphLaunch(e, stream));
     }
     cudaGraphExec_t commit_graph[kTMax + 1] = {};
 
@@ -1022,8 +1021,26 @@ struct Model {
     }
     int32_t* best_dev = nullptr;
 
+    // record (without running) the draft-check graphs for 2..T_max positions and the commits after them, so a round
+    // that checks a different number of drafts does not pay for its recording
+    void warm_checks(int T_max) {
+        if (!use_graph) return;
+        for (int T = 2; T <= T_max; ++T) {
+            const int key = T * 4 + 1;
+            if (graphs.count(key)) continue;
+            cudaGraph_t g; cudaGraphExec_t e;
+            CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            body(T, 0, true, nullptr);
+            CK(cudaStreamEndCapture(stream, &g));
+            CK(cudaGraphInstantiate(&e, g, nullptr, nullptr, 0));
+            CK(cudaGraphDestroy(g));
+            graphs.emplace(key, e);
+        }
+        for (int m = 1; m <= T_max; ++m) commit(m, false);
+    }
+
     // after a draft check (write_after 0): move every Mamba state forward over the first m positions of that window
-    void commit(int m) {
+    void commit(int m, bool run = true) {
         graphed(commit_graph[m], [&] {
             for (auto& b : blocks) {
                 if (b.kind != MAMBA) continue;
@@ -1031,8 +1048,8 @@ struct Model {
                 float* xbc = win_xbc[b.win];
                 k_mamba_commit<<<dim3(kMHeads, kScanSlices), kMState, 0, stream>>>(xbc, proj, b.A_log, b.dt_bias, b.ssm, b.conv_state, m);
             }
-        });
-        pos += m;
+        }, run);
+        if (run) pos += m;
     }
 
     // ---------------------------------------------------------------- the prompt path (chunks of up to kTBig)
@@ -1907,6 +1924,9 @@ struct Drafter {
 static int argmax(const float* p, int n) { return int(std::max_element(p, p + n) - p); }
 
 int main(int argc, char** argv) {
+    // two hardware queues unless set: with the runtime's default four, some draft-check graphs had their two branches
+    // placed so that every launch boundary in them took several times as long
+    setenv("GPU_MAX_HW_QUEUES", "2", 0);
     std::string dir, ids_s, dump_path, mode = "plain", draft_dir;
     bool ppl = false;
     int n_new = 0, ctx = 4096;
@@ -2001,20 +2021,43 @@ int main(int argc, char** argv) {
         }
         CK(cudaStreamSynchronize(m.stream));
         const double rs = std::chrono::duration<double>(std::chrono::steady_clock::now() - s0).count();
+        m.warm_checks(kDSlots + 1);
         const auto s1 = std::chrono::steady_clock::now();
         int bonus = argmax(lg.data(), kVocab);
         std::vector<int> out = {bonus};
         int rounds = 0, drafted_ok = 0;
         double t_draft = 0, t_check = 0;
+        // how many of the drafts to check: the most tokens a round per unit of cost, where the tokens come from p, the
+        // drafts' acceptance rate over recent rounds (accepted drafts against rejections, both decayed), and a round
+        // costs a fixed part plus n_cost of it a checked position (the measured ratio). NEMO_DRAFT_N: always check that
+        // many; NEMO_DRAFT_COST: n_cost.
+        static const int n_fixed = std::getenv("NEMO_DRAFT_N") ? std::atoi(std::getenv("NEMO_DRAFT_N")) : 0;
+        static const double n_cost = std::getenv("NEMO_DRAFT_COST") ? std::atof(std::getenv("NEMO_DRAFT_COST")) : 0.068;
+        double ok_ema = 4.0, rej_ema = 1.0;                            // (a prior of p = 0.8)
+        auto pick_n = [&]() {
+            if (n_fixed > 0) return std::min(n_fixed, kDSlots);
+            const double p = ok_ema / (ok_ema + rej_ema);
+            int bn = kDSlots;
+            double bv = 0, tok = 1, pk = 1;
+            for (int nn = 1; nn <= kDSlots; ++nn) {
+                pk *= p;
+                tok += pk;
+                const double v = tok / (1.0 + n_cost * (nn + 1));
+                if (v > bv) { bv = v; bn = nn; }
+            }
+            return bn;
+        };
         while (int(out.size()) < n_new) {
             const auto a0 = std::chrono::steady_clock::now();
-            const std::vector<int> dr = D.draft(bonus, m.pos);
+            std::vector<int> dr = D.draft(bonus, m.pos);
+            const int n_dr = pick_n();
+            if ((int) dr.size() > n_dr) dr.resize(n_dr);
             const auto a1 = std::chrono::steady_clock::now();
             std::vector<int> win = {bonus};
             win.insert(win.end(), dr.begin(), dr.end());
             const std::vector<int> best = m.forward_argmax(win, 0);
             int acc = 0;
-            while (acc < kDSlots && best[acc] == dr[acc]) ++acc;
+            while (acc < (int) dr.size() && best[acc] == dr[acc]) ++acc;
             const int nb = best[acc];
             const int p0 = m.pos;
             m.commit(acc + 1);
@@ -2023,6 +2066,8 @@ int main(int argc, char** argv) {
             out.push_back(nb);
             bonus = nb;
             ++rounds; drafted_ok += acc;
+            ok_ema = 0.85 * ok_ema + acc;
+            rej_ema = 0.85 * rej_ema + (acc < (int) dr.size() ? 1.0 : 0.0);
             const auto a2 = std::chrono::steady_clock::now();
             t_draft += std::chrono::duration<double>(a1 - a0).count();
             t_check += std::chrono::duration<double>(a2 - a1).count();
