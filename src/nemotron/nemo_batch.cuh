@@ -237,11 +237,122 @@ __global__ void __launch_bounds__(128) k_mamba_scan(const float* xbc, const floa
     }
 }
 
+// k_mamba_conv_many + k_mamba_scan in one launch for the small steps: each scan block runs the causal conv for the
+// channels it reads - its 8 x channels and its group's 128 B and 128 C channels (one each a thread; the group's
+// B / C are computed by all its 128 blocks, a few multiply-adds) - instead of reading xbc. The same arithmetic per
+// channel as k_mamba_conv_many, so the same values. xbc is still written, by one owner each (the x channels by their
+// block, B / C by the group's (first head, slice 0) block), for k_mamba_commit; the conv state of the x channels by
+// their block, of B / C by k_gated_norm_many afterwards (here another block of the group could read it after its
+// owner moved it on).
+__global__ void __launch_bounds__(128) k_mamba_conv_scan(const float* proj, float* conv_state, const uint16_t* cw, const uint16_t* cb,
+                                                         float* xbc, const uint16_t* A_log, const uint16_t* D,
+                                                         const uint16_t* dt_bias, float* ssm, float* y, int T, int write_after) {
+    constexpr int RP = kMHeadDim / kScanSlices;
+    __shared__ float part[2][RP][4];
+    __shared__ float s_dt[kScanTile], s_dA[kScanTile], s_x[kScanTile][RP];
+    const int hd = blockIdx.x, n = threadIdx.x, warp = n / 32, lane = n % 32;
+    const int g = hd / (kMHeads / kMGroups), p0 = blockIdx.y * RP;
+    const int row = ((lane >> 4) & 1) * 4 + ((lane >> 3) & 1) * 2 + ((lane >> 2) & 1);
+    const float A = -expf(bf16f(A_log[hd])), Dh = bf16f(D[hd]), db = bf16f(dt_bias[hd]);
+    float* hp = ssm + size_t(hd) * kMHeadDim * kMState + size_t(p0) * kMState + n;
+    float hr[RP];
+#pragma unroll
+    for (int p = 0; p < RP; ++p) hr[p] = hp[p * kMState];
+    // this thread's conv channels: B (cB), C (cC), and for n < RP its x channel (cX)
+    const int cB = kMInter + g * kMState + n, cC = kMInter + kMGroups * kMState + g * kMState + n, cX = hd * kMHeadDim + p0 + n;
+    const bool bc_owner = (hd % (kMHeads / kMGroups)) == 0 && blockIdx.y == 0;
+    struct Conv {
+        float v0, v1, v2, w0, w1, w2, w3, b;
+        float* st;
+        int c;
+        __device__ void init(float* state, const uint16_t* cw, const uint16_t* cb, int ch) {
+            c = ch;
+            st = state + size_t(ch) * (kConvK - 1);
+            v0 = st[0]; v1 = st[1]; v2 = st[2];
+            w0 = bf16f(cw[ch * kConvK]); w1 = bf16f(cw[ch * kConvK + 1]); w2 = bf16f(cw[ch * kConvK + 2]); w3 = bf16f(cw[ch * kConvK + 3]);
+            b = bf16f(cb[ch]);
+        }
+        // position t's output (the raw input in, the window shifted)
+        __device__ float step(const float* proj, int t) {
+            const float x = proj[size_t(t) * kInProj + kMInter + c];
+            const float a = b + w0 * v0 + w1 * v1 + w2 * v2 + w3 * x;
+            v0 = v1; v1 = v2; v2 = x;
+            return a / (1.f + expf(-a));
+        }
+        __device__ void save() { st[0] = v0; st[1] = v1; st[2] = v2; }
+    };
+    Conv cvB, cvC, cvX;
+    cvB.init(conv_state, cw, cb, cB);
+    cvC.init(conv_state, cw, cb, cC);
+    if (n < RP) cvX.init(conv_state, cw, cb, cX);
+    for (int t0 = 0; t0 < T; t0 += kScanTile) {
+        const int nt = min(kScanTile, T - t0);
+        __syncthreads();                                              // the last tile's LDS reads are done
+        if (n < nt) {
+            float dt = proj[size_t(t0 + n) * kInProj + kMInter + kConvDim + hd] + db;
+            dt = dt > 20.f ? dt : log1pf(expf(dt));
+            s_dt[n] = dt;
+            s_dA[n] = expf(dt * A);
+        }
+        float Bn[kScanTile], Cn[kScanTile];
+#pragma unroll
+        for (int t = 0; t < kScanTile; ++t)
+            if (t < nt) {
+                Bn[t] = cvB.step(proj, t0 + t);
+                Cn[t] = cvC.step(proj, t0 + t);
+                if (bc_owner) {
+                    xbc[size_t(t0 + t) * kConvDim + cB] = Bn[t];
+                    xbc[size_t(t0 + t) * kConvDim + cC] = Cn[t];
+                }
+                if (n < RP) {
+                    const float xv = cvX.step(proj, t0 + t);
+                    s_x[t][n] = xv;
+                    xbc[size_t(t0 + t) * kConvDim + cX] = xv;
+                    if (t0 + t + 1 == write_after) cvX.save();
+                }
+            }
+        __syncthreads();
+#pragma unroll
+        for (int t = 0; t < kScanTile; ++t) {
+            if (t >= nt) break;
+            const float dA = s_dA[t], dtB = s_dt[t] * Bn[t];
+            float c[RP];
+#pragma unroll
+            for (int p = 0; p < RP; ++p) {
+                hr[p] = hr[p] * dA + dtB * s_x[t][p];
+                c[p] = hr[p] * Cn[t];
+            }
+            const float sum = warp_sum8(c, lane);
+            float (*pt)[4] = part[t & 1];
+            if ((lane & 3) == 0) pt[row][warp] = sum;
+            __syncthreads();
+            if (n < RP) y[size_t(t0 + t) * kMInter + hd * kMHeadDim + p0 + n] = pt[n][0] + pt[n][1] + pt[n][2] + pt[n][3] + s_x[t][n] * Dh;
+            if (t0 + t + 1 == write_after) {
+#pragma unroll
+                for (int p = 0; p < RP; ++p) hp[p * kMState] = hr[p];
+            }
+        }
+    }
+}
+
 // gated group norm for T rows: y (T, kMInter), z = proj + t * kInProj. zero_out (T, kHidden), if given, is zeroed
 // for the out_proj slices to add into (saves a fill launch)
-__global__ void k_gated_norm_many(float* y, const float* proj, const uint16_t* w, float* zero_out = nullptr, const float* prs = nullptr) {
+__global__ void k_gated_norm_many(float* y, const float* proj, const uint16_t* w, float* zero_out = nullptr, const float* prs = nullptr,
+                                  float* conv_state = nullptr, int write_after = 0) {
     __shared__ float sh[256];
     const int G = kMInter / kMGroups, base = blockIdx.x * G, t = blockIdx.y;
+    if (conv_state && write_after > 0 && t == 0) {
+        // (after k_mamba_conv_scan) group blockIdx.x's B / C conv state moved on by write_after positions: the last
+        // three of [state, raw inputs 0 .. write_after - 1]
+        const int c = kMInter + (threadIdx.x < kMState ? blockIdx.x * kMState + threadIdx.x : kMGroups * kMState + blockIdx.x * kMState + threadIdx.x - kMState);
+        float* st = conv_state + size_t(c) * (kConvK - 1);
+        float v[3] = {st[0], st[1], st[2]};
+        for (int i = 0; i < write_after; ++i) {
+            v[0] = v[1]; v[1] = v[2];
+            v[2] = proj[size_t(i) * kInProj + kMInter + c] * (prs ? prs[i] : 1.f);
+        }
+        st[0] = v[0]; st[1] = v[1]; st[2] = v[2];
+    }
     const float zs = prs ? prs[t] : 1.f;                              // proj's row scale (per-row FP8 in_proj)
     if (zero_out)
         for (int i = threadIdx.x; i < kHidden / kMGroups; i += 256) zero_out[size_t(t) * kHidden + blockIdx.x * (kHidden / kMGroups) + i] = 0.f;

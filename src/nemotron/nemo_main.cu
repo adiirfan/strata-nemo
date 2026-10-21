@@ -568,6 +568,7 @@ struct Model {
     bool route_side = !std::getenv("NEMO_ROUTE_SIDE") || std::atoi(std::getenv("NEMO_ROUTE_SIDE")) != 0;
     // one-position MoE steps: the weighted sum writes fc2's q8_1 input (NEMO_FUSED_Q=0: fc2 quantizes it)
     bool fused_q = !std::getenv("NEMO_FUSED_Q") || std::atoi(std::getenv("NEMO_FUSED_Q")) != 0;
+    bool conv_scan = !std::getenv("NEMO_CONV_SCAN") || std::atoi(std::getenv("NEMO_CONV_SCAN")) != 0;   // k_mamba_conv_scan
     cudaStream_t stream = nullptr;
     int *d_toks = nullptr, *d_pos = nullptr, *h_tp = nullptr;   // [kTMax tokens, position of the first]
     // per Mamba layer: the window's projections and conv outputs, kept until the accepted count is known
@@ -778,10 +779,16 @@ struct Model {
         float* proj = win_proj[b.win];
         float* xbc = win_xbc[b.win];
         nvfp4(b.in_w, b.in_s, b.in_s2, n, proj, kHidden, kInProj, T);
-        k_mamba_conv_many<<<(kConvDim + 255) / 256, 256, 0, stream>>>(proj, b.conv_state, b.conv_w, b.conv_b, xbc, T, write_after);
-        k_mamba_scan<<<dim3(kMHeads, kScanSlices), kMState, 0, stream>>>(xbc, proj, b.A_log, b.D, b.dt_bias, b.ssm, y, T, write_after);
+        if (conv_scan)   // (one launch: the scan blocks run the conv for the channels they read)
+            k_mamba_conv_scan<<<dim3(kMHeads, kScanSlices), kMState, 0, stream>>>(proj, b.conv_state, b.conv_w, b.conv_b, xbc, b.A_log, b.D,
+                                                                               b.dt_bias, b.ssm, y, T, write_after);
+        else {
+            k_mamba_conv_many<<<(kConvDim + 255) / 256, 256, 0, stream>>>(proj, b.conv_state, b.conv_w, b.conv_b, xbc, T, write_after);
+            k_mamba_scan<<<dim3(kMHeads, kScanSlices), kMState, 0, stream>>>(xbc, proj, b.A_log, b.D, b.dt_bias, b.ssm, y, T, write_after);
+        }
         // (T > 1: the out_proj slices add into d, which the norm zeroes)
-        k_gated_norm_many<<<dim3(kMGroups, T), 256, 0, stream>>>(y, proj, b.gnorm, T > 1 ? d : nullptr);
+        k_gated_norm_many<<<dim3(kMGroups, T), 256, 0, stream>>>(y, proj, b.gnorm, T > 1 ? d : nullptr, nullptr,
+                                                                 conv_scan ? b.conv_state : nullptr, write_after);
         nvfp4(b.out_w, b.out_s, b.out_s2, y, d, kMInter, kHidden, T, T > 1);
     }
 
