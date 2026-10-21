@@ -1046,6 +1046,28 @@ struct Model {
         k_fp8_alpha<<<(rows + 255) / 256, 256, 0, stream>>>(B->rscale, rows, B->amax, s2, alpha);
         return B->gemm.fp8(B->x8, B->w8, alpha, Y, T, rows, K);
     }
+    // the shared expert's IQ2_XXS products in FP8 (NEMO_SH_FP8): weight unpacked to BF16, then E4M3 per row; X in
+    // E4M3 per chunk (relu^2 applied first, in place, when relu2)
+    bool iq2_fp8(const void* w, float* X, float* Y, int T, int rows, int K, bool relu2) {
+        if (!B->w8) {
+            CK(cudaMalloc(&B->w8, size_t(kInProj) * kHidden)); CK(cudaMalloc(&B->x8, size_t(kTBig) * kMInter));
+            CK(cudaMalloc(&B->rscale, 2 * size_t(kInProj) * 4)); CK(cudaMalloc(&B->amax, 4));
+        }
+        strata::kernels::iq_dequant_bf16(kIQ2_XXS, w, int64_t(rows) * K, B->gemm.scratch(), stream);
+        k_bf16_to_e4m3_rows<<<rows, 256, 0, stream>>>(B->gemm.scratch(), K, B->w8, B->rscale);
+        CK(cudaMemsetAsync(B->amax, 0, 4, stream));
+        const size_t n = size_t(T) * K;
+        if (relu2) k_relu2_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
+        else k_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
+        k_to_e4m3<<<2048, 256, 0, stream>>>(X, n, B->amax, B->x8);
+        float* alpha = B->rscale + kInProj;
+        k_fp8_alpha<<<(rows + 255) / 256, 256, 0, stream>>>(B->rscale, rows, B->amax, 1.f, alpha);
+        return B->gemm.fp8(B->x8, B->w8, alpha, Y, T, rows, K);
+    }
+    // the shared expert in FP8 for chunks of 256+ rows (default; NEMO_SH_FP8=0: BF16). 8K texts: perplexity +0.07% /
+    // +0.17% over the BF16 shared expert (all FP8 together vs all BF16: README 4.5585 -> 4.5710, DETAILS.md 7.5497 ->
+    // 7.5795), reading 8K 3,392 -> 3,553 a second
+    bool sh_fp8 = !std::getenv("NEMO_SH_FP8") || std::atoi(std::getenv("NEMO_SH_FP8")) != 0;
     void nvfp4_big(const uint8_t* w, const uint8_t* sc, float s2, const float* X, float* Y, int T, int rows, int K) {
         const bool fp8_here = T >= 256 && (fp8_mode == 1 || (fp8_mode == 2 && rows == kInProj) || (fp8_mode == 3 && rows == kHidden && K == kMInter));
         if (fp8_here && nvfp4_fp8(w, sc, s2, X, Y, T, rows, K)) return;
@@ -1220,6 +1242,8 @@ struct Model {
             mmq_dense(b.sh_up, kIQ2_XXS, B->n, B->tmp, T, kShared, kHidden);
             k_relu2<<<1024, 256, 0, stream>>>(B->tmp, size_t(T) * kShared);
             mmq_dense(b.sh_down, kIQ2_XXS, B->tmp, B->tmp2, T, kHidden, kShared);
+        } else if (sh_fp8 && T >= 256 && iq2_fp8(b.sh_up, B->n, B->tmp, T, kShared, kHidden, false)) {
+            if (!iq2_fp8(b.sh_down, B->tmp, B->tmp2, T, kHidden, kShared, true)) { std::fprintf(stderr, "strata-nemo: shared FP8\n"); std::exit(1); }
         } else {
             // the shared expert unpacked to BF16 and through the BLAS GEMM (B->xb still holds n in BF16, from the
             // router): MMQ reached ~85 int8 TOPS on these two, the BF16 GEMM ~150 TFLOPS
@@ -1644,6 +1668,11 @@ int main(int argc, char** argv) {
     Model m(dir, ctx);
     m.init_big();                              // the prompt path's buffers and library, before any prompt is timed
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    {
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        std::fprintf(stderr, "strata-nemo: card memory %.1f GB free of %.1f GB after load\n", fr / 1e9, tot / 1e9);
+    }
     std::fprintf(stderr, "strata-nemo: %.1f GB on the card in %.1f s\n", m.st.loaded / 1e9, load_s);
 
     if (ppl) {   // how well the prompt path predicts each next token of the text (quality checks of numeric changes)

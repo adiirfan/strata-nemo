@@ -571,6 +571,38 @@ __global__ void k_to_e4m3(const float* x, size_t n, const uint32_t* amax, uint8_
         reinterpret_cast<uint32_t*>(x8)[i] = fp8x4(v.x * inv, v.y * inv, v.z * inv, v.w * inv);
     }
 }
+// one block per row of a BF16 matrix (K wide): its largest magnitude / 448 as the row scale, the row in E4M3
+__global__ void __launch_bounds__(256) k_bf16_to_e4m3_rows(const uint16_t* w, int K, uint8_t* w8, float* rscale) {
+    __shared__ float red[256];
+    const int64_t r = blockIdx.x;
+    const uint16_t* wr = w + r * K;
+    float m = 0.f;
+    for (int i = threadIdx.x; i < K; i += 256) m = fmaxf(m, fabsf(__uint_as_float(uint32_t(wr[i]) << 16)));
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]); __syncthreads(); }
+    const float rs = red[0] > 0.f ? red[0] / 448.f : 1.f, inv = 1.f / rs;
+    for (int i = threadIdx.x; i < K / 4; i += 256) {
+        const uint2 v = reinterpret_cast<const uint2*>(wr)[i];
+        reinterpret_cast<uint32_t*>(w8 + r * K)[i] = fp8x4(__uint_as_float(v.x << 16) * inv, __uint_as_float(v.x & 0xffff0000u) * inv,
+                                                          __uint_as_float(v.y << 16) * inv, __uint_as_float(v.y & 0xffff0000u) * inv);
+    }
+    if (threadIdx.x == 0) rscale[r] = rs;
+}
+// x = relu(x)^2 in place and its largest value into *amax
+__global__ void __launch_bounds__(256) k_relu2_amax(float* x, size_t n, uint32_t* amax) {
+    __shared__ float red[256];
+    float m = 0.f;
+    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) {
+        const float v = fmaxf(x[i], 0.f), q = v * v;
+        x[i] = q;
+        m = fmaxf(m, q);
+    }
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]); __syncthreads(); }
+    if (threadIdx.x == 0 && red[0] > 0.f) atomicMax(amax, __float_as_uint(red[0]));
+}
 // alpha[n] = row scale x activation scale x scale_2
 __global__ void k_fp8_alpha(const float* rscale, int N, const uint32_t* amax, float s2, float* alpha) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
