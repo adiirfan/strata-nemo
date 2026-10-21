@@ -1306,6 +1306,112 @@ __global__ void __launch_bounds__(256) k_attn_flash(const float* __restrict__ q,
     }
 }
 
+// Writing / small steps on the matrix cores: one block per (key split, KV head) serves all 16 query heads of the KV
+// head from one read of each 32-key run (k_attn_dec read the cache once per query head: 16 times a layer). Warp w
+// takes position w's tile (16 heads x 128); the run's K rows and its V (transposed on the way into LDS) are shared.
+// Runs go to splits round robin (run c to split c % splits); each split leaves k_attn_dec's partials (unnormalized
+// output, running max, sum) for k_flash_combine. NW: warps (positions) a block, T <= NW.
+template <int NW>
+__global__ void __launch_bounds__(NW * 32) k_attn_dec_wm(const float* __restrict__ q, const uint16_t* __restrict__ K,
+                                                         const uint16_t* __restrict__ V, float* __restrict__ part,
+                                                         const int* pos0, int kv_rows, int T, int splits) {
+    __shared__ __align__(16) uint16_t sk[kFwKeys][kFwKS];
+    __shared__ __align__(16) uint16_t sv[kAHeadDim][kFwVS];
+    __shared__ __align__(16) uint16_t sp[NW][16][kFwVS];
+    const int z = blockIdx.x, g = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, l16 = lane & 15, g8 = lane >> 4;
+    const int P0 = *pos0, t = warp, p = P0 + t;
+    const bool live = t < T;
+    const uint16_t* Kh = K + size_t(g) * kv_rows * kAHeadDim;
+    const uint16_t* Vh = V + size_t(g) * kv_rows * kAHeadDim;
+    att_v8s qa[kAHeadDim / 16];
+#pragma unroll
+    for (int kk = 0; kk < kAHeadDim / 16; ++kk) {
+        uint32_t w[4] = {0, 0, 0, 0};
+        if (live) {
+            const float* qr = q + (size_t(t) * kAHeads + g * 16 + l16) * kAHeadDim + kk * 16 + g8 * 8;
+            const float4 a = reinterpret_cast<const float4*>(qr)[0], b = reinterpret_cast<const float4*>(qr)[1];
+            w[0] = f2bf(a.x) | (uint32_t(f2bf(a.y)) << 16); w[1] = f2bf(a.z) | (uint32_t(f2bf(a.w)) << 16);
+            w[2] = f2bf(b.x) | (uint32_t(f2bf(b.y)) << 16); w[3] = f2bf(b.z) | (uint32_t(f2bf(b.w)) << 16);
+        }
+        qa[kk] = __builtin_bit_cast(att_v8s, make_uint4(w[0], w[1], w[2], w[3]));
+    }
+    const float scale = rsqrtf(float(kAHeadDim));
+    att_v8f o[kAHeadDim / 16];
+#pragma unroll
+    for (int d = 0; d < kAHeadDim / 16; ++d) o[d] = att_v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float m[8], l[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { m[i] = -INFINITY; l[i] = 0.f; }
+    const int L = P0 + T;                                          // keys 0 .. L - 1 exist
+    for (int j0 = z * kFwKeys; j0 < L; j0 += splits * kFwKeys) {
+        __syncthreads();
+        for (int i = tid; i < kFwKeys * (kAHeadDim / 8); i += NW * 32) {   // K rows: 32 x 16 pieces of 8
+            const int r = i / (kAHeadDim / 8), c = i % (kAHeadDim / 8);
+            *reinterpret_cast<uint4*>(&sk[r][c * 8]) = *reinterpret_cast<const uint4*>(Kh + size_t(j0 + r) * kAHeadDim + c * 8);
+        }
+        for (int i = tid; i < kFwKeys * (kAHeadDim / 8); i += NW * 32) {   // V rows, transposed into sv[dim][key]
+            const int r = i / (kAHeadDim / 8), c = i % (kAHeadDim / 8);
+            const uint4 v = *reinterpret_cast<const uint4*>(Vh + size_t(j0 + r) * kAHeadDim + c * 8);
+            const uint32_t vw[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int e = 0; e < 8; ++e) sv[c * 8 + e][r] = uint16_t(vw[e / 2] >> (16 * (e % 2)));
+        }
+        __syncthreads();
+        if (!live || j0 > p) continue;                             // (warp-uniform)
+        att_v8f s[2];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            s[nt] = att_v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int kk = 0; kk < kAHeadDim / 16; ++kk)
+                s[nt] = att_wmma(qa[kk], *reinterpret_cast<const att_v8s*>(&sk[nt * 16 + l16][kk * 16 + g8 * 8]), s[nt]);
+        }
+        float alpha[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float v0 = s[0][i] * scale, v1 = s[1][i] * scale;
+            if (j0 + l16 > p) v0 = -INFINITY;
+            if (j0 + 16 + l16 > p) v1 = -INFINITY;
+            float mx = fmaxf(v0, v1);
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off, 32));
+            const float mn = fmaxf(m[i], mx);
+            alpha[i] = expf(m[i] - mn);
+            m[i] = mn;
+            const float e0 = expf(v0 - mn), e1 = expf(v1 - mn);
+            l[i] = l[i] * alpha[i] + e0 + e1;
+            sp[warp][g8 * 8 + i][l16] = f2bf(e0);
+            sp[warp][g8 * 8 + i][16 + l16] = f2bf(e1);
+        }
+#pragma unroll
+        for (int d = 0; d < kAHeadDim / 16; ++d)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) o[d][i] *= alpha[i];
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
+#pragma unroll
+        for (int kk = 0; kk < kFwKeys / 16; ++kk) {
+            const att_v8s pa = *reinterpret_cast<const att_v8s*>(&sp[warp][l16][kk * 16 + g8 * 8]);
+#pragma unroll
+            for (int d = 0; d < kAHeadDim / 16; ++d)
+                o[d] = att_wmma(pa, *reinterpret_cast<const att_v8s*>(&sv[d * 16 + l16][kk * 16 + g8 * 8]), o[d]);
+        }
+    }
+    if (!live) return;
+    // this lane: heads g * 16 + g8 * 8 + i, dims d * 16 + l16; a split without keys leaves sum 0 (weight 0)
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float sum = l[i];
+#pragma unroll
+        for (int off = 1; off < 16; off <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off, 32);
+        float* pp = part + ((size_t(t) * kAHeads + g * 16 + g8 * 8 + i) * splits + z) * (kAHeadDim + 2);
+#pragma unroll
+        for (int d = 0; d < kAHeadDim / 16; ++d) pp[d * 16 + l16] = o[d][i];
+        if (l16 == 0) { pp[kAHeadDim] = m[i]; pp[kAHeadDim + 1] = sum; }
+    }
+}
+
 // causal softmax of S (16 T x Lp, row (hl, t) sees keys 0 .. pos0 + t) into BF16 P
 __global__ void k_softmax_causal(const float* S, uint16_t* P, const int* pos0, int T, int Lp, int t_off) {
     __shared__ float sh[256];

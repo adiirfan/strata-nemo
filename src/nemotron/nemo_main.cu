@@ -539,7 +539,11 @@ struct Model {
     Store st;
     std::vector<Block> blocks;
     int max_ctx;
-    int kv_rows() const { return max_ctx + 64; }   // the BF16 KV cache's rows a KV head (k_attn_flash reads up to 63 past)
+    int kv_rows() const { return max_ctx + 64; }
+    // the decode attention's key splits: enough blocks for a long context (32-key runs, round robin);
+    // NEMO_DEC_OLD=1: k_attn_dec (one block per query head, 16 splits)
+    int dec_splits() const { return std::min(256, std::max(32, max_ctx / 2048)); }
+    bool dec_old = std::getenv("NEMO_DEC_OLD") != nullptr;   // the BF16 KV cache's rows a KV head (k_attn_flash reads up to 63 past)
     const uint16_t *embed = nullptr, *norm_f = nullptr;
     const void* head = nullptr;
     // scratch, kTMax rows each
@@ -652,7 +656,8 @@ struct Model {
         const size_t T = kTMax;
         f(&h, T * kHidden); f(&n, T * kHidden); f(&d, T * kHidden); f(&y, T * kMInter);
         f(&lat, T * kLatent); f(&eo, T * kLatent); f(&tmp, T * kShared); f(&tmp2, T * kShared); f(&scores, T * 512);
-        f(&att_sc, T * kAHeads * std::max(size_t(max_ctx), size_t(kDecSplits) * (kAHeadDim + 2))); f(&qkv, T * kAHeads * kAHeadDim);
+        // (the decode attention's partials: T rows x heads x splits; it was sized for a full score row per head)
+        f(&att_sc, T * kAHeads * size_t(std::max(dec_splits(), kDecSplits)) * (kAHeadDim + 2)); f(&qkv, T * kAHeads * kAHeadDim);
         f(&kbuf, T * kAKv * kAHeadDim); f(&vbuf, T * kAKv * kAHeadDim); f(&logits, T * size_t(kVocab));
         f(&ex_up, T * 16 * 2560); f(&ex_down, T * 16 * kLatent); f(&route_w, T * 16);
         CK(cudaMalloc(&route_idx, T * 16 * sizeof(int32_t)));
@@ -764,6 +769,16 @@ struct Model {
         k_kv_append_many<<<dim3(T, kAKv), kAHeadDim, 0, stream>>>(kbuf, vbuf, b.K, b.V, d_pos, kv_rows());
         // T <= 16 rows: one query tile, the keys present split into kDecSplits equal shares (an empty share is
         // weighted 0 by the combine)
+        if (!dec_old) {
+            // all 16 query heads of a KV head from one read of each 32-key run, on the matrix cores (k_attn_dec_wm)
+            const int splits = dec_splits();
+            if (T == 1) k_attn_dec_wm<1><<<dim3(splits, kAKv), 32, 0, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
+            else if (T <= 8) k_attn_dec_wm<8><<<dim3(splits, kAKv), 256, 0, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
+            else k_attn_dec_wm<kTMax><<<dim3(splits, kAKv), kTMax * 32, 0, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
+            k_flash_combine<<<dim3(kAHeads, T), kAHeadDim, 0, stream>>>(att_sc, y, splits);
+            q8_0(b.o, y, d, kAHeads * kAHeadDim, kHidden, T);
+            return;
+        }
         const int splits = kDecSplits;
         const size_t lds = size_t(T) * (5 * kAHeadDim + 8) * 4;
         if (T == 1) k_attn_dec<1><<<dim3(kAHeads, splits), 128, lds, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
