@@ -2759,6 +2759,31 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
     }
 }
 
+// max(x, 0)^2 then quantize_q8_1_kernel, in one pass (Nemotron's expert activation). The square is rounded on its
+// own before q8_1_store, as it was when it went through memory, so the blocks are the same bits as k_relu2 followed
+// by quantize_q8_1_rows.
+__global__ void relu2_q8_1_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n) {
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = fmaxf(x[i], 0.f);
+#if defined(__HIPCC__)
+    const float h = v * v;
+#else
+    const float h = __fmul_rn(v, v);
+#endif
+    q8_1_store(h, y, i);
+}
+
+void relu2_quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream) {
+    const long long n = (long long) n_rows * n_cols;
+    if (n <= 0) return;
+    relu2_q8_1_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, (block_q8_1*) y, n);
+    check("relu2_quantize_q8_1_rows");
+}
+
 void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream) {
     const long long n = (long long) n_rows * n_cols;
     if (n <= 0) return;

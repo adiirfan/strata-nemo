@@ -39,8 +39,10 @@ __global__ void k_add_rms_rows(float* res, const float* x, const uint16_t* w, fl
     const float inv = rsqrtf(block_sum<1024>(a, sh) / n + eps);
     for (int i = threadIdx.x; i < n; i += 1024) y[o + i] = bf16f(w[i]) * (res[o + i] * inv);
 }
-__global__ void k_add_bias(float* y, const uint16_t* b, int n, size_t total) {
-    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += size_t(gridDim.x) * blockDim.x) y[i] += bf16f(b[i % n]);
+// y (rows, n) += b; grid (n / 256 rounded up, rows) (a flat loop with a 64-bit i % n took 12 us on 56 x 1024)
+__global__ void k_add_bias(float* y, const uint16_t* b, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[size_t(blockIdx.y) * n + i] += bf16f(b[i]);
 }
 __global__ void k_silu(float* a, size_t n) {
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) a[i] = a[i] / (1.f + expf(-a[i]));

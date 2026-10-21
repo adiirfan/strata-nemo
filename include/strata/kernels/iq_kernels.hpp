@@ -96,6 +96,9 @@ void iq_mmvq_grouped(int ggml_type, const unsigned long long* table, const int32
                      const int32_t* g_exp, const int32_t* g_cnt, const int32_t* g_xi, const int32_t* g_slot,
                      const void* x_q8_1, int x_stride_blocks, float* y, int n_in, int n_out, void* stream);
 
+// max(x, 0)^2 quantized to q8_1 rows: bitwise k_relu2 then quantize_q8_1_rows, one launch (n_cols % 32 == 0)
+void relu2_quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream);
+
 // y[c][row] = W[row] . x[c] for c < ncols, rows_per_warp (2 or 4) rows per warp sharing each activation load;
 // bitwise equal to iq_mmvq. IQ2_XXS only.
 void iq_mmvq_rows(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, int rows_per_warp,

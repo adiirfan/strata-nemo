@@ -647,8 +647,12 @@ struct Model {
     int sh_nr = std::getenv("NEMO_SH_NR") ? std::atoi(std::getenv("NEMO_SH_NR")) : 4;
     void iq2(const void* w, const float* x, float* out, int n_in, int n_out, int T) {
         strata::kernels::quantize_q8_1_rows(x, T, n_in, q8, stream);
-        if (T > 1 && sh_nr) strata::kernels::iq_mmvq_rows(kIQ2_XXS, w, q8, out, n_in, n_out, T, sh_nr, stream);
-        else strata::kernels::iq_mmvq(kIQ2_XXS, w, q8, out, n_in, n_out, T, stream);
+        iq2_q(w, q8, out, n_in, n_out, T);
+    }
+    // the same from inputs already in q8_1
+    void iq2_q(const void* w, const void* xq, float* out, int n_in, int n_out, int T) {
+        if (T > 1 && sh_nr) strata::kernels::iq_mmvq_rows(kIQ2_XXS, w, xq, out, n_in, n_out, T, sh_nr, stream);
+        else strata::kernels::iq_mmvq(kIQ2_XXS, w, xq, out, n_in, n_out, T, stream);
     }
     // W (rows x n_in, BF16 or NVFP4) times T <= 16 rows of x into (T, rows): the skinny kernel, 8 columns a launch
     void skinny(int fmt, const void* w, const uint8_t* sc, float s2, const float* x, float* out, int n_in, int rows, int T) {
@@ -667,7 +671,8 @@ struct Model {
 
     // rows per warp at once in k_nvfp4_q8cols (1: 101 us a call, 2: 73, 4: 78)
     int nv_rw = std::getenv("NEMO_NV_RW") ? std::atoi(std::getenv("NEMO_NV_RW")) : 2;
-    void nvfp4(const uint8_t* w, const uint8_t* s, float s2, const float* x, float* out, int n_in, int rows, int T) {
+    // zeroed: out is already zero (k_gated_norm_many's zero_out), so the slices need no fill first
+    void nvfp4(const uint8_t* w, const uint8_t* s, float s2, const float* x, float* out, int n_in, int rows, int T, bool zeroed = false) {
         const int g = (rows + 7) / 8;
         // the skinny kernel measured slower than the q8 one for NVFP4 (40 vs 35 ms a check round): BF16 only
         if (T > 1 && use_skinny && std::getenv("NEMO_SKINNY_FP4") && n_in % 256 == 0) { skinny(1, w, s, s2, x, out, n_in, rows, T); return; }
@@ -679,7 +684,7 @@ struct Model {
         // inputs to q8_1 once, then the on-chip kernel: slices of 4096 add into a zeroed output
         strata::kernels::quantize_q8_1_rows(x, T, n_in, q8, stream);
         const int slices = n_in / 4096;
-        if (slices > 1) CK(cudaMemsetAsync(out, 0, size_t(T) * rows * 4, stream));
+        if (slices > 1 && !zeroed) CK(cudaMemsetAsync(out, 0, size_t(T) * rows * 4, stream));
         // one block per compute unit fits (37 KB LDS): size the blocks so the launch is whole waves over the units
         static const int units = [] {
             if (const char* e = std::getenv("NEMO_UNITS")) return std::atoi(e);
@@ -701,8 +706,9 @@ struct Model {
         nvfp4(b.in_w, b.in_s, b.in_s2, n, proj, kHidden, kInProj, T);
         k_mamba_conv_many<<<(kConvDim + 255) / 256, 256, 0, stream>>>(proj, b.conv_state, b.conv_w, b.conv_b, xbc, T, write_after);
         k_mamba_scan<<<dim3(kMHeads, kScanSlices), kMState, 0, stream>>>(xbc, proj, b.A_log, b.D, b.dt_bias, b.ssm, y, T, write_after);
-        k_gated_norm_many<<<dim3(kMGroups, T), 256, 0, stream>>>(y, proj, b.gnorm);
-        nvfp4(b.out_w, b.out_s, b.out_s2, y, d, kMInter, kHidden, T);
+        // (T > 1: the out_proj slices add into d, which the norm zeroes)
+        k_gated_norm_many<<<dim3(kMGroups, T), 256, 0, stream>>>(y, proj, b.gnorm, T > 1 ? d : nullptr);
+        nvfp4(b.out_w, b.out_s, b.out_s2, y, d, kMInter, kHidden, T, T > 1);
     }
 
     void attention(Block& b, int T) {
@@ -742,8 +748,7 @@ struct Model {
         strata::kernels::quantize_q8_1_rows(lat, T, kLatent, q8, stream);
         if (T == 1) {
             strata::kernels::iq_mmvq_gather(kIQ2_XXS, b.up_tab, route_idx, k, q8, kLatent / 32, k, ex_up, kLatent, W, stream);
-            k_relu2<<<128, 256, 0, stream>>>(ex_up, k * W);
-            strata::kernels::quantize_q8_1_rows(ex_up, k, W, q8b, stream);
+            strata::kernels::relu2_quantize_q8_1_rows(ex_up, k, W, q8b, stream);
             strata::kernels::iq_mmvq_gather(kIQ2_XXS, b.down_tab, route_idx, k, q8b, W / 32, 1, ex_down, W, kLatent, stream);
         } else {
             // the step's picks grouped by expert: each chosen expert is read once for every position that chose it
@@ -751,21 +756,15 @@ struct Model {
             const int S = T * k, G = std::min({S, b.n_exp, grp_y});
             k_group_slots_par<<<1, 256, 0, stream>>>(route_idx, S, k, b.n_exp, g_n, g_exp, g_cnt, g_tok, g_slot);
             strata::kernels::iq_mmvq_grouped(kIQ2_XXS, b.up_tab, g_n, G, g_exp, g_cnt, g_tok, g_slot, q8, kLatent / 32, ex_up, kLatent, W, stream);
-            k_relu2<<<128, 256, 0, stream>>>(ex_up, S * W);
-            strata::kernels::quantize_q8_1_rows(ex_up, S, W, q8b, stream);
+            strata::kernels::relu2_quantize_q8_1_rows(ex_up, S, W, q8b, stream);
             strata::kernels::iq_mmvq_grouped(kIQ2_XXS, b.down_tab, g_n, G, g_exp, g_cnt, g_slot, g_slot, q8b, W / 32, ex_down, W, kLatent, stream);
         }
         k_wsum_many<<<dim3(4, T), 256, 0, stream>>>(eo, ex_down, route_w, k, kLatent);
         q8_0(b.fc2, eo, d, kLatent, kHidden, T);
-        if (T > 1 && B && std::getenv("NEMO_MMQ_SHARED")) {   // trial: llama.cpp's MMQ for the shared expert at T > 1
-            mmq_dense(b.sh_up, kIQ2_XXS, n, tmp, T, kShared, kHidden);
-            k_relu2<<<64, 256, 0, stream>>>(tmp, T * kShared);
-            mmq_dense(b.sh_down, kIQ2_XXS, tmp, tmp2, T, kHidden, kShared);
-        } else {
-            iq2(b.sh_up, n, tmp, kHidden, kShared, T);
-            k_relu2<<<64, 256, 0, stream>>>(tmp, T * kShared);
-            iq2(b.sh_down, tmp, tmp2, kShared, kHidden, T);
-        }
+        // (llama.cpp's MMQ for these two at T = 8 measured slower: 46 vs 34 us a call)
+        iq2(b.sh_up, n, tmp, kHidden, kShared, T);
+        strata::kernels::relu2_quantize_q8_1_rows(tmp, T, kShared, q8, stream);
+        iq2_q(b.sh_down, q8, tmp2, kShared, kHidden, T);
         extra = tmp2;
     }
 
@@ -882,8 +881,7 @@ struct Model {
                 if (b.kind != MAMBA) continue;
                 float* proj = win_proj[b.win];
                 float* xbc = win_xbc[b.win];
-                k_mamba_conv_many<<<(kConvDim + 255) / 256, 256, 0, stream>>>(proj, b.conv_state, b.conv_w, b.conv_b, xbc, m, m);
-                k_mamba_commit<<<dim3(kMHeads, kScanSlices), kMState, 0, stream>>>(xbc, proj, b.A_log, b.dt_bias, b.ssm, m);
+                k_mamba_commit<<<dim3(kMHeads, kScanSlices), kMState, 0, stream>>>(xbc, proj, b.A_log, b.dt_bias, b.ssm, b.conv_state, m);
             }
         });
         pos += m;
@@ -1238,9 +1236,11 @@ struct Drafter {
         std::fprintf(stderr, "strata-nemo: drafter %.2f GB\n", st.loaded / 1e9);
     }
 
+    // above lib_rows rows the products go to hipBLASLt (the small-step kernels re-read the weights every 8-16 rows)
+    int lib_rows = std::getenv("NEMO_LIB_ROWS") ? std::atoi(std::getenv("NEMO_LIB_ROWS")) : 16;
     // Y[R, n_out] = X[R, n_in] . W^T (+ bias), W bf16
     void lin_bf16(const uint16_t* W, const float* X, float* Y, int R, int n_in, int n_out, const uint16_t* bias) {
-        if (R > 64 && M.B && n_in % 64 == 0) {
+        if (R > lib_rows && M.B && n_in % 64 == 0) {
             k_to_bf16<<<1024, 256, 0, stream>>>(X, M.B->xb, size_t(R) * n_in);
             M.B->gemm.bf16(M.B->xb, W, Y, R, n_out, n_in);
         } else {
@@ -1250,11 +1250,11 @@ struct Drafter {
                 else k_bf16_rows<<<(n_out + 7) / 8, 256, 0, stream>>>(W, X + size_t(r0) * n_in, Y + size_t(r0) * n_out, n_in, n_out, nr);
             }
         }
-        if (bias) k_add_bias<<<256, 256, 0, stream>>>(Y, bias, n_out, size_t(R) * n_out);
+        if (bias) k_add_bias<<<dim3((n_out + 255) / 256, R), 256, 0, stream>>>(Y, bias, n_out);
     }
     // the same for an NVFP4 matrix
     void lin_nv(const Nv& W, const float* X, float* Y, int R) {
-        if (R > 64 && M.B) M.nvfp4_big(W.w, W.s, W.s2, X, Y, R, W.n_out, W.n_in);
+        if (R > lib_rows && M.B) M.nvfp4_big(W.w, W.s, W.s2, X, Y, R, W.n_out, W.n_in);
         else
             for (int r0 = 0; r0 < R; r0 += kTMax) {
                 const int nr = std::min(kTMax, R - r0);
@@ -1263,7 +1263,7 @@ struct Drafter {
                 if (W.n_in % 4096 == 0) M.nvfp4(W.w, W.s, W.s2, xr, yr, W.n_in, W.n_out, nr);
                 else k_nvfp4_cols<8><<<(W.n_out + 7) / 8, 256, 0, stream>>>(W.w, W.s, W.s2, xr, yr, W.n_in, W.n_out, nr);
             }
-        if (W.b) k_add_bias<<<256, 256, 0, stream>>>(Y, W.b, W.n_out, size_t(R) * W.n_out);
+        if (W.b) k_add_bias<<<dim3((W.n_out + 255) / 256, R), 256, 0, stream>>>(Y, W.b, W.n_out);
     }
 
     // the target's tapped stream for R accepted positions starting at p0 (rows of src, each kAux wide) into the

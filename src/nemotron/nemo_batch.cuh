@@ -209,10 +209,13 @@ __global__ void __launch_bounds__(128) k_mamba_scan(const float* xbc, const floa
     }
 }
 
-// gated group norm for T rows: y (T, kMInter), z = proj + t * kInProj
-__global__ void k_gated_norm_many(float* y, const float* proj, const uint16_t* w) {
+// gated group norm for T rows: y (T, kMInter), z = proj + t * kInProj. zero_out (T, kHidden), if given, is zeroed
+// for the out_proj slices to add into (saves a fill launch)
+__global__ void k_gated_norm_many(float* y, const float* proj, const uint16_t* w, float* zero_out = nullptr) {
     __shared__ float sh[256];
     const int G = kMInter / kMGroups, base = blockIdx.x * G, t = blockIdx.y;
+    if (zero_out)
+        for (int i = threadIdx.x; i < kHidden / kMGroups; i += 256) zero_out[size_t(t) * kHidden + blockIdx.x * (kHidden / kMGroups) + i] = 0.f;
     float* yr = y + size_t(t) * kMInter;
     const float* z = proj + size_t(t) * kInProj;
     float a = 0.f;
@@ -326,7 +329,7 @@ template <int NC, int RW = 1>
 __global__ void __launch_bounds__(1024) k_nvfp4_q8cols(const uint8_t* W, const uint8_t* S, float scale2, const uint8_t* xq,
                                                       float* y, int n, int rows, int T, int accumulate, int rpb) {
     constexpr int KS = 4096, NB = KS / 32;
-    __shared__ int xs[NC][NB][8];
+    __shared__ __attribute__((aligned(16))) int xs[NC][NB][8];
     __shared__ float xd[NC][NB];
     __shared__ float e4[256];
     __shared__ int kv[16];
@@ -373,28 +376,36 @@ __global__ void __launch_bounds__(1024) k_nvfp4_q8cols(const uint8_t* W, const u
             uint16_t sc[RW];
 #pragma unroll
             for (int r = 0; r < RW; ++r) { q[r] = w4[r][i]; sc[r] = s2[r][i]; }
+            float sa[RW], sb[RW];
+            int wq[RW][8];
 #pragma unroll
             for (int r = 0; r < RW; ++r) {
-                const float sa = e4[sc[r] & 255], sb = e4[sc[r] >> 8];
+                sa[r] = e4[sc[r] & 255];
+                sb[r] = e4[sc[r] >> 8];
                 const uint32_t word[4] = {q[r].x, q[r].y, q[r].z, q[r].w};
-                int wq[8];
 #pragma unroll
                 for (int k = 0; k < 4; ++k) {
                     const uint32_t bb = word[k];
 #pragma unroll
                     for (int h = 0; h < 2; ++h) {
                         const uint32_t u = bb >> (16 * h);
-                        wq[2 * k + h] = (kv[u & 15] & 255) | ((kv[(u >> 4) & 15] & 255) << 8) | ((kv[(u >> 8) & 15] & 255) << 16) |
-                                        ((kv[(u >> 12) & 15] & 255) << 24);
+                        wq[r][2 * k + h] = (kv[u & 15] & 255) | ((kv[(u >> 4) & 15] & 255) << 8) | ((kv[(u >> 8) & 15] & 255) << 16) |
+                                           ((kv[(u >> 12) & 15] & 255) << 24);
                     }
                 }
+            }
+            // each column's inputs read from LDS once for all RW rows
 #pragma unroll
-                for (int c = 0; c < NC; ++c) {
-                    const int* xv = xs[c][i];
+            for (int c = 0; c < NC; ++c) {
+                const int4 x0 = *reinterpret_cast<const int4*>(&xs[c][i][0]), x1 = *reinterpret_cast<const int4*>(&xs[c][i][4]);
+                const int xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+                const float d = xd[c][i];
+#pragma unroll
+                for (int r = 0; r < RW; ++r) {
                     int lo = 0, hi = 0;
 #pragma unroll
-                    for (int w = 0; w < 4; ++w) { lo = STRATA_DP4A(wq[w], xv[w], lo); hi = STRATA_DP4A(wq[w + 4], xv[w + 4], hi); }
-                    acc[r][c] += xd[c][i] * (float(lo) * sa + float(hi) * sb);
+                    for (int w = 0; w < 4; ++w) { lo = STRATA_DP4A(wq[r][w], xv[w], lo); hi = STRATA_DP4A(wq[r][w + 4], xv[w + 4], hi); }
+                    acc[r][c] += d * (float(lo) * sa[r] + float(hi) * sb[r]);
                 }
             }
         }
@@ -1277,8 +1288,16 @@ __global__ void __launch_bounds__(256) k_ssd_out2(const float* xbc, const float*
 // The same per-step arithmetic as k_mamba_scan (h = h * dA + dt B x), so the stored state equals the scan's at the
 // same step; the step values are read before the steps, as there.
 __global__ void __launch_bounds__(128) k_mamba_commit(const float* xbc, const float* proj, const uint16_t* A_log,
-                                                      const uint16_t* dt_bias, float* ssm, int m) {
+                                                      const uint16_t* dt_bias, float* ssm, float* conv_state, int m) {
     constexpr int RP = kMHeadDim / kScanSlices;
+    // the conv state too (k_mamba_conv_many's, after m positions): the last 3 raw inputs of [state, x_0 .. x_m-1],
+    // one channel per thread of the grid. The window's conv outputs (xbc) are already the check's.
+    if (const int ch = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x; ch < kConvDim) {
+        float* st = conv_state + size_t(ch) * (kConvK - 1);
+        float v0 = st[0], v1 = st[1], v2 = st[2];
+        for (int t = 0; t < m; ++t) { v0 = v1; v1 = v2; v2 = proj[size_t(t) * kInProj + kMInter + ch]; }
+        st[0] = v0; st[1] = v1; st[2] = v2;
+    }
     __shared__ float s_dt[kScanTile], s_dA[kScanTile], s_x[kScanTile][RP];
     const int hd = blockIdx.x, n = threadIdx.x;
     const int g = hd / (kMHeads / kMGroups), p0 = blockIdx.y * RP;
