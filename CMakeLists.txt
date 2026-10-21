@@ -313,6 +313,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata-nemo PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata-nemo PRIVATE strata_kernels strata_prefill ${_strata_gpu_runtime_target})
 
+  # Recursive Flint (src/flint): its own program, read straight from the Q4_1 GGUF
+  add_executable(strata-flint src/flint/flint_main.cu)
+  target_include_directories(strata-flint PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata-flint PRIVATE strata_kernels strata_prefill ${_strata_gpu_runtime_target})
+
   add_executable(strata-concurrent src/core/concurrent_main.cpp)
   target_include_directories(strata-concurrent PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata-concurrent PRIVATE strata_core strata_kernels ${_strata_gpu_runtime_target})
