@@ -1,12 +1,12 @@
 // src/nemotron/nemo_main.cu - strata-nemo: NVIDIA Nemotron 3.5 Bolt 74B-A9B 24GB's language model on one card.
 //
 // v1, the correctness build: one position at a time through all 88 blocks (40 Mamba-2, 40 latent MoE, 8 attention),
-// every weight resident in VRAM in its stored format. It is checked block by block against the float32 reference in
-// ~/nemotron-ref/ref.py (same maths, written as plainly as possible) before anything is made fast.
+// every weight resident in VRAM in its stored format. It was checked block by block against a float32 reference (the
+// same maths in plain Python, not included here) before anything was made fast.
 //
 //   strata-nemo --model DIR --ids 1784,8961,1307 [--new N] [--dump FILE] [--max-ctx N]
 //
-// DIR holds the safetensors files and strata-manifest.txt (written by ~/nemotron-ref/manifest.py). --dump writes, per
+// DIR holds the safetensors files and strata-manifest.txt (written by tools/nemotron/manifest.py). --dump writes, per
 // position, the 88 block outputs then the logits, all float32, after a header "NEMO1 positions blocks hidden vocab".
 //
 // Reused Strata kernels: iq_mmvq (IQ2_XXS experts) after quantize_q8_1_rows, native_q8_0_f32 (attention, latent

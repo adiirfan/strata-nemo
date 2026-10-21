@@ -1,7 +1,7 @@
 // src/nemotron/nemo_draft.cuh - NVIDIA's LiLiCorr drafter for Nemotron 3.5 Bolt (nvidia/...-24GB-LiLiCorr), the
 // kernels it needs beyond the target's. Transcribed from vLLM 77154ca6 (qwen3_dflash.py, qwen3_dflash2.py,
-// lilicorr.py, the DFlash / DFlash2 / LiLiCorr speculators) by way of ~/nemotron-ref/ref_draft.py, which matched the
-// engine's own greedy text at 7.2 tokens a round on a worked-arithmetic answer.
+// lilicorr.py, the DFlash / DFlash2 / LiLiCorr speculators) by way of a plain Python reference (not included), which
+// matched the engine's own greedy text on a worked-arithmetic answer.
 //
 // A round: the block [bonus, mask x 7] at positions pos..pos+7 goes through 5 Qwen3-style layers (grouped dynamic
 // convolutions around attention and MLP; attention bidirectional inside the block, a 1,024-position window over the
