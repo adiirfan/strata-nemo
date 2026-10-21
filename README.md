@@ -38,9 +38,27 @@ the prompt's length, so the drafter's speed moves around from row to row.
 - **Why reading slows down with length:** 80 of the model's 88 layers cost the same for every token. The 8 attention
   layers compare each new token with every one before it, so at 256K they take about half the reading time.
 
+## Through the server: `tools/strata_bench.py`
+
+Strata's own benchmark, run against the server (`python -m serve.server --engine strata --config ...`) with the
+drafter on and a 262,144-token context. Medians of 3 runs, thinking off, same card at 230 W.
+
+| Test | Result |
+| --- | ---: |
+| Chat: writing speed | 125.5 tokens/s (107-223) |
+| Chat: first token | 0.13 s |
+| 4K prompt: reading | 4,890 tokens/s, first token 0.84 s |
+| 16K prompt: reading | 5,203 tokens/s, first token 3.18 s |
+| 32K prompt: reading | 4,988 tokens/s, first token 6.62 s |
+| Agent session (6 turns, 4 tools): prompt reused from cache | 69% |
+| Agent session: first token per turn | 0.65 s |
+| Agent session: writing speed | 104.6 tokens/s |
+
+The chat writing speed ranges widely because it depends on how many of the drafter's guesses the model keeps.
+
 ## How these were measured
 
-- **Program:** `engine/strata-nemo` from the command line (there is no server yet).
+- **Program:** `engine/strata-nemo` from the command line (the table above; the server section has its own).
 - **Prompts:** real text, not repeated: the ONNX Runtime and llama.cpp documentation, joined and cut to each size.
   Then 256 tokens written greedily, continuing the text.
 - **Memory:** the card's peak use during the run, with the context sized to the prompt (`--max-ctx` = prompt + 344).
