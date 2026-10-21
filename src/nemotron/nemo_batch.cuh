@@ -25,8 +25,12 @@ __global__ void k_rmsnorm_many(const float* x, const uint16_t* w, float* y, int 
     for (int i = threadIdx.x; i < n; i += 1024) yr[i] = bf16f(w[i]) * (xr[i] * inv);
 }
 
-// h += d (+ e); y = norm(h) * w, one row per block
-__global__ void k_add_rmsnorm_many(float* h, const float* d, const float* e, const uint16_t* w, float* y, int n) {
+// a q8_1 block (block_q8_1's layout: fp16 scale and sum, 32 int8 values)
+struct Q8Blk { half2 ds; int8_t qs[32]; };
+// h += d (+ e); y = norm(h) * w, one row per block; q8 (if given): y as q8_1 rows too - a warp holds 32 consecutive
+// values, so each block is quantized exactly as quantize_q8_1_rows / native_quantize_q8_1 do it (same xor-tree max
+// and sum, the same bits), for the products that read n (one launch instead of one per product)
+__global__ void k_add_rmsnorm_many(float* h, const float* d, const float* e, const uint16_t* w, float* y, int n, void* q8 = nullptr) {
     __shared__ float sh[1024];
     const size_t o = size_t(blockIdx.x) * n;
     float a = 0.f;
@@ -36,7 +40,22 @@ __global__ void k_add_rmsnorm_many(float* h, const float* d, const float* e, con
         a += v * v;
     }
     const float inv = rsqrtf(block_sum<1024>(a, sh) / n + kEps);
-    for (int i = threadIdx.x; i < n; i += 1024) y[o + i] = bf16f(w[i]) * (h[o + i] * inv);
+    for (int i = threadIdx.x; i < n; i += 1024) {
+        const float xi = bf16f(w[i]) * (h[o + i] * inv);
+        y[o + i] = xi;
+        if (q8) {
+            float amax = fabsf(xi), sum = xi;
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+                sum += __shfl_xor_sync(0xffffffffu, sum, off);
+            }
+            const float dq = strata::kernels::q8_1_finite(amax / 127.0f);
+            Q8Blk* yb = reinterpret_cast<Q8Blk*>(q8) + (o + i) / 32;
+            yb->qs[i % 32] = strata::kernels::q8_1_quant(xi, dq, amax);
+            if (i % 32 == 0) yb->ds = strata::kernels::q8_1_ds(dq, sum);
+        }
+    }
 }
 
 // NVFP4 times T columns: one warp per row, NC columns per pass over the row's weights (y is (T, rows))

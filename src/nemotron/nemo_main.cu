@@ -14,6 +14,7 @@
 // state step, NoPE grouped-query attention, relu^2 and the small vector helpers.
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
@@ -556,6 +557,10 @@ struct Model {
     int32_t *g_n, *g_exp, *g_cnt, *g_tok, *g_slot;   // the step's expert groups
     void *q8, *q8b;
     void* q8s = nullptr;                   // the shared expert's packed inputs (its own: it runs beside the routed path)
+    // n as q8_1 rows, written by the residual add before a MoE or attention block (nq8: it holds this block's n)
+    void* q8n = nullptr;
+    bool nq8 = false;
+    bool use_q8n = !std::getenv("NEMO_Q8N") || std::atoi(std::getenv("NEMO_Q8N")) != 0;
     cudaStream_t stream2 = nullptr;         // the shared expert's stream in a small step
     cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
     cudaStream_t stream = nullptr;
@@ -670,6 +675,7 @@ struct Model {
         CK(cudaMalloc(&q8, std::max(strata::kernels::native_q8_1_bytes(8192, 8), size_t(kTMax) * (kAux / 32) * 36)));   // up to 16 rows of 24,576 (the drafter's fc)
         CK(cudaMalloc(&q8b, size_t(T) * 16 * (2560 / 32) * 36));
         CK(cudaMalloc(&q8s, size_t(kTMax) * (kShared / 32) * 36));
+        CK(cudaMalloc(&q8n, size_t(kTMax) * (kHidden / 32) * 36));
         CK(cudaStreamCreateWithFlags(&stream2, cudaStreamNonBlocking));
         CK(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming));
         reset();
@@ -688,6 +694,12 @@ struct Model {
 
     // Strata's Q8_0 kernel takes at most 8 columns a call
     void q8_0(const void* w, const float* x, float* out, int n_in, int n_out, int T) {
+        if (x == n && nq8) {   // (n already in q8_1, from the residual add)
+            for (int c = 0; c < T; c += 8)
+                strata::kernels::native_q8_0_mmvq(w, static_cast<const uint8_t*>(q8n) + size_t(c) * (n_in / 32) * 36, out + size_t(c) * n_out,
+                                                  n_in, n_out, std::min(8, T - c), stream);
+            return;
+        }
         for (int c = 0; c < T; c += 8)
             strata::kernels::native_q8_0_f32(w, x + size_t(c) * n_in, q8, out + size_t(c) * n_out, n_in, n_out, std::min(8, T - c), stream);
     }
@@ -813,8 +825,8 @@ struct Model {
         if (sh_par) {
             CK(cudaEventRecord(ev_fork, stream));
             CK(cudaStreamWaitEvent(stream2, ev_fork, 0));
-            strata::kernels::quantize_q8_1_rows(n, T, kHidden, q8s, stream2);
-            iq2_q_on(b.sh_up, q8s, tmp, kHidden, kShared, T, stream2);
+            if (!nq8) strata::kernels::quantize_q8_1_rows(n, T, kHidden, q8s, stream2);
+            iq2_q_on(b.sh_up, nq8 ? q8n : q8s, tmp, kHidden, kShared, T, stream2);
             strata::kernels::relu2_quantize_q8_1_rows(tmp, T, kShared, q8s, stream2);
             iq2_q_on(b.sh_down, q8s, tmp2, kShared, kHidden, T, stream2);
             CK(cudaEventRecord(ev_join, stream2));
@@ -840,7 +852,8 @@ struct Model {
         // (llama.cpp's MMQ for these two at T = 8 measured slower: 46 vs 34 us a call)
         if (sh_par) CK(cudaStreamWaitEvent(stream, ev_join, 0));
         else {
-            iq2(b.sh_up, n, tmp, kHidden, kShared, T);
+            if (nq8) iq2_q(b.sh_up, q8n, tmp, kHidden, kShared, T);
+            else iq2(b.sh_up, n, tmp, kHidden, kShared, T);
             strata::kernels::relu2_quantize_q8_1_rows(tmp, T, kShared, q8, stream);
             iq2_q(b.sh_down, q8, tmp2, kShared, kHidden, T);
         }
@@ -853,6 +866,7 @@ struct Model {
     void body(int T, int write_after, bool all_logits, std::vector<float>* dump) {
         k_embed_many<<<dim3(16, T), 256, 0, stream>>>(embed, d_toks, h);
         k_rmsnorm_many<<<T, 1024, 0, stream>>>(h, blocks[0].norm, n, kHidden);
+        nq8 = false;
         for (size_t i = 0; i < blocks.size(); ++i) {
             Block& b = blocks[i];
             extra = nullptr;
@@ -860,7 +874,10 @@ struct Model {
             else if (b.kind == MOE) moe(b, T);
             else attention(b, T);
             const uint16_t* nw = i + 1 < blocks.size() ? blocks[i + 1].norm : norm_f;
-            k_add_rmsnorm_many<<<T, 1024, 0, stream>>>(h, d, extra, nw, n, kHidden);
+            // (the next block's n in q8_1 too when its products read it so: MoE fc1 + shared up, attention q/k/v)
+            const bool q = i + 1 < blocks.size() && blocks[i + 1].kind != MAMBA && use_q8n;
+            k_add_rmsnorm_many<<<T, 1024, 0, stream>>>(h, d, extra, nw, n, kHidden, q ? q8n : nullptr);
+            nq8 = q;
             tap(i, h, aux, T);
             if (dump) {
                 std::vector<float> rows(size_t(T) * kHidden);
