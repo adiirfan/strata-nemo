@@ -517,6 +517,9 @@ __device__ inline uint16_t f2bf(float f) {     // round to nearest even
     u += 0x7fffu + ((u >> 16) & 1u);
     return uint16_t(u >> 16);
 }
+__global__ void k_relu2_to_bf16(const float* x, uint16_t* y, size_t n) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) { const float v = fmaxf(x[i], 0.f); y[i] = f2bf(v * v); }
+}
 __global__ void k_to_bf16(const float* x, uint16_t* y, size_t n) {
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) y[i] = f2bf(x[i]);
 }

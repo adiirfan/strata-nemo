@@ -1601,6 +1601,13 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
 template<typename dst_t> __device__ __forceinline__ dst_t cvt(float v);
 template<> __device__ __forceinline__ float cvt<float>(float v) { return v; }
 template<> __device__ __forceinline__ __half cvt<__half>(float v) { return __float2half(v); }
+// BF16 bits, rounded to nearest even (the prompt path's BF16 GEMMs)
+struct Bf16Bits { uint16_t v; };
+template<> __device__ __forceinline__ Bf16Bits cvt<Bf16Bits>(float f) {
+    uint32_t u = __float_as_uint(f);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return Bf16Bits{(uint16_t) (u >> 16)};
+}
 
 template<typename dst_t>
 __device__ void dq_iq2_xxs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -2803,6 +2810,12 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
         default: std::fprintf(stderr, "iq_mmvq: type %d is not supported\n", t); std::exit(1);
     }
     check("iq_mmvq");
+}
+
+void iq_dequant_bf16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
+    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_bf16: bad arguments\n"); std::exit(1); }
+    dequant_flat_kernel<Bf16Bits><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (Bf16Bits*) dst);
+    check("iq_dequant_bf16");
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {

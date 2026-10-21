@@ -979,7 +979,8 @@ struct Model {
         B->gemm.bf16(B->xb, B->gemm.scratch(), Y, T, rows, K, 0, 0.0f, 0, s2);   // scale_2 as the product's alpha
     }
 
-    bool ssd_old = std::getenv("NEMO_SSD_OLD") != nullptr;   // the three-kernel state hand-off, for comparison
+    bool ssd_old = std::getenv("NEMO_SSD_OLD") != nullptr;
+    bool sh_mmq = std::getenv("NEMO_SH_MMQ") != nullptr;     // the shared expert through MMQ (before: BF16 GEMM)   // the three-kernel state hand-off, for comparison
     void mamba_big(Block& b, int T) {
         nvfp4_big(b.in_w, b.in_s, b.in_s2, B->n, B->proj, T, kInProj, kHidden);
         k_mamba_conv_tiles<<<dim3((kConvDim + 255) / 256, (T + kConvTile - 1) / kConvTile), 256, 0, stream>>>(B->proj, b.conv_state, b.conv_w, b.conv_b, B->xbc, T);
@@ -1048,9 +1049,19 @@ struct Model {
         // idle while the host launches the rest (a stream sync here cost ~0.25 ms of idle card a layer)
         mmq_dense(b.fc1, 8, B->n, B->lat, T, kLatent, kHidden);
         mq::quantize(B->lat, B->src, B->xq, kIQ2_XXS, kLatent, kLatent, S, stream);
-        mmq_dense(b.sh_up, kIQ2_XXS, B->n, B->tmp, T, kShared, kHidden);
-        k_relu2<<<1024, 256, 0, stream>>>(B->tmp, size_t(T) * kShared);
-        mmq_dense(b.sh_down, kIQ2_XXS, B->tmp, B->tmp2, T, kHidden, kShared);
+        if (sh_mmq) {
+            mmq_dense(b.sh_up, kIQ2_XXS, B->n, B->tmp, T, kShared, kHidden);
+            k_relu2<<<1024, 256, 0, stream>>>(B->tmp, size_t(T) * kShared);
+            mmq_dense(b.sh_down, kIQ2_XXS, B->tmp, B->tmp2, T, kHidden, kShared);
+        } else {
+            // the shared expert unpacked to BF16 and through the BLAS GEMM (B->xb still holds n in BF16, from the
+            // router): MMQ reached ~85 int8 TOPS on these two, the BF16 GEMM ~150 TFLOPS
+            strata::kernels::iq_dequant_bf16(kIQ2_XXS, b.sh_up, int64_t(kShared) * kHidden, B->gemm.scratch(), stream);
+            B->gemm.bf16(B->xb, B->gemm.scratch(), B->tmp, T, kShared, kHidden);
+            k_relu2_to_bf16<<<1024, 256, 0, stream>>>(B->tmp, B->xb, size_t(T) * kShared);
+            strata::kernels::iq_dequant_bf16(kIQ2_XXS, b.sh_down, int64_t(kHidden) * kShared, B->gemm.scratch(), stream);
+            B->gemm.bf16(B->xb, B->gemm.scratch(), B->tmp2, T, kHidden, kShared);
+        }
         CK(cudaEventSynchronize(B->counted));
         int maxr = 1;
         for (int e = 0; e < b.n_exp; ++e) maxr = std::max(maxr, B->hbounds[e + 1] - B->hbounds[e]);
