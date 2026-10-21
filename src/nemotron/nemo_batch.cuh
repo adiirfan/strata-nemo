@@ -1491,7 +1491,9 @@ __global__ void __launch_bounds__(kFwPos * 32) k_attn_flash(const float* __restr
                     mx = fmaxf(mx, v[nt][i]);
                 }
         }
-        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 16, 32));
+        // (the other half's max by permlanex16: a shuffle went through LDS, a wait on the softmax's critical path)
+        mx = fmaxf(mx, __int_as_float((int) __builtin_amdgcn_permlanex16((unsigned) __float_as_int(mx), (unsigned) __float_as_int(mx),
+                                                                            0x76543210u, 0xfedcba98u, false, false)));
         // (the bare v_exp_f32: exp2f's guard for results below the normal range is several instructions an exp, and
         // such results only need to come out as 0)
         const float mn = fmaxf(m, mx), alpha = __builtin_amdgcn_exp2f(m - mn);
