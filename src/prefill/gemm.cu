@@ -1035,6 +1035,29 @@ bool Gemm::native_fp8(const uint16_t* X, int ggml_type, const void* W_blocks, fl
 #endif
 }
 
+bool Gemm::fp8(const uint8_t* X8, const uint8_t* W8, const float* alpha, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+    auto* st = static_cast<HipLtState*>(hipblaslt_state_);
+    if (st == nullptr || T <= 0 || K % 16 != 0 || N > INT_MAX || K > INT_MAX || T > INT_MAX) return false;
+    if (ldy <= 0) ldy = N;
+    if (fp8_cache_ == nullptr) fp8_cache_ = new Fp8Cache();
+    auto& cache = *static_cast<Fp8Cache*>(fp8_cache_);
+    const float beta = 0.0f;
+    const Fp8Plan& p = fp8_plan(cache, *st, (int) T, (int) N, (int) K, (int) ldy, beta);
+    if (!p.ok) return false;
+    const hipblasStatus_t rs = hipblasLtMatmul(st->handle, p.op, alpha, W8, p.a, X8, p.b, &beta, Y, p.c, Y, p.c, &p.algo,
+                                               st->workspace, st->workspace_bytes, (cudaStream_t) stream_);
+    if (rs != HIPBLAS_STATUS_SUCCESS) {
+        std::fprintf(stderr, "prefill gemm: fp8: status %d (t %lld n %lld k %lld)\n", (int) rs, (long long) T, (long long) N, (long long) K);
+        std::exit(1);
+    }
+    return true;
+#else
+    (void) X8; (void) W8; (void) alpha; (void) Y; (void) T; (void) N; (void) K; (void) ldy;
+    return false;
+#endif
+}
+
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta, int64_t ldx) {
 #ifdef STRATA_USE_HIP

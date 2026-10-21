@@ -37,6 +37,10 @@ public:
     /// shape (so the caller falls back to bf16(), with the same ldx).
     bool bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K);
 
+    /// FP8 (E4M3) product of operands already converted: Y[T, N] (fp32, row stride ldy) = X8[T, K] . W8[N, K]^T, each
+    /// output column n times alpha[n] (a device vector). false (nothing launched) where hipBLASLt has no FP8 plan.
+    bool fp8(const uint8_t* X8, const uint8_t* W8, const float* alpha, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0);
+
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);

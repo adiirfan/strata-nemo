@@ -517,6 +517,67 @@ __device__ inline uint16_t f2bf(float f) {     // round to nearest even
     u += 0x7fffu + ((u >> 16) & 1u);
     return uint16_t(u >> 16);
 }
+// ---- FP8 (E4M3) operands for the prompt path's NVFP4 products ----
+// four floats to E4M3 (OCP, as hipBLASLt's HIP_R_8F_E4M3 on gfx12), round to nearest even, by the card's converter
+__device__ __forceinline__ uint32_t fp8x4(float a, float b, float c, float d) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    int v = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
+    v = __builtin_amdgcn_cvt_pk_fp8_f32(c, d, v, true);
+    return (uint32_t) v;
+#else
+    __trap();
+    return 0;
+#endif
+}
+// one block per weight row: the row unpacked (E2M1 x its E4M3 block scale; scale_2 is left to alpha), its largest
+// magnitude / 448 as the row scale, the row in E4M3 at that scale
+__global__ void __launch_bounds__(256) k_nvfp4_to_e4m3_rows(const uint8_t* W, const uint8_t* S, int K, uint8_t* w8, float* rscale) {
+    __shared__ float red[256];
+    const int64_t r = blockIdx.x;
+    const uint8_t* wr = W + r * (K / 2);
+    const uint8_t* sr = S + r * (K / 16);
+    float m = 0.f;
+    for (int i = threadIdx.x; i < K / 2; i += 256) {
+        const uint8_t b = wr[i];
+        const float sc = e4m3f(sr[(2 * i) / 16]);
+        m = fmaxf(m, fmaxf(fabsf(e2m1x2(b & 15)), fabsf(e2m1x2(b >> 4))) * 0.5f * sc);
+    }
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]); __syncthreads(); }
+    const float rs = red[0] > 0.f ? red[0] / 448.f : 1.f, inv = 1.f / rs;
+    for (int i = threadIdx.x; i < K / 4; i += 256) {                 // 4 values (2 bytes) a step
+        const uint8_t b0 = wr[2 * i], b1 = wr[2 * i + 1];
+        const float sc = e4m3f(sr[(4 * i) / 16]) * 0.5f * inv;
+        reinterpret_cast<uint32_t*>(w8 + r * K)[i] = fp8x4(e2m1x2(b0 & 15) * sc, e2m1x2(b0 >> 4) * sc, e2m1x2(b1 & 15) * sc, e2m1x2(b1 >> 4) * sc);
+    }
+    if (threadIdx.x == 0) rscale[r] = rs;
+}
+// the largest |x| of n values into *amax (float bits)
+__global__ void __launch_bounds__(256) k_amax(const float* x, size_t n, uint32_t* amax) {
+    __shared__ float red[256];
+    float m = 0.f;
+    for (size_t i = size_t(blockIdx.x) * 256 + threadIdx.x; i < n; i += size_t(gridDim.x) * 256) m = fmaxf(m, fabsf(x[i]));
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]); __syncthreads(); }
+    if (threadIdx.x == 0 && red[0] > 0.f) atomicMax(amax, __float_as_uint(red[0]));
+}
+// x in E4M3 at the scale amax / 448
+__global__ void k_to_e4m3(const float* x, size_t n, const uint32_t* amax, uint8_t* x8) {
+    const float m = __uint_as_float(*amax), inv = m > 0.f ? 448.f / m : 1.f;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n / 4; i += size_t(gridDim.x) * blockDim.x) {
+        const float4 v = reinterpret_cast<const float4*>(x)[i];
+        reinterpret_cast<uint32_t*>(x8)[i] = fp8x4(v.x * inv, v.y * inv, v.z * inv, v.w * inv);
+    }
+}
+// alpha[n] = row scale x activation scale x scale_2
+__global__ void k_fp8_alpha(const float* rscale, int N, const uint32_t* amax, float s2, float* alpha) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const float m = __uint_as_float(*amax), xs = m > 0.f ? m / 448.f : 1.f;
+    if (i < N) alpha[i] = rscale[i] * xs * s2;
+}
+
 __global__ void k_relu2_to_bf16(const float* x, uint16_t* y, size_t n) {
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) { const float v = fmaxf(x[i], 0.f); y[i] = f2bf(v * v); }
 }

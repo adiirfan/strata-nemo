@@ -931,6 +931,9 @@ struct Model {
         int32_t* ccnt;                // the sort's per-chunk expert counts / offsets
         cudaEvent_t counted;          // bounds copied to hbounds
         int32_t *mtiles, *mtiles_n;   // the matrix-core expert kernel's work list
+        uint8_t *w8 = nullptr, *x8 = nullptr;   // NEMO_FP8: E4M3 weight and activations, row scales and alpha, amax
+        float* rscale = nullptr;
+        uint32_t* amax = nullptr;
         uint16_t *lat16, *exh;        // its inputs in the scaled FP16 form, and their scales
         float *lats, *exs;
         int32_t* small_bounds;        // {0, T} for T <= kTMax, at 2 T
@@ -982,6 +985,16 @@ struct Model {
         if (!strata::prefill::mmq::built()) { std::fprintf(stderr, "strata-nemo: this build has no MMQ\n"); std::exit(1); }
         // one product now, so the library's first-use set-up (~0.4 s) is not paid inside the first prompt
         B->gemm.bf16(B->xb, B->gemm.scratch(), B->proj, kTBig, kInProj, kHidden, 0, 0.0f, 0, 1.0f);
+        if (use_fp8) {   // and the FP8 products' (their first call cost ~0.45 s): both NVFP4 shapes at a full chunk
+            CK(cudaMemsetAsync(B->n, 0, size_t(kTBig) * kHidden * 4, stream));
+            CK(cudaMemsetAsync(B->y, 0, size_t(kTBig) * kMInter * 4, stream));
+            for (auto& b : blocks)
+                if (b.kind == MAMBA) {
+                    nvfp4_fp8(b.in_w, b.in_s, b.in_s2, B->n, B->proj, kTBig, kInProj, kHidden);
+                    nvfp4_fp8(b.out_w, b.out_s, b.out_s2, B->y, B->d, kTBig, kHidden, kMInter);
+                    break;
+                }
+        }
         CK(cudaStreamSynchronize(stream));
     }
     // the chunk's slots sorted by expert into B->bounds / src / rowof (see k_sort_count)
@@ -1010,7 +1023,30 @@ struct Model {
     }
     // NVFP4 projection: unpacked to BF16 (exact) in the GEMM scratch, X to BF16, hipBLASLt times scale_2 (its alpha:
     // the same bits as scaling the fp32 product after, without the extra pass)
+    // NEMO_FP8 (trial): the NVFP4 products in FP8 - the weight per row and the activations per chunk in E4M3,
+    // hipBLASLt's FP8 product with alpha = row scale x activation scale x scale_2
+    // NEMO_FP8 = 1 (default): both NVFP4 products of prompt chunks of 256+ rows in FP8, 2: in_proj only, 3: out_proj
+    // only, 0: BF16. Measured (8K-token texts, next-token perplexity): README 4.5585 -> 4.5645, DETAILS.md 7.5497 ->
+    // 7.5674 (+0.13%, +0.23%; top-1 66.03 -> 65.95%, 53.04 -> 53.14%); reading 8K 2,661 -> 3,064 tokens a second
+    int fp8_mode = std::getenv("NEMO_FP8") ? std::atoi(std::getenv("NEMO_FP8")) : 1;
+    bool use_fp8 = fp8_mode != 0;
+    bool nvfp4_fp8(const uint8_t* w, const uint8_t* sc, float s2, const float* X, float* Y, int T, int rows, int K) {
+        if (!B->w8) {
+            CK(cudaMalloc(&B->w8, size_t(kInProj) * kHidden)); CK(cudaMalloc(&B->x8, size_t(kTBig) * kMInter));
+            CK(cudaMalloc(&B->rscale, 2 * size_t(kInProj) * 4)); CK(cudaMalloc(&B->amax, 4));
+        }
+        k_nvfp4_to_e4m3_rows<<<rows, 256, 0, stream>>>(w, sc, K, B->w8, B->rscale);
+        CK(cudaMemsetAsync(B->amax, 0, 4, stream));
+        const size_t n = size_t(T) * K;
+        k_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
+        k_to_e4m3<<<2048, 256, 0, stream>>>(X, n, B->amax, B->x8);
+        float* alpha = B->rscale + kInProj;
+        k_fp8_alpha<<<(rows + 255) / 256, 256, 0, stream>>>(B->rscale, rows, B->amax, s2, alpha);
+        return B->gemm.fp8(B->x8, B->w8, alpha, Y, T, rows, K);
+    }
     void nvfp4_big(const uint8_t* w, const uint8_t* sc, float s2, const float* X, float* Y, int T, int rows, int K) {
+        const bool fp8_here = T >= 256 && (fp8_mode == 1 || (fp8_mode == 2 && rows == kInProj) || (fp8_mode == 3 && rows == kHidden && K == kMInter));
+        if (fp8_here && nvfp4_fp8(w, sc, s2, X, Y, T, rows, K)) return;
         const size_t nb = size_t(rows) * K / 2;
         k_nvfp4_to_bf16<<<2048, 256, 0, stream>>>(w, sc, B->gemm.scratch(), nb);
         k_to_bf16<<<1024, 256, 0, stream>>>(X, B->xb, size_t(T) * K);
@@ -1583,6 +1619,14 @@ int main(int argc, char** argv) {
     for (std::string v; std::getline(ss, v, ',');) ids.push_back(std::stoi(v));
 
     const auto t0 = std::chrono::steady_clock::now();
+    // hipBLASLt's tuned solutions (and with them its FP8 products) for this card, unless the caller set a table
+    if (!std::getenv("STRATA_HIPBLASLT_TUNING")) {
+        char exe[4096] = {};
+        const ssize_t len = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        std::string tbl = std::string(exe, len > 0 ? size_t(len) : 0);
+        tbl = tbl.substr(0, tbl.rfind('/')) + "/../tools/hip/gfx1201-hipblaslt-100500.txt";
+        if (FILE* f = std::fopen(tbl.c_str(), "r")) { std::fclose(f); setenv("STRATA_HIPBLASLT_TUNING", tbl.c_str(), 0); }
+    }
     Model m(dir, ctx);
     m.init_big();                              // the prompt path's buffers and library, before any prompt is timed
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
