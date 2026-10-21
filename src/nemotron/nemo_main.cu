@@ -501,7 +501,7 @@ struct Block {
     size_t up_bytes = 0, down_bytes = 0;
     // attention
     const void *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr;
-    float *K = nullptr, *V = nullptr;
+    uint16_t *K = nullptr, *V = nullptr;   // attention: the KV cache in BF16, kv_rows rows a KV head
     int win = -1;                     // index of this Mamba layer's window buffers
 };
 
@@ -539,6 +539,7 @@ struct Model {
     Store st;
     std::vector<Block> blocks;
     int max_ctx;
+    int kv_rows() const { return max_ctx + 64; }   // the BF16 KV cache's rows a KV head (k_attn_flash reads up to 63 past)
     const uint16_t *embed = nullptr, *norm_f = nullptr;
     const void* head = nullptr;
     // scratch, kTMax rows each
@@ -637,8 +638,10 @@ struct Model {
                 b.kind = ATTN;
                 b.q = st.dev(M + "q_proj.weight"); b.k = st.dev(M + "k_proj.weight");
                 b.v = st.dev(M + "v_proj.weight"); b.o = st.dev(M + "o_proj.weight");
-                CK(cudaMalloc(&b.K, sizeof(float) * kAKv * size_t(max_ctx) * kAHeadDim));
-                CK(cudaMalloc(&b.V, sizeof(float) * kAKv * size_t(max_ctx) * kAHeadDim));
+                CK(cudaMalloc(&b.K, 2 * kAKv * size_t(kv_rows()) * kAHeadDim));
+                CK(cudaMalloc(&b.V, 2 * kAKv * size_t(kv_rows()) * kAHeadDim));
+                CK(cudaMemset(b.K, 0, 2 * kAKv * size_t(kv_rows()) * kAHeadDim));   // (finite past the last key)
+                CK(cudaMemset(b.V, 0, 2 * kAKv * size_t(kv_rows()) * kAHeadDim));
             } else {
                 std::fprintf(stderr, "strata-nemo: block %zu has unknown type %s\n", i, types[i].c_str()); std::exit(1);
             }
@@ -758,14 +761,14 @@ struct Model {
         q8_0(b.q, n, qkv, kHidden, kAHeads * kAHeadDim, T);
         q8_0(b.k, n, kbuf, kHidden, kAKv * kAHeadDim, T);
         q8_0(b.v, n, vbuf, kHidden, kAKv * kAHeadDim, T);
-        k_kv_append_many<<<dim3(T, kAKv), kAHeadDim, 0, stream>>>(kbuf, vbuf, b.K, b.V, d_pos, max_ctx);
+        k_kv_append_many<<<dim3(T, kAKv), kAHeadDim, 0, stream>>>(kbuf, vbuf, b.K, b.V, d_pos, kv_rows());
         // T <= 16 rows: one query tile, the keys present split into kDecSplits equal shares (an empty share is
         // weighted 0 by the combine)
         const int splits = kDecSplits;
         const size_t lds = size_t(T) * (5 * kAHeadDim + 8) * 4;
-        if (T == 1) k_attn_dec<1><<<dim3(kAHeads, splits), 128, lds, stream>>>(qkv, b.K, b.V, att_sc, d_pos, max_ctx, T, splits);
-        else if (T <= 8) k_attn_dec<8><<<dim3(kAHeads, splits), 128, lds, stream>>>(qkv, b.K, b.V, att_sc, d_pos, max_ctx, T, splits);
-        else k_attn_dec<kTMax><<<dim3(kAHeads, splits), 128, lds, stream>>>(qkv, b.K, b.V, att_sc, d_pos, max_ctx, T, splits);
+        if (T == 1) k_attn_dec<1><<<dim3(kAHeads, splits), 128, lds, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
+        else if (T <= 8) k_attn_dec<8><<<dim3(kAHeads, splits), 128, lds, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
+        else k_attn_dec<kTMax><<<dim3(kAHeads, splits), 128, lds, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
         k_flash_combine<<<dim3(kAHeads, T), kAHeadDim, 0, stream>>>(att_sc, y, splits);
         q8_0(b.o, y, d, kAHeads * kAHeadDim, kHidden, T);
     }
@@ -998,7 +1001,7 @@ struct Model {
         }         // BF16 activations up to kTBig x 24,576 (the drafter's fc)
         // the prompt attention products hold (16 T x max_ctx) scores: this caps the context they serve
         const size_t Lmax = size_t(max_ctx + 64);
-        CK(cudaMalloc(&B->kb2, kAKv * Lmax * kAHeadDim * 2)); CK(cudaMalloc(&B->vtb2, kAKv * Lmax * kAHeadDim * 2));
+        CK(cudaMalloc(&B->vtb2, kAKv * Lmax * kAHeadDim * 2));   // (the keys are read from the BF16 cache itself)
         if (att_old) {   // the two-GEMM attention's score tables (24 KB a context position) only when it runs
             CK(cudaMalloc(&B->kb, Lmax * kAHeadDim * 2)); CK(cudaMalloc(&B->vtb, Lmax * kAHeadDim * 2));
             CK(cudaMalloc(&B->qb, 16 * kAttSub * kAHeadDim * 2)); CK(cudaMalloc(&B->O, 16 * kAttSub * kAHeadDim * 4));
@@ -1282,23 +1285,23 @@ struct Model {
         mmq_dense(b.q, 8, B->n, q, T, kAHeads * kAHeadDim, kHidden);
         mmq_dense(b.k, 8, B->n, kk, T, kAKv * kAHeadDim, kHidden);
         mmq_dense(b.v, 8, B->n, vv, T, kAKv * kAHeadDim, kHidden);
-        k_kv_append_many<<<dim3(T, kAKv), kAHeadDim, 0, stream>>>(kk, vv, b.K, b.V, d_pos, max_ctx);
+        k_kv_append_many<<<dim3(T, kAKv), kAHeadDim, 0, stream>>>(kk, vv, b.K, b.V, d_pos, kv_rows());
         const int Lp = (pos + T + 63) / 64 * 64;
         if (!att_old) {
             // one pass on the matrix cores per (KV head, 8 positions): the scores stay on the chip (k_attn_flash)
             const size_t kvs = size_t(max_ctx + 64) * kAHeadDim;
-            for (int g = 0; g < kAKv; ++g) {
-                k_k_bf16<<<1024, 256, 0, stream>>>(b.K + size_t(g) * max_ctx * kAHeadDim, B->kb2 + g * kvs, d_pos, T, max_ctx, Lp);
-                k_vt_bf16<<<1024, 256, 0, stream>>>(b.V + size_t(g) * max_ctx * kAHeadDim, B->vtb2 + g * kvs, d_pos, T, Lp);
-            }
-            k_attn_flash<<<dim3((T + kFwPos - 1) / kFwPos, kAKv), 256, 0, stream>>>(q, B->kb2, B->vtb2, kvs, d_pos, T, Lp, B->y);
+            // (the keys straight from the BF16 cache; V transposed for the product)
+            for (int g = 0; g < kAKv; ++g)
+                k_vt_bf16<<<1024, 256, 0, stream>>>(b.V + size_t(g) * kv_rows() * kAHeadDim, B->vtb2 + g * kvs, d_pos, T, Lp);
+            k_attn_flash<<<dim3((T + kFwPos - 1) / kFwPos, kAKv), 256, 0, stream>>>(q, b.K, size_t(kv_rows()) * kAHeadDim, B->vtb2, kvs,
+                                                                                     d_pos, T, Lp, B->y);
             mmq_dense(b.o, 8, B->y, B->d, T, kHidden, kAHeads * kAHeadDim);
             return;
         }
         // two products per KV head through hipBLASLt: S = Q K^T (16 T x L), causal softmax, O = P V
         for (int g = 0; g < kAKv; ++g) {
-            const float* Kg = b.K + size_t(g) * max_ctx * kAHeadDim;
-            const float* Vg = b.V + size_t(g) * max_ctx * kAHeadDim;
+            const uint16_t* Kg = b.K + size_t(g) * kv_rows() * kAHeadDim;
+            const uint16_t* Vg = b.V + size_t(g) * kv_rows() * kAHeadDim;
             k_k_bf16<<<1024, 256, 0, stream>>>(Kg, B->kb, d_pos, T, max_ctx, Lp);
             k_vt_bf16<<<1024, 256, 0, stream>>>(Vg, B->vtb, d_pos, T, Lp);
             for (int t0 = 0; t0 < T; t0 += kAttSub) {

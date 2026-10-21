@@ -240,11 +240,14 @@ __global__ void k_gated_norm_many(float* y, const float* proj, const uint16_t* w
 }
 
 // attention for T new positions starting at *pos0: their keys / values are appended, then each attends causally
-__global__ void k_kv_append_many(const float* k, const float* v, float* K, float* V, const int* pos0, int max_ctx) {
+__device__ inline uint16_t f2bf(float f);   // (below)
+// (the cache is BF16, as the reference keeps it: kv_rows = max_ctx + 64 rows a KV head, the 64 for k_attn_flash's
+// reads past the last key)
+__global__ void k_kv_append_many(const float* k, const float* v, uint16_t* K, uint16_t* V, const int* pos0, int kv_rows) {
     const int t = blockIdx.x, kv = blockIdx.y, i = threadIdx.x;
-    const size_t at = (size_t(kv) * max_ctx + *pos0 + t) * kAHeadDim + i;
-    K[at] = k[size_t(t) * kAKv * kAHeadDim + kv * kAHeadDim + i];
-    V[at] = v[size_t(t) * kAKv * kAHeadDim + kv * kAHeadDim + i];
+    const size_t at = (size_t(kv) * kv_rows + *pos0 + t) * kAHeadDim + i;
+    K[at] = f2bf(k[size_t(t) * kAKv * kAHeadDim + kv * kAHeadDim + i]);
+    V[at] = f2bf(v[size_t(t) * kAKv * kAHeadDim + kv * kAHeadDim + i]);
 }
 // sc: (T, kAHeads, max_ctx)
 __global__ void k_att_scores_many(const float* q, const float* K, float* sc, const int* pos0, int max_ctx) {
@@ -1099,7 +1102,7 @@ __global__ void k_conv_state_set(const float* proj, float* state, int T, const f
 // spilled to scratch: 272 bytes, 36 us a call)
 constexpr int kDecSplits = 16, kDecRun = 32;
 template <int NT>
-__global__ void __launch_bounds__(128) k_attn_dec(const float* q, const float* K, const float* V, float* part,
+__global__ void __launch_bounds__(128) k_attn_dec(const float* q, const uint16_t* K, const uint16_t* V, float* part,
                                                   const int* pos0, int max_ctx, int T, int splits) {
     // LDS sized for T rows (dynamic): qs[T][128], wacc[4][T][128], wm[4][T], wl[4][T]
     extern __shared__ float dsh[];
@@ -1116,12 +1119,16 @@ __global__ void __launch_bounds__(128) k_attn_dec(const float* q, const float* K
     float m[NT], l[NT], acc[NT][4];
 #pragma unroll
     for (int r = 0; r < NT; ++r) { m[r] = -1e30f; l[r] = 0.f; acc[r][0] = acc[r][1] = acc[r][2] = acc[r][3] = 0.f; }
-    const float* Kh = K + size_t(kvh) * max_ctx * kAHeadDim;
-    const float* Vh = V + size_t(kvh) * max_ctx * kAHeadDim;
+    const uint16_t* Kh = K + size_t(kvh) * max_ctx * kAHeadDim;       // (max_ctx: the cache's rows a head)
+    const uint16_t* Vh = V + size_t(kvh) * max_ctx * kAHeadDim;
     for (int j0 = z * kDecRun; j0 < p0 + T; j0 += splits * kDecRun)
     for (int j = j0 + warp; j < min(p0 + T, j0 + kDecRun); j += 4) {
-        const float4 kv = reinterpret_cast<const float4*>(Kh + size_t(j) * kAHeadDim)[lane];
-        const float4 vv = reinterpret_cast<const float4*>(Vh + size_t(j) * kAHeadDim)[lane];
+        const uint2 kb = reinterpret_cast<const uint2*>(Kh + size_t(j) * kAHeadDim)[lane];
+        const uint2 vb = reinterpret_cast<const uint2*>(Vh + size_t(j) * kAHeadDim)[lane];
+        const float4 kv = make_float4(__uint_as_float(kb.x << 16), __uint_as_float(kb.x & 0xffff0000u),
+                                      __uint_as_float(kb.y << 16), __uint_as_float(kb.y & 0xffff0000u));
+        const float4 vv = make_float4(__uint_as_float(vb.x << 16), __uint_as_float(vb.x & 0xffff0000u),
+                                      __uint_as_float(vb.y << 16), __uint_as_float(vb.y & 0xffff0000u));
 #pragma unroll
         for (int r = 0; r < NT; ++r) {
             if (r >= T) break;
@@ -1162,19 +1169,19 @@ __global__ void __launch_bounds__(128) k_attn_dec(const float* q, const float* K
 
 // Prompt chunks: attention as two hipBLASLt products per KV head (see Model::attention_big).
 // K rows [0, L) of KV head g to BF16, (Lp x 128), zero rows past L
-__global__ void k_k_bf16(const float* K, uint16_t* out, const int* pos0, int T, int max_ctx, int Lp) {
+__global__ void k_k_bf16(const uint16_t* K, uint16_t* out, const int* pos0, int T, int max_ctx, int Lp) {
     const int L = *pos0 + T;
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < size_t(Lp) * kAHeadDim; i += size_t(gridDim.x) * blockDim.x) {
         const int j = int(i / kAHeadDim);
-        out[i] = j < L ? f2bf(K[i]) : 0;
+        out[i] = j < L ? K[i] : 0;
     }
 }
 // V rows [0, L) of KV head g transposed to BF16, (128 x Lp)
-__global__ void k_vt_bf16(const float* V, uint16_t* out, const int* pos0, int T, int Lp) {
+__global__ void k_vt_bf16(const uint16_t* V, uint16_t* out, const int* pos0, int T, int Lp) {
     const int L = *pos0 + T;
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < size_t(Lp) * kAHeadDim; i += size_t(gridDim.x) * blockDim.x) {
         const int d = int(i / Lp), j = int(i % Lp);
-        out[i] = j < L ? f2bf(V[size_t(j) * kAHeadDim + d]) : 0;
+        out[i] = j < L ? V[size_t(j) * kAHeadDim + d] : 0;
     }
 }
 // the 16 query heads of KV head g to BF16, rows (head-in-group, t): (16 T x 128), the 1/sqrt(128) folded in
@@ -1200,7 +1207,7 @@ __device__ __forceinline__ att_v8f att_wmma(const att_v8s& a, const att_v8s& b, 
 #endif
 }
 constexpr int kFwKeys = 32, kFwPos = 8, kFwKS = kAHeadDim + 8, kFwVS = kFwKeys + 8;   // LDS row strides (bf16)
-__global__ void __launch_bounds__(256) k_attn_flash(const float* __restrict__ q, const uint16_t* __restrict__ kb,
+__global__ void __launch_bounds__(256) k_attn_flash(const float* __restrict__ q, const uint16_t* __restrict__ kb, size_t k_stride,
                                                     const uint16_t* __restrict__ vtb, size_t kv_stride, const int* pos0,
                                                     int T, int Lp, float* __restrict__ y) {
     __shared__ __align__(16) uint16_t sk[kFwKeys][kFwKS];          // keys j0 .. j0 + 31, 128 dims
@@ -1211,7 +1218,7 @@ __global__ void __launch_bounds__(256) k_attn_flash(const float* __restrict__ q,
     const bool live = t < T;
     const int p = P0 + t;                                          // this warp's position: keys 0 .. p
     const int pmax = P0 + min(T - 1, t0 + kFwPos - 1);
-    const uint16_t* K = kb + g * kv_stride;
+    const uint16_t* K = kb + g * k_stride;                         // (the BF16 cache: keys past L are finite, and masked)
     const uint16_t* V = vtb + g * kv_stride;
     // Q: rows = heads g * 16 + l16 of position t, as WMMA A operands for the 8 steps of 16 dims
     att_v8s qa[kAHeadDim / 16];
