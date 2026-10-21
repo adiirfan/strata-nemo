@@ -1590,29 +1590,51 @@ __global__ void __launch_bounds__(NT) k_ssd_state(const float* xbc, const float*
     float H[PT];
 #pragma unroll
     for (int j = 0; j < PT; ++j) H[j] = hp[size_t(p0 + pp + j) * kMState + n];
+    // a Q-block's global reads go to registers one step ahead (issued before the step's products, used after the next
+    // barrier), so each step's memory waits overlap the step before (waiting for them in the step cost ~1/3 of the
+    // walk: 43 us a step)
+    constexpr int CI = kSq * kMState / NT, XI = kSq * P / NT;
+    float pc[CI], px[XI], pb[kSq], pat = 0.f, pdt = 0.f, paq = 0.f;
+    auto fetch = [&](int c) {
+        if (c >= nc) return;
+        const int c0 = c * kSq, nq = min(kSq, T - c0);
+#pragma unroll
+        for (int j = 0; j < CI; ++j) {
+            const int i = tid + j * NT, t = i / kMState, m = i % kMState;
+            pc[j] = t < nq ? xbc[size_t(c0 + t) * kConvDim + kMInter + kMGroups * kMState + g * kMState + m] : 0.f;
+        }
+#pragma unroll
+        for (int j = 0; j < XI; ++j) {
+            const int i = tid + j * NT, t = i / P, q = i % P;
+            px[j] = t < nq ? xbc[size_t(c0 + t) * kConvDim + hd * kMHeadDim + p0 + q] : 0.f;
+        }
+#pragma unroll
+        for (int t = 0; t < kSq; ++t) pb[t] = t < nq ? xbc[size_t(c0 + t) * kConvDim + kMInter + g * kMState + n] : 0.f;
+        if (tid < kSq) {
+            pat = tid < nq ? acs[size_t(c0 + tid) * kMHeads + hd] : 0.f;
+            pdt = tid < nq ? dtv[size_t(c0 + tid) * kMHeads + hd] : 0.f;
+            paq = acs[size_t(c0 + nq - 1) * kMHeads + hd];
+        }
+    };
+    fetch(0);
     for (int c = 0; c < nc; ++c) {
         const int c0 = c * kSq, nq = min(kSq, T - c0);
         __syncthreads();                                              // the last Q-block's LDS reads are done
 #pragma unroll
         for (int j = 0; j < PT; ++j) Hs[n][pp + j] = H[j];
-        for (int i = tid; i < kSq * kMState; i += NT) {
-            const int t = i / kMState, m = i % kMState;
-            Cs[t][m] = t < nq ? xbc[size_t(c0 + t) * kConvDim + kMInter + kMGroups * kMState + g * kMState + m] : 0.f;
-        }
-        for (int i = tid; i < kSq * P; i += NT) {
-            const int t = i / P, q = i % P;
-            xs[t][q] = t < nq ? xbc[size_t(c0 + t) * kConvDim + hd * kMHeadDim + p0 + q] : 0.f;
-        }
+#pragma unroll
+        for (int j = 0; j < CI; ++j) { const int i = tid + j * NT; Cs[i / kMState][i % kMState] = pc[j]; }
+#pragma unroll
+        for (int j = 0; j < XI; ++j) { const int i = tid + j * NT; xs[i / P][i % P] = px[j]; }
         if (tid < kSq) {
-            const float at = tid < nq ? acs[size_t(c0 + tid) * kMHeads + hd] : 0.f;
-            const float aq = acs[size_t(c0 + nq - 1) * kMHeads + hd];
-            w[tid] = tid < nq ? expf(aq - at) * dtv[size_t(c0 + tid) * kMHeads + hd] : 0.f;
-            et[tid] = expf(at);
+            w[tid] = tid < nq ? expf(paq - pat) * pdt : 0.f;
+            et[tid] = expf(pat);
         }
         float bn[kSq];                                                // B_s[n] for this thread's column
 #pragma unroll
-        for (int t = 0; t < kSq; ++t) bn[t] = t < nq ? xbc[size_t(c0 + t) * kConvDim + kMInter + g * kMState + n] : 0.f;
+        for (int t = 0; t < kSq; ++t) bn[t] = pb[t];
         __syncthreads();
+        fetch(c + 1);
         static_assert(kSq * P == NT * 4, "outputs: 4 per thread");
         {   // outputs (kSq x P) = C (kSq x 128) . H (128 x P): thread = 1 position x 4 rows
             const int t = tid / (P / 4), q0 = (tid % (P / 4)) * 4;
