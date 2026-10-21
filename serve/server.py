@@ -2920,8 +2920,13 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        # the end markers this tokenizer has as one token: Nemotron has no <|endoftext|>, and spelled out its '<', '|'
+        # and '>' each ended a reply; its </s> is one (Qwen's is three, and stays out)
+        self.stop_ids = set()
+        for marker in (IM_END, "<|endoftext|>", "</s>"):
+            ids = tokenizer.encode(marker, parse_special=True)
+            if len(ids) == 1:
+                self.stop_ids.update(ids)
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
