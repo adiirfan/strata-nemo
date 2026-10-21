@@ -987,6 +987,38 @@ __device__ __forceinline__ void row_dot_multi(const uint8_t* row, const block_q8
         if (EXACT_N || c < n) s[c] = warp_sum(s[c]);
 }
 
+// NR rows against the n <= NC activations x + off[0..n): row_dot_multi for each row, with the rows' weight loads
+// issued together and each activation chunk loaded once for all NR rows. Per (row, activation) the same calls in the
+// same order and the same warp_sum, so each sum is bitwise equal to row_dot_multi's.
+template<int TY, int NR, int NC, bool STAGE_GRID = false>
+__device__ __forceinline__ void rows_dot_multi(const uint8_t* const (&wr)[NR], const block_q8_1* x, const int (&off)[NC], int n,
+                                               int nb, int lane, float (&s)[NR][NC], const uint32_t* __restrict__ s_grid = nullptr) {
+    using F = Fmt<TY>;
+    using S = Split<TY>;
+#pragma unroll
+    for (int r = 0; r < NR; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) s[r][c] = 0.0f;
+    for (int k = lane; k < nb * F::ipb; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        typename S::W wv[NR];
+#pragma unroll
+        for (int r = 0; r < NR; ++r) wv[r] = S::template load<STAGE_GRID>(wr[r], kbx, iqs, s_grid);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (c >= n) break;
+            const block_q8_1* xc = x + off[c] + kbx * (F::qk / 32);
+#pragma unroll
+            for (int r = 0; r < NR; ++r) s[r][c] += S::apply(wv[r], xc, iqs);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < NR; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < n) s[r][c] = warp_sum(s[r][c]);
+}
+
 // 8-lane sub-warp row dot for K = nb * ipb == 40 (TD == 20, IQ4_NL with n_ff == 640):
 // 4 rows per warp (32 rows per 256-thread block), 100% active lanes, bitwise identical addition tree to row_dot_multi.
 template<int TY, int NC, bool EXACT_N = false>
@@ -3667,22 +3699,28 @@ __global__ void __launch_bounds__(128) mmvq_grouped_kernel(const unsigned long l
     const int lane = threadIdx.x, nb = n_in / Fmt<TY>::qk, ng = *n_groups;
     // 4 rows per warp (16 per block): a group's expert is a few hundred KB, so one row per warp left most of the
     // launch in block start-up
-    for (int g = blockIdx.y; g < ng; g += gridDim.y)
-    for (int rr = 0; rr < 4; ++rr) {
-        const int row = (blockIdx.x * 4 + threadIdx.y) * 4 + rr;
-        if (row >= n_out) break;
-        const uint8_t* wr = reinterpret_cast<const uint8_t*>(table[g_exp[g]]) + (size_t) row * row_bytes;
+    // (the 4 rows go through rows_dot_multi together: one after the other, each row's single pass waited on its own
+    // loads, 99 us a call)
+    const int r0 = (blockIdx.x * 4 + threadIdx.y) * 4;
+    if (r0 >= n_out) return;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* we = reinterpret_cast<const uint8_t*>(table[g_exp[g]]);
+        const uint8_t* wr[4];
+#pragma unroll
+        for (int r = 0; r < 4; ++r) wr[r] = we + (size_t) min(r0 + r, n_out - 1) * row_bytes;
         const int cnt = g_cnt[g];
         for (int m0 = 0; m0 < cnt; m0 += 8) {
             const int n = min(8, cnt - m0);
             int off[8];
 #pragma unroll
             for (int c = 0; c < 8; ++c) off[c] = g_xi[g * 16 + m0 + min(c, n - 1)] * x_stride;
-            float sum[8];
-            row_dot_multi<TY, 8, false, STAGE_GRID>(wr, x, off, n, nb, lane, sum, s_grid);
+            float sum[4][8];
+            rows_dot_multi<TY, 4, 8, STAGE_GRID>(wr, x, off, n, nb, lane, sum, s_grid);
 #pragma unroll
-            for (int c = 0; c < 8; ++c)
-                if (c < n && lane == c) y[(size_t) g_slot[g * 16 + m0 + c] * n_out + row] = sum[c];
+            for (int r = 0; r < 4; ++r)
+#pragma unroll
+                for (int c = 0; c < 8; ++c)
+                    if (c < n && lane == c && r0 + r < n_out) y[(size_t) g_slot[g * 16 + m0 + c] * n_out + r0 + r] = sum[r][c];
         }
     }
 }
@@ -3697,6 +3735,49 @@ void iq_mmvq_grouped(int ggml_type, const unsigned long long* table, const int32
     const auto* X = static_cast<const block_q8_1*>(x_q8_1);
     if (g_stage_grid) mmvq_grouped_kernel<16, true><<<grid, block, 0, s>>>(table, n_groups, g_exp, g_cnt, g_xi, g_slot, rb, X, x_stride_blocks, y, n_in, n_out);
     else mmvq_grouped_kernel<16, false><<<grid, block, 0, s>>>(table, n_groups, g_exp, g_cnt, g_xi, g_slot, rb, X, x_stride_blocks, y, n_in, n_out);
+}
+
+// NR rows per warp (4 * NR per block) against ncols activations, NC at a time: each activation chunk loaded from
+// memory serves NR rows. With one row per warp (mmvq_multi_kernel) a dense matrix at 8 columns re-read ~37 KB of
+// activations per 1 KB row and ran at ~5x its weight-read time. Per (row, column) the same calls in the same lane
+// order and the same warp_sum as row_dot_multi, so each output is bitwise equal to iq_mmvq.
+template<int TY, int NR, int NC, bool STAGE_GRID>
+__global__ void __launch_bounds__(128) mmvq_rows_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
+                                                        const block_q8_1* __restrict__ x, float* __restrict__ y,
+                                                        int n_in, int n_out, int ncols) {
+    STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TY, STAGE_GRID>::value);
+    const uint32_t* s_grid = stage_iq_grid<TY, STAGE_GRID>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
+    const int r0 = (blockIdx.x * 4 + threadIdx.y) * NR;
+    if (r0 >= n_out) return;
+    const int lane = threadIdx.x, nb = n_in / Fmt<TY>::qk, xb = n_in / 32;
+    const uint8_t* wr[NR];
+#pragma unroll
+    for (int r = 0; r < NR; ++r) wr[r] = w + (size_t) min(r0 + r, n_out - 1) * row_bytes;
+    for (int c0 = 0; c0 < ncols; c0 += NC) {
+        const int n = min(NC, ncols - c0);
+        int off[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) off[c] = (c0 + min(c, n - 1)) * xb;
+        float s[NR][NC];
+        rows_dot_multi<TY, NR, NC, STAGE_GRID>(wr, x, off, n, nb, lane, s, s_grid);
+#pragma unroll
+        for (int r = 0; r < NR; ++r)
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (c < n && lane == c && r0 + r < n_out) y[(size_t) (c0 + c) * n_out + r0 + r] = s[r][c];
+    }
+}
+
+void iq_mmvq_rows(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, int rows_per_warp,
+                  void* stream) {
+    if (ggml_type != 16) throw std::invalid_argument("iq_mmvq_rows: only IQ2_XXS (16) so far");
+    const size_t rb = iq_row_bytes(ggml_type, n_in);
+    auto s = static_cast<cudaStream_t>(stream);
+    const auto* W = static_cast<const uint8_t*>(w);
+    const auto* X = static_cast<const block_q8_1*>(x_q8_1);
+    const dim3 block(32, 4);
+    if (rows_per_warp == 2) mmvq_rows_kernel<16, 2, 8, true><<<(n_out + 7) / 8, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
+    else mmvq_rows_kernel<16, 4, 8, true><<<(n_out + 15) / 16, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
 }
 
 }  // namespace strata::kernels

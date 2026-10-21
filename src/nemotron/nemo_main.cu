@@ -614,7 +614,7 @@ struct Model {
         const size_t T = kTMax;
         f(&h, T * kHidden); f(&n, T * kHidden); f(&d, T * kHidden); f(&y, T * kMInter);
         f(&lat, T * kLatent); f(&eo, T * kLatent); f(&tmp, T * kShared); f(&tmp2, T * kShared); f(&scores, T * 512);
-        f(&att_sc, T * kAHeads * size_t(max_ctx)); f(&qkv, T * kAHeads * kAHeadDim);
+        f(&att_sc, T * kAHeads * std::max(size_t(max_ctx), size_t(kDecSplits) * (kAHeadDim + 2))); f(&qkv, T * kAHeads * kAHeadDim);
         f(&kbuf, T * kAKv * kAHeadDim); f(&vbuf, T * kAKv * kAHeadDim); f(&logits, T * size_t(kVocab));
         f(&ex_up, T * 16 * 2560); f(&ex_down, T * 16 * kLatent); f(&route_w, T * 16);
         CK(cudaMalloc(&route_idx, T * 16 * sizeof(int32_t)));
@@ -642,9 +642,13 @@ struct Model {
         for (int c = 0; c < T; c += 8)
             strata::kernels::native_q8_0_f32(w, x + size_t(c) * n_in, q8, out + size_t(c) * n_out, n_in, n_out, std::min(8, T - c), stream);
     }
+    // T > 1: several rows per warp share each activation load (NEMO_SH_NR 2 or 4, 0 = the one-row kernel)
+    int grp_y = std::getenv("NEMO_GRP_Y") ? std::atoi(std::getenv("NEMO_GRP_Y")) : 16;
+    int sh_nr = std::getenv("NEMO_SH_NR") ? std::atoi(std::getenv("NEMO_SH_NR")) : 4;
     void iq2(const void* w, const float* x, float* out, int n_in, int n_out, int T) {
         strata::kernels::quantize_q8_1_rows(x, T, n_in, q8, stream);
-        strata::kernels::iq_mmvq(kIQ2_XXS, w, q8, out, n_in, n_out, T, stream);
+        if (T > 1 && sh_nr) strata::kernels::iq_mmvq_rows(kIQ2_XXS, w, q8, out, n_in, n_out, T, sh_nr, stream);
+        else strata::kernels::iq_mmvq(kIQ2_XXS, w, q8, out, n_in, n_out, T, stream);
     }
     // W (rows x n_in, BF16 or NVFP4) times T <= 16 rows of x into (T, rows): the skinny kernel, 8 columns a launch
     void skinny(int fmt, const void* w, const uint8_t* sc, float s2, const float* x, float* out, int n_in, int rows, int T) {
@@ -661,6 +665,8 @@ struct Model {
     }
     bool use_skinny = std::getenv("NEMO_NO_SKINNY") == nullptr;
 
+    // rows per warp at once in k_nvfp4_q8cols (1: 101 us a call, 2: 73, 4: 78)
+    int nv_rw = std::getenv("NEMO_NV_RW") ? std::atoi(std::getenv("NEMO_NV_RW")) : 2;
     void nvfp4(const uint8_t* w, const uint8_t* s, float s2, const float* x, float* out, int n_in, int rows, int T) {
         const int g = (rows + 7) / 8;
         // the skinny kernel measured slower than the q8 one for NVFP4 (40 vs 35 ms a check round): BF16 only
@@ -675,11 +681,18 @@ struct Model {
         const int slices = n_in / 4096;
         if (slices > 1) CK(cudaMemsetAsync(out, 0, size_t(T) * rows * 4, stream));
         // one block per compute unit fits (37 KB LDS): size the blocks so the launch is whole waves over the units
-        static const int units = [] { int d = 0, n = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, d); return n > 0 ? n : 64; }();
+        static const int units = [] {
+            if (const char* e = std::getenv("NEMO_UNITS")) return std::atoi(e);
+            // RDNA reports work-group processors, two compute units each (and room for two of these blocks): 32 on the
+            // R9700, where sizing for 64 measured best (32: 76 us a call, 64: 73, 128: 84)
+            int d = 0, n = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, d); return n > 0 ? 2 * n : 64;
+        }();
         const int per = (rows * slices * ((T + 7) / 8) + units - 1) / units;          // rows per block for one wave
         const int rpb = std::getenv("NEMO_RPB") ? std::atoi(std::getenv("NEMO_RPB")) : std::max(32, (per + 31) / 32 * 32);
         const dim3 grid((rows + rpb - 1) / rpb, slices, (T + 7) / 8);
-        k_nvfp4_q8cols<8><<<grid, 1024, 0, stream>>>(w, s, s2, (const uint8_t*) q8, out, n_in, rows, T, slices > 1, rpb);
+        if (nv_rw == 4) k_nvfp4_q8cols<8, 4><<<grid, 1024, 0, stream>>>(w, s, s2, (const uint8_t*) q8, out, n_in, rows, T, slices > 1, rpb);
+        else if (nv_rw == 2) k_nvfp4_q8cols<8, 2><<<grid, 1024, 0, stream>>>(w, s, s2, (const uint8_t*) q8, out, n_in, rows, T, slices > 1, rpb);
+        else k_nvfp4_q8cols<8><<<grid, 1024, 0, stream>>>(w, s, s2, (const uint8_t*) q8, out, n_in, rows, T, slices > 1, rpb);
     }
 
     void mamba(Block& b, int T, int write_after) {
@@ -697,10 +710,13 @@ struct Model {
         q8_0(b.k, n, kbuf, kHidden, kAKv * kAHeadDim, T);
         q8_0(b.v, n, vbuf, kHidden, kAKv * kAHeadDim, T);
         k_kv_append_many<<<dim3(T, kAKv), kAHeadDim, 0, stream>>>(kbuf, vbuf, b.K, b.V, d_pos, max_ctx);
-        // T <= 16 rows: one query tile, the keys split kFaSplitKeys at a time (empty splits write nothing useful
-        // and are weighted 0 by the combine)
-        const int splits = (max_ctx + kDecSplit - 1) / kDecSplit;
-        k_attn_dec<<<dim3(kAHeads, splits), 128, size_t(T) * (5 * kAHeadDim + 8) * 4, stream>>>(qkv, b.K, b.V, att_sc, d_pos, max_ctx, T, splits);
+        // T <= 16 rows: one query tile, the keys present split into kDecSplits equal shares (an empty share is
+        // weighted 0 by the combine)
+        const int splits = kDecSplits;
+        const size_t lds = size_t(T) * (5 * kAHeadDim + 8) * 4;
+        if (T == 1) k_attn_dec<1><<<dim3(kAHeads, splits), 128, lds, stream>>>(qkv, b.K, b.V, att_sc, d_pos, max_ctx, T, splits);
+        else if (T <= 8) k_attn_dec<8><<<dim3(kAHeads, splits), 128, lds, stream>>>(qkv, b.K, b.V, att_sc, d_pos, max_ctx, T, splits);
+        else k_attn_dec<kTMax><<<dim3(kAHeads, splits), 128, lds, stream>>>(qkv, b.K, b.V, att_sc, d_pos, max_ctx, T, splits);
         k_flash_combine<<<dim3(kAHeads, T), kAHeadDim, 0, stream>>>(att_sc, y, splits);
         q8_0(b.o, y, d, kAHeads * kAHeadDim, kHidden, T);
     }
@@ -731,8 +747,9 @@ struct Model {
             strata::kernels::iq_mmvq_gather(kIQ2_XXS, b.down_tab, route_idx, k, q8b, W / 32, 1, ex_down, W, kLatent, stream);
         } else {
             // the step's picks grouped by expert: each chosen expert is read once for every position that chose it
-            const int S = T * k, G = std::min(S, b.n_exp);
-            k_group_slots_par<<<1, 512, 0, stream>>>(route_idx, S, k, b.n_exp, g_n, g_exp, g_cnt, g_tok, g_slot);
+            // G: blocks across the groups (each block then loops over every G-th group, sharing its start-up)
+            const int S = T * k, G = std::min({S, b.n_exp, grp_y});
+            k_group_slots_par<<<1, 256, 0, stream>>>(route_idx, S, k, b.n_exp, g_n, g_exp, g_cnt, g_tok, g_slot);
             strata::kernels::iq_mmvq_grouped(kIQ2_XXS, b.up_tab, g_n, G, g_exp, g_cnt, g_tok, g_slot, q8, kLatent / 32, ex_up, kLatent, W, stream);
             k_relu2<<<128, 256, 0, stream>>>(ex_up, S * W);
             strata::kernels::quantize_q8_1_rows(ex_up, S, W, q8b, stream);
@@ -780,6 +797,22 @@ struct Model {
 
     std::map<int, cudaGraphExec_t> graphs;   // key: T * 4 + (write_after == T) * 2 + all_logits
     bool use_graph = std::getenv("NEMO_NO_GRAPH") == nullptr;
+
+    // run body() on the stream, recorded as a graph the first time (e) and replayed after; body must take every
+    // per-call value from device memory, since the launches' own arguments are frozen at the recording
+    template <class F> void graphed(cudaGraphExec_t& e, F&& body) {
+        if (!use_graph) { body(); return; }
+        if (!e) {
+            cudaGraph_t g;
+            CK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            body();
+            CK(cudaStreamEndCapture(stream, &g));
+            CK(cudaGraphInstantiate(&e, g, nullptr, nullptr, 0));
+            CK(cudaGraphDestroy(g));
+        }
+        CK(cudaGraphLaunch(e, stream));
+    }
+    cudaGraphExec_t commit_graph[kTMax + 1] = {};
 
     // run tokens (up to kTMax) at pos; returns the logits rows (all of them, or the last); does not move pos
     std::vector<float> forward(const std::vector<int>& toks, int write_after, bool all_logits, std::vector<float>* dump = nullptr) {
@@ -844,13 +877,15 @@ struct Model {
 
     // after a draft check (write_after 0): move every Mamba state forward over the first m positions of that window
     void commit(int m) {
-        for (auto& b : blocks) {
-            if (b.kind != MAMBA) continue;
-            float* proj = win_proj[b.win];
-            float* xbc = win_xbc[b.win];
-            k_mamba_conv_many<<<(kConvDim + 255) / 256, 256, 0, stream>>>(proj, b.conv_state, b.conv_w, b.conv_b, xbc, m, m);
-            k_mamba_commit<<<dim3(kMHeads, kScanSlices), kMState, 0, stream>>>(xbc, proj, b.A_log, b.dt_bias, b.ssm, m);
-        }
+        graphed(commit_graph[m], [&] {
+            for (auto& b : blocks) {
+                if (b.kind != MAMBA) continue;
+                float* proj = win_proj[b.win];
+                float* xbc = win_xbc[b.win];
+                k_mamba_conv_many<<<(kConvDim + 255) / 256, 256, 0, stream>>>(proj, b.conv_state, b.conv_w, b.conv_b, xbc, m, m);
+                k_mamba_commit<<<dim3(kMHeads, kScanSlices), kMState, 0, stream>>>(xbc, proj, b.A_log, b.dt_bias, b.ssm, m);
+            }
+        });
         pos += m;
     }
 
@@ -1098,6 +1133,7 @@ struct Drafter {
     int *d_p0, *h_p0;
     int32_t* h_ids;
     bool dumped = false;
+    cudaGraphExec_t draft_graph = nullptr, ctx_graph[kTMax + 1] = {};
 
     Nv nv(const std::string& name, bool bias) {
         Nv r;
@@ -1237,15 +1273,20 @@ struct Drafter {
         // before this copy may have run (one shared slot filed every accepted position under the next draft's)
         h_p0[1] = p0;
         CK(cudaMemcpyAsync(d_p0 + 1, h_p0 + 1, 4, cudaMemcpyHostToDevice, stream));
-        lin_nv(fc, src, comb, R);
-        k_rms_rows<<<R, 1024, 0, stream>>>(comb, hidden_norm, xn, kHidden, kDEps);
-        for (int l = 0; l < kDLayers; ++l) {
-            lin_bf16(L[l].k, xn, kt, R, kHidden, 256, nullptr);
-            lin_bf16(L[l].v, xn, vt, R, kHidden, 256, nullptr);
-            k_head_norm_rope<<<dim3(R, kAKv), 128, 0, stream>>>(kt, L[l].k_norm, kAKv, d_p0 + 1, 0, L[l].K, M.max_ctx);
-            k_v_store<<<dim3(R, kAKv), 128, 0, stream>>>(vt, L[l].V, d_p0 + 1, 0, M.max_ctx);
-        }
-        CK(cudaMemcpyAsync(anchor, xn + size_t(R - 1) * kHidden, kHidden * 4, cudaMemcpyDeviceToDevice, stream));
+        auto body = [&] {
+            lin_nv(fc, src, comb, R);
+            k_rms_rows<<<R, 1024, 0, stream>>>(comb, hidden_norm, xn, kHidden, kDEps);
+            for (int l = 0; l < kDLayers; ++l) {
+                lin_bf16(L[l].k, xn, kt, R, kHidden, 256, nullptr);
+                lin_bf16(L[l].v, xn, vt, R, kHidden, 256, nullptr);
+                k_head_norm_rope<<<dim3(R, kAKv), 128, 0, stream>>>(kt, L[l].k_norm, kAKv, d_p0 + 1, 0, L[l].K, M.max_ctx);
+                k_v_store<<<dim3(R, kAKv), 128, 0, stream>>>(vt, L[l].V, d_p0 + 1, 0, M.max_ctx);
+            }
+            CK(cudaMemcpyAsync(anchor, xn + size_t(R - 1) * kHidden, kHidden * 4, cudaMemcpyDeviceToDevice, stream));
+        };
+        // the rounds' small updates always read the target's step rows (M.aux): one recording per row count
+        if (R <= kTMax && src == M.aux) M.graphed(ctx_graph[R], body);
+        else body();
     }
 
     // 7 drafts after `bonus`, which sits at position p0 (the context covers positions < p0)
@@ -1256,70 +1297,72 @@ struct Drafter {
         CK(cudaMemcpyAsync(d_p0, h_p0, 4, cudaMemcpyHostToDevice, stream));
         CK(cudaMemcpyAsync(ids, h_ids, kDBlock * 4, cudaMemcpyHostToDevice, stream));
         const int R = kDBlock;
-        k_embed_ids<<<dim3(16, R), 256, 0, stream>>>(M.embed, ids, h, kHidden);
-        for (int l = 0; l < kDLayers; ++l) {
-            Layer& y = L[l];
-            k_add_rms_rows<<<R, 1024, 0, stream>>>(res, h, y.in_ln, x, kHidden, kDEps, l == 0);
-            lin_bf16(y.ac_proj, x, coef, R, kHidden, 1024, nullptr);
-            k_dconv<<<dim3(16, R), 256, 0, stream>>>(x, coef, y.ac_base, 0, xa);
-            lin_bf16(y.q, xa, q, R, kHidden, kHidden, nullptr);
-            lin_bf16(y.k, xa, k, R, kHidden, 256, nullptr);
-            lin_bf16(y.v, xa, v, R, kHidden, 256, nullptr);
-            k_head_norm_rope<<<dim3(R, kAHeads), 128, 0, stream>>>(q, y.q_norm, kAHeads, d_p0, 0, nullptr, M.max_ctx);
-            k_head_norm_rope<<<dim3(R, kAKv), 128, 0, stream>>>(k, y.k_norm, kAKv, d_p0, 0, y.K, M.max_ctx);
-            k_v_store<<<dim3(R, kAKv), 128, 0, stream>>>(v, y.V, d_p0, 0, M.max_ctx);
-            k_draft_attn<<<dim3(kAHeads, R), 128, 0, stream>>>(q, y.K, y.V, y.sink, att, d_p0, M.max_ctx);
-            lin_bf16(y.o, att, o, R, kHidden, kHidden, nullptr);
-            k_dconv<<<dim3(16, R), 256, 0, stream>>>(o, coef, y.ac_base, 1, h);
-            k_add_rms_rows<<<R, 1024, 0, stream>>>(res, h, y.post_ln, x, kHidden, kDEps, 0);
-            lin_bf16(y.mc_proj, x, coef, R, kHidden, 1024, nullptr);
-            k_dconv<<<dim3(16, R), 256, 0, stream>>>(x, coef, y.mc_base, 0, xa);
-            lin_nv(y.gate, xa, g, R);
-            lin_nv(y.up, xa, u, R);
-            k_swiglu<<<512, 256, 0, stream>>>(g, u, act, size_t(R) * kDFf);
-            lin_nv(y.down, act, dn, R);
-            k_dconv<<<dim3(16, R), 256, 0, stream>>>(dn, coef, y.mc_base, 1, h);
-        }
-        k_add_rms_rows<<<R, 1024, 0, stream>>>(res, h, norm, out, kHidden, kDEps, 0);
-        // the target's head on the 7 mask slots, their top 8
-        const float* hid = out + kHidden;
-        M.q8_0(M.head, hid, M.logits, kHidden, kVocab, kDSlots);
-        k_logsoftmax_top8<<<kDSlots, 1024, 0, stream>>>(M.logits, kVocab, cand, lp);
-        // LiLiCorr
         const int RL = kDSlots * kDTopK;
-        k_embed_ids<<<dim3(16, RL), 256, 0, stream>>>(M.embed, cand, tokE, kHidden);
-        lin_nv(token_proj, tokE, tok, RL);
-        lin_nv(pass_proj, hid, pass, kDSlots);
-        k_ll_features<<<RL, 256, 0, stream>>>(lp, fn_w, fn_b, fm_up_w, fm_up_b, feat);
-        lin_bf16(fm_down_w, feat, featd, RL, kLl, kLl, fm_down_b);
-        k_ll_sum<<<RL, 256, 0, stream>>>(hs, tok, pass, featd, slot_emb, rank_emb);
-        for (int i = 0; i < 2; ++i) {
-            k_rms_rows<<<RL, 1024, 0, stream>>>(hs, l_attn_norm[i], lx, kLl, kDEps);
-            lin_bf16(l_in_w[i], lx, qkv, RL, kLl, 3 * kLl, l_in_b[i]);
-            k_ll_attn<<<dim3(8, RL), 128, 0, stream>>>(qkv, att_bias, latt, RL);
-            lin_nv(l_out[i], latt, lo, RL);
-            k_add<<<64, 256, 0, stream>>>(hs, lo, RL * kLl);
-            k_rms_rows<<<RL, 1024, 0, stream>>>(hs, l_mlp_norm[i], lx, kLl, kDEps);
-            lin_nv(l_up[i], lx, lu, RL);
-            k_silu<<<256, 256, 0, stream>>>(lu, size_t(RL) * 2 * kLl);
-            lin_nv(l_down[i], lu, lo, RL);
-            k_add<<<64, 256, 0, stream>>>(hs, lo, RL * kLl);
-        }
-        k_rms_rows<<<RL, 1024, 0, stream>>>(hs, out_norm, hsn, kLl, kDEps);
-        lin_nv(context_proj, anchor, an_raw, 1);
-        k_rms_rows<<<1, 1024, 0, stream>>>(an_raw, anchor_norm, an, kLl, kDEps);
-        lin_bf16(f_self, hsn, pre1, RL, kLl, kLl, f_bias);
-        lin_bf16(f_anchor, an, ar, 1, kLl, kLl, nullptr);
-        k_mul_row<<<RL, 256, 0, stream>>>(hsn, an, lx, kLl);
-        lin_bf16(f_cross, lx, pre2, RL, kLl, kLl, nullptr);
-        k_add3_silu<<<RL, 256, 0, stream>>>(pre1, pre2, ar, kLl);
-        lin_bf16(out_head_w, pre1, ov, RL, kLl, kLl, out_head_b);
-        lin_bf16(in_head_w, pre1, iv, RL, kLl, kLl, in_head_b);
-        k_normalize_rows<<<RL, 256, 0, stream>>>(ov, kLl, 1e-4f);
-        k_normalize_rows<<<RL, 256, 0, stream>>>(iv, kLl, 1e-4f);
-        lin_bf16(aout_w, an, aout, 1, kLl, kLl, aout_b);
-        k_normalize_rows<<<1, 256, 0, stream>>>(aout, kLl, 1e-4f);
-        k_ll_walk<<<1, 256, 0, stream>>>(ov, iv, aout, cand, drafts);
+        const float* hid = out + kHidden;
+        M.graphed(draft_graph, [&] {
+            k_embed_ids<<<dim3(16, R), 256, 0, stream>>>(M.embed, ids, h, kHidden);
+            for (int l = 0; l < kDLayers; ++l) {
+                Layer& y = L[l];
+                k_add_rms_rows<<<R, 1024, 0, stream>>>(res, h, y.in_ln, x, kHidden, kDEps, l == 0);
+                lin_bf16(y.ac_proj, x, coef, R, kHidden, 1024, nullptr);
+                k_dconv<<<dim3(16, R), 256, 0, stream>>>(x, coef, y.ac_base, 0, xa);
+                lin_bf16(y.q, xa, q, R, kHidden, kHidden, nullptr);
+                lin_bf16(y.k, xa, k, R, kHidden, 256, nullptr);
+                lin_bf16(y.v, xa, v, R, kHidden, 256, nullptr);
+                k_head_norm_rope<<<dim3(R, kAHeads), 128, 0, stream>>>(q, y.q_norm, kAHeads, d_p0, 0, nullptr, M.max_ctx);
+                k_head_norm_rope<<<dim3(R, kAKv), 128, 0, stream>>>(k, y.k_norm, kAKv, d_p0, 0, y.K, M.max_ctx);
+                k_v_store<<<dim3(R, kAKv), 128, 0, stream>>>(v, y.V, d_p0, 0, M.max_ctx);
+                k_draft_attn<<<dim3(kAHeads, R), 128, 0, stream>>>(q, y.K, y.V, y.sink, att, d_p0, M.max_ctx);
+                lin_bf16(y.o, att, o, R, kHidden, kHidden, nullptr);
+                k_dconv<<<dim3(16, R), 256, 0, stream>>>(o, coef, y.ac_base, 1, h);
+                k_add_rms_rows<<<R, 1024, 0, stream>>>(res, h, y.post_ln, x, kHidden, kDEps, 0);
+                lin_bf16(y.mc_proj, x, coef, R, kHidden, 1024, nullptr);
+                k_dconv<<<dim3(16, R), 256, 0, stream>>>(x, coef, y.mc_base, 0, xa);
+                lin_nv(y.gate, xa, g, R);
+                lin_nv(y.up, xa, u, R);
+                k_swiglu<<<512, 256, 0, stream>>>(g, u, act, size_t(R) * kDFf);
+                lin_nv(y.down, act, dn, R);
+                k_dconv<<<dim3(16, R), 256, 0, stream>>>(dn, coef, y.mc_base, 1, h);
+            }
+            k_add_rms_rows<<<R, 1024, 0, stream>>>(res, h, norm, out, kHidden, kDEps, 0);
+            // the target's head on the 7 mask slots, their top 8
+            M.q8_0(M.head, hid, M.logits, kHidden, kVocab, kDSlots);
+            k_logsoftmax_top8<<<kDSlots, 1024, 0, stream>>>(M.logits, kVocab, cand, lp);
+            // LiLiCorr
+            k_embed_ids<<<dim3(16, RL), 256, 0, stream>>>(M.embed, cand, tokE, kHidden);
+            lin_nv(token_proj, tokE, tok, RL);
+            lin_nv(pass_proj, hid, pass, kDSlots);
+            k_ll_features<<<RL, 256, 0, stream>>>(lp, fn_w, fn_b, fm_up_w, fm_up_b, feat);
+            lin_bf16(fm_down_w, feat, featd, RL, kLl, kLl, fm_down_b);
+            k_ll_sum<<<RL, 256, 0, stream>>>(hs, tok, pass, featd, slot_emb, rank_emb);
+            for (int i = 0; i < 2; ++i) {
+                k_rms_rows<<<RL, 1024, 0, stream>>>(hs, l_attn_norm[i], lx, kLl, kDEps);
+                lin_bf16(l_in_w[i], lx, qkv, RL, kLl, 3 * kLl, l_in_b[i]);
+                k_ll_attn<<<dim3(8, RL), 128, 0, stream>>>(qkv, att_bias, latt, RL);
+                lin_nv(l_out[i], latt, lo, RL);
+                k_add<<<64, 256, 0, stream>>>(hs, lo, RL * kLl);
+                k_rms_rows<<<RL, 1024, 0, stream>>>(hs, l_mlp_norm[i], lx, kLl, kDEps);
+                lin_nv(l_up[i], lx, lu, RL);
+                k_silu<<<256, 256, 0, stream>>>(lu, size_t(RL) * 2 * kLl);
+                lin_nv(l_down[i], lu, lo, RL);
+                k_add<<<64, 256, 0, stream>>>(hs, lo, RL * kLl);
+            }
+            k_rms_rows<<<RL, 1024, 0, stream>>>(hs, out_norm, hsn, kLl, kDEps);
+            lin_nv(context_proj, anchor, an_raw, 1);
+            k_rms_rows<<<1, 1024, 0, stream>>>(an_raw, anchor_norm, an, kLl, kDEps);
+            lin_bf16(f_self, hsn, pre1, RL, kLl, kLl, f_bias);
+            lin_bf16(f_anchor, an, ar, 1, kLl, kLl, nullptr);
+            k_mul_row<<<RL, 256, 0, stream>>>(hsn, an, lx, kLl);
+            lin_bf16(f_cross, lx, pre2, RL, kLl, kLl, nullptr);
+            k_add3_silu<<<RL, 256, 0, stream>>>(pre1, pre2, ar, kLl);
+            lin_bf16(out_head_w, pre1, ov, RL, kLl, kLl, out_head_b);
+            lin_bf16(in_head_w, pre1, iv, RL, kLl, kLl, in_head_b);
+            k_normalize_rows<<<RL, 256, 0, stream>>>(ov, kLl, 1e-4f);
+            k_normalize_rows<<<RL, 256, 0, stream>>>(iv, kLl, 1e-4f);
+            lin_bf16(aout_w, an, aout, 1, kLl, kLl, aout_b);
+            k_normalize_rows<<<1, 256, 0, stream>>>(aout, kLl, 1e-4f);
+            k_ll_walk<<<1, 256, 0, stream>>>(ov, iv, aout, cand, drafts);
+        });
         if (const char* dp = std::getenv("NEMO_DDUMP"); dp && !dumped) {   // the first draft's pieces, for ref_draft.py
             dumped = true;
             CK(cudaStreamSynchronize(stream));
