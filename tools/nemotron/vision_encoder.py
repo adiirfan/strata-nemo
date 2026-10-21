@@ -130,6 +130,8 @@ for line in sys.stdin:
         continue
     try:
         n, nx, ny = encode(parts[1], parts[2])
+        if dev.type == "cuda":                 # the activations' memory back to the card: the engine shares it
+            torch.cuda.empty_cache()
         print(f"OK {n} {nx} {ny}", flush=True)
     except Exception as e:  # noqa: BLE001 - one bad image must not end the encoder
         print("ERR " + " ".join(str(e).split())[:300], flush=True)
