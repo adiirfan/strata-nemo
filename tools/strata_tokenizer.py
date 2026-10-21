@@ -66,7 +66,7 @@ QWEN35_PATTERN = (
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
-                 pre: str = "qwen35", special_ids: dict[str, int] | None = None):
+                 pre: str = "qwen35", special_ids: dict[str, int] | None = None, pattern: str | None = None):
         self.tokens = tokens
         self.pre = pre
         self.token_types = token_types
@@ -86,7 +86,8 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        # pattern: the pre-tokenizer's split (another model family's, from its exported tokenizer.json)
+        self._re = regex.compile(pattern or QWEN35_PATTERN)
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:

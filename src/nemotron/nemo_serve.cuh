@@ -259,6 +259,7 @@ static bool read_embeddings(const std::string& path, std::vector<float>& rows, s
 }
 
 constexpr int kImageToken = 18;                                     // <image>, the model's img_context_token_id
+constexpr int kImStart = 10;                                        // <|im_start|>
 
 static int serve(Model& m, Drafter* D, const std::vector<int>& eos_ids) {
     LineReader in;
@@ -340,6 +341,7 @@ static int serve(Model& m, Drafter* D, const std::vector<int>& eos_ids) {
             live = ck.toks;
             reuse = m.pos;
             from_ck_logits = ids.size() == ck.toks.size();
+            if (from_ck_logits && ck.logits.empty()) { m.reset(); live.clear(); reuse = 0; from_ck_logits = false; }
         } else {
             m.reset();
             live.clear();
@@ -351,8 +353,22 @@ static int serve(Model& m, Drafter* D, const std::vector<int>& eos_ids) {
         bool cancelled = false;
         int read_n = 0;
         if (from_ck_logits) CK(cudaMemcpy(m.logits, ck.logits.data(), kVocab * 4, cudaMemcpyHostToDevice));
+        // the checkpoint goes in front of the last <|im_start|> (the answer's turn): the next request renders this
+        // answer differently (its thinking dropped), so that is the last token the two prompts share
+        size_t cut = 0;
+        for (size_t i = ids.size(); i-- > size_t(reuse) + 1;) if (ids[i] == kImStart) { cut = i; break; }
+        bool saved = false;
+        auto save_ck = [&](size_t upto, bool with_logits) {
+            snap_copy(m, D, ck, true);
+            ck.toks.assign(ids.begin(), ids.begin() + upto);
+            ck.logits.resize(with_logits ? kVocab : 0);
+            if (with_logits) CK(cudaMemcpy(ck.logits.data(), m.logits, kVocab * 4, cudaMemcpyDeviceToHost));
+            ck.ok = true;
+            saved = true;
+        };
         for (size_t i = size_t(reuse); i < ids.size();) {
-            const size_t e = std::min(ids.size(), i + size_t(kTBig));
+            if (!geni && cut && i == cut && !saved) save_ck(cut, false);
+            const size_t e = std::min({ids.size(), i + size_t(kTBig), (!geni && cut > i) ? cut : ids.size()});
             const std::vector<int> c(ids.begin() + i, ids.begin() + e);
             const int p0 = m.pos;
             bool has_img = false;
@@ -387,14 +403,10 @@ static int serve(Model& m, Drafter* D, const std::vector<int>& eos_ids) {
             std::fflush(stdout);
             continue;
         }
-        // the checkpoint at the prompt's end (a text prompt only: an image prompt's ids alone do not name its state)
-        if (!geni) {
-            snap_copy(m, D, ck, true);
-            ck.toks = ids;
-            ck.logits.resize(kVocab);
-            CK(cudaMemcpy(ck.logits.data(), m.logits, kVocab * 4, cudaMemcpyDeviceToHost));
-            ck.ok = true;
-        } else ck.ok = false;
+        // (a text prompt only: an image prompt's ids alone do not name its state; a prompt with no turn to cut at is
+        // checkpointed at its end)
+        if (geni) ck.ok = false;
+        else if (!saved) save_ck(ids.size(), true);
         // writing
         const auto t1 = std::chrono::steady_clock::now();
         int produced = 0, drafts_ok = 0, drafts_offered = 0;

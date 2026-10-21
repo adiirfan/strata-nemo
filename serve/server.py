@@ -68,6 +68,9 @@ from serve.responses import ResponsesError, error_body as responses_error_body  
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
+# "model_family": "nemotron" in the config: Nemotron's image markers (one <image> per image from its template, written
+# as <img> + one <image> per image token + </img>, as its processor does), set by main()
+MODEL_FAMILY = "qwen"
 
 
 def popen(what: str, args: list, **kw):
@@ -3529,8 +3532,10 @@ class Service:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            nemotron = MODEL_FAMILY == "nemotron"
+            pad = self.tok.encode("<image>" if nemotron else IMAGE_PAD, parse_special=True)[0]
+            start = self.tok.encode("<img>" if nemotron else VISION_START, parse_special=True)[0]
+            end = self.tok.encode("</img>", parse_special=True)[0] if nemotron else None
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
             # for as long as urlopen waited.
             images = [fetched[src] if src in fetched else Vision.download(src) if src.startswith(("http://", "https://"))
@@ -3546,10 +3551,15 @@ class Service:
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+            literal = self.tok.encode("<image>" if nemotron else IMAGE_PAD, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
-                if t == pad and j > 0 and ids[j - 1] == start:
+                if nemotron and t == pad:                  # (its template writes the image marker on its own)
+                    if k == len(encoded):
+                        raise ValueError("the prompt and its images do not match")
+                    out += [start] + [pad] * encoded[k][1] + [end]
+                    k += 1
+                elif t == pad and j > 0 and ids[j - 1] == start:
                     # more pairs than images: text parts that cut both markers apart (the literal marks keep whole ones text)
                     if k == len(encoded):
                         raise ValueError("the prompt and its images do not match")
@@ -6287,6 +6297,8 @@ def main() -> int:
         ap.error(listen_problem(a.host, a.port, e))
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
+    global MODEL_FAMILY
+    MODEL_FAMILY = str(cfg.get("model_family") or "qwen")
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
@@ -6299,7 +6311,10 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        # another model family's split pattern, when its exported tokenizer.json names one (Qwen's is the default)
+        tcfg = tpath / "tokenizer.json"
+        pattern = json.loads(tcfg.read_text(encoding="utf-8")).get("pre_pattern") if tcfg.exists() else None
+        tok = ST.Tokenizer(tokens, merges, types, pattern=pattern)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:
