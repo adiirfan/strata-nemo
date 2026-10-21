@@ -992,12 +992,16 @@ struct Model {
         f(&B->h, T * kHidden); f(&B->n, T * kHidden); f(&B->d, T * kHidden); f(&B->proj, T * kInProj);
         f(&B->xbc, T * kConvDim); f(&B->y, T * kMInter); f(&B->lat, T * kLatent); f(&B->eo, T * kLatent);
         f(&B->tmp, T * kShared); f(&B->tmp2, T * kShared); f(&B->scores, T * 512);
-        f(&B->exu, S * 2560); f(&B->exd, S * kLatent); f(&B->rw, S);
+        // (the MMQ expert path's buffers, and the three-kernel SSD's states, only when those paths can run: ~1 GB)
+        const bool mmq_experts = !moe_wmma || std::getenv("NEMO_MW_CHECK");
+        if (mmq_experts) f(&B->exu, S * 2560);
+        f(&B->exd, S * kLatent); f(&B->rw, S);
         CK(cudaMalloc(&B->xb, T * kAux * 2));
         {
             const size_t nc = (T + kSq - 1) / kSq;
             f(&B->ssd_dt, T * kMHeads); f(&B->ssd_acs, T * kMHeads); f(&B->ssd_ea, nc * kMHeads);
-            f(&B->ssd_cb, size_t(kMGroups) * nc * kSq * kSq); f(&B->ssd_S, size_t(kMHeads) * nc * kMState * kMHeadDim);
+            f(&B->ssd_cb, size_t(kMGroups) * nc * kSq * kSq);
+            if (ssd_old) f(&B->ssd_S, size_t(kMHeads) * nc * kMState * kMHeadDim);
         }         // BF16 activations up to kTBig x 24,576 (the drafter's fc)
         // the prompt attention products hold (16 T x max_ctx) scores: this caps the context they serve
         const size_t Lmax = size_t(max_ctx + 64);
@@ -1024,7 +1028,8 @@ struct Model {
         }
         strata::prefill::mmq::iota(B->ident, int64_t(S), stream);
         const size_t xqb = std::max(strata::prefill::mmq::q8_bytes(int64_t(S), 2560), strata::prefill::mmq::q8_bytes(int64_t(T), kShared));
-        CK(cudaMalloc(&B->xq, xqb)); CK(cudaMalloc(&B->xq2, xqb));
+        if (mmq_experts) CK(cudaMalloc(&B->xq, xqb));
+        CK(cudaMalloc(&B->xq2, strata::prefill::mmq::q8_bytes(int64_t(T), kShared)));   // (mmq_dense: K <= kShared)
         std::string err;
         if (!B->gemm.init(stream, std::max<int64_t>(int64_t(kInProj) * kHidden, int64_t(kHidden) * kAux), err)) { std::fprintf(stderr, "strata-nemo: %s\n", err.c_str()); std::exit(1); }
         if (!strata::prefill::mmq::built()) { std::fprintf(stderr, "strata-nemo: this build has no MMQ\n"); std::exit(1); }
