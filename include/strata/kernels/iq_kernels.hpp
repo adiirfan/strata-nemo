@@ -95,6 +95,22 @@ bool iq_old_kernels();
 /// x_j = x_q8_1 + (j / x_div) * x_stride_blocks q8_1 blocks. IQ2_XXS only so far.
 void iq_mmvq_gather(int ggml_type, const unsigned long long* table, const int32_t* idx, int n_slots,
                     const void* x_q8_1, int x_stride_blocks, int x_div, float* y, int n_in, int n_out, void* stream);
+// IQ2_XXS only, from FP32 inputs (row j / x_div for slot j, n_in <= 5376): the inputs go to FP16 with a power-of-two
+// scale per 32 in each block, the products are FP16 pairs into FP32. relu_in / relu_out: max(v, 0)^2 of the inputs /
+// outputs. y is (n_slots, n_out).
+void iq2_gather_f16(const unsigned long long* table, const int32_t* idx, int n_slots, const float* x, int x_div, bool relu_in,
+                    bool relu_out, float* y, int n_in, int n_out, void* stream);
+// the same for two jobs in one launch (b may be null): each job is n_slots matrices table[idx[j]] of n_out x n_in
+struct Iq2F16Job {
+    const unsigned long long* table;
+    const int32_t* idx;
+    int n_slots;
+    const float* x;
+    int x_div;
+    float* y;
+    int n_in, n_out;
+};
+void iq2_gather_f16(const Iq2F16Job& a, const Iq2F16Job* b, bool relu_in, bool relu_out, void* stream);
 
 /// Grouped routed experts: group g (g < *n_groups, at most max_groups launched) is expert g_exp[g] applied to
 /// g_cnt[g] <= 16 inputs x_q8_1 + g_xi[g*16+m] * x_stride_blocks, writing y row block g_slot[g*16+m]. IQ2_XXS only.

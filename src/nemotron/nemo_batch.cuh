@@ -427,11 +427,10 @@ __device__ __forceinline__ float rt_x16(float v) { return __int_as_float(rt_x16(
 // sigmoids normalized x kRouteScale; idx / wts are (T, k). One warp a row (8 rows a block of 256, n <= 512, k <= 16):
 // each lane holds n/32 scores, k rounds of a warp argmax by shuffles, no barriers (a 512-wide LDS reduction per round
 // took ~80 barriers a row)
-__global__ void __launch_bounds__(256) k_route_warp(const float* raw, const float* bias, int n, int k, int T, int32_t* idx, float* wts) {
+// one row's choice by one warp (k_route_warp's body): r is the row's raw scores, VOL reads them past the vector caches
+template <bool VOL = false>
+__device__ __forceinline__ void route_row(const float* r, const float* bias, int n, int k, int row, int lane, int32_t* idx, float* wts) {
     constexpr int M = 16;
-    const int lane = threadIdx.x & 31, row = blockIdx.x * 8 + (threadIdx.x >> 5);
-    if (row >= T) return;
-    const float* r = raw + size_t(row) * n;
     float c[M], sg[M];
     // (every load issued unconditionally at a clamped index, then masked: guarded loads became 16 branches whose
     // memory waits ran one after another)
@@ -439,7 +438,7 @@ __global__ void __launch_bounds__(256) k_route_warp(const float* raw, const floa
 #pragma unroll
     for (int j = 0; j < M; ++j) {
         const int e = min(lane + 32 * j, n - 1);
-        rv[j] = r[e];
+        rv[j] = VOL ? __builtin_nontemporal_load(r + e) : r[e];
         bv0[j] = bias[e];
     }
 #pragma unroll
@@ -479,6 +478,44 @@ __global__ void __launch_bounds__(256) k_route_warp(const float* raw, const floa
         idx[row * k + lane] = myi;
         wts[row * k + lane] = myw / (sum + 1e-20f) * kRouteScale;
     }
+}
+__global__ void __launch_bounds__(256) k_route_warp(const float* raw, const float* bias, int n, int k, int T, int32_t* idx, float* wts) {
+    const int lane = threadIdx.x & 31, row = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (row >= T) return;
+    route_row(raw + size_t(row) * n, bias, n, k, row, lane, idx, wts);
+}
+// one position's routing in one launch: k_bf16_cols' scores (a warp a router row), then the last block to finish
+// (a counter, which it puts back to 0) makes the choice from them
+__global__ void __launch_bounds__(256) k_route1(const uint16_t* W, const float* x, float* raw, const float* bias, int n, int rows, int k,
+                                                unsigned* done, int32_t* idx, float* wts) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int row = blockIdx.x * 8 + warp;
+    if (row < rows) {
+        const uint4* wr = reinterpret_cast<const uint4*>(W + size_t(row) * n);
+        const float4* xr = reinterpret_cast<const float4*>(x);
+        float a = 0.f;
+#pragma unroll 4
+        for (int i = lane; i < n / 8; i += 32) {
+            const uint4 w = wr[i];
+            const float4 x0 = xr[2 * i], x1 = xr[2 * i + 1];
+            a += __uint_as_float(w.x << 16) * x0.x + __uint_as_float(w.x & 0xffff0000u) * x0.y +
+                 __uint_as_float(w.y << 16) * x0.z + __uint_as_float(w.y & 0xffff0000u) * x0.w +
+                 __uint_as_float(w.z << 16) * x1.x + __uint_as_float(w.z & 0xffff0000u) * x1.y +
+                 __uint_as_float(w.w << 16) * x1.z + __uint_as_float(w.w & 0xffff0000u) * x1.w;
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffff, a, o, 32);
+        if (lane == 0) raw[row] = a;
+    }
+    __shared__ unsigned last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(done, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last || warp) return;
+    __threadfence();
+    route_row<true>(raw, bias, rows, k, 0, lane, idx, wts);
+    if (lane == 0) *done = 0;
 }
 
 // k_wsum_many with eo also as q8_1 rows (n == gridDim.x * blockDim.x: a warp holds 32 consecutive outputs; the same

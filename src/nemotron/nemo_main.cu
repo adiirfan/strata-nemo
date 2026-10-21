@@ -495,7 +495,7 @@ struct Block {
     const uint16_t* router = nullptr;
     std::vector<float> bias;
     float* bias_dev = nullptr;
-    unsigned long long *up_tab = nullptr, *down_tab = nullptr;
+    unsigned long long *up_tab = nullptr, *down_tab = nullptr, *sh_down_tab = nullptr;   // (sh_down_tab: one entry)
     const void *fc1 = nullptr, *fc2 = nullptr, *sh_up = nullptr, *sh_down = nullptr;
     std::vector<const void*> up, down;
     uint8_t *up_all = nullptr, *down_all = nullptr;   // the experts packed, for MMQ
@@ -554,6 +554,10 @@ struct Model {
     float *h, *n, *d, *y, *lat, *eo, *tmp, *tmp2, *scores, *att_sc, *qkv, *kbuf, *vbuf, *logits;
     float *ex_up, *ex_down, *route_w;
     int32_t* route_idx;
+    int32_t* idx0 = nullptr;   // a single 0 (one-entry tables)
+    unsigned* route_done = nullptr;   // k_route1's block counter (back to 0 after each launch)
+    // one position: the router's scores and choice in one launch (NEMO_ROUTE1=0: two)
+    bool route1 = !std::getenv("NEMO_ROUTE1") || std::atoi(std::getenv("NEMO_ROUTE1")) != 0;
     int32_t *g_n, *g_exp, *g_cnt, *g_tok, *g_slot;   // the step's expert groups
     void *q8, *q8b;
     void* q8s = nullptr;                   // the shared expert's packed inputs (its own: it runs beside the routed path)
@@ -651,6 +655,8 @@ struct Model {
                 CK(cudaMalloc(&b.up_tab, b.n_exp * 8)); CK(cudaMalloc(&b.down_tab, b.n_exp * 8)); CK(cudaMalloc(&b.bias_dev, b.n_exp * 4));
                 CK(cudaMemcpy(b.up_tab, u.data(), b.n_exp * 8, cudaMemcpyHostToDevice));
                 CK(cudaMemcpy(b.down_tab, dn.data(), b.n_exp * 8, cudaMemcpyHostToDevice));
+                const unsigned long long shd = (unsigned long long) b.sh_down;
+                CK(cudaMalloc(&b.sh_down_tab, 8)); CK(cudaMemcpy(b.sh_down_tab, &shd, 8, cudaMemcpyHostToDevice));
                 CK(cudaMemcpy(b.bias_dev, b.bias.data(), b.n_exp * 4, cudaMemcpyHostToDevice));
             } else if (types[i] == "attention") {
                 b.kind = ATTN;
@@ -675,6 +681,8 @@ struct Model {
         f(&kbuf, T * kAKv * kAHeadDim); f(&vbuf, T * kAKv * kAHeadDim); f(&logits, T * size_t(kVocab));
         f(&ex_up, T * 16 * 2560); f(&ex_down, T * 16 * kLatent); f(&route_w, T * 16);
         CK(cudaMalloc(&route_idx, T * 16 * sizeof(int32_t)));
+        CK(cudaMalloc(&idx0, sizeof(int32_t))); CK(cudaMemset(idx0, 0, sizeof(int32_t)));
+        CK(cudaMalloc(&route_done, sizeof(unsigned))); CK(cudaMemset(route_done, 0, sizeof(unsigned)));
         CK(cudaMalloc(&best_dev, kTMax * 4));
         CK(cudaMalloc(&g_n, 4)); CK(cudaMalloc(&g_exp, 512 * 4)); CK(cudaMalloc(&g_cnt, 512 * 4));
         CK(cudaMalloc(&g_tok, T * 16 * 16 * 4)); CK(cudaMalloc(&g_slot, T * 16 * 16 * 4));
@@ -718,6 +726,8 @@ struct Model {
         iq2_q(w, q8, out, n_in, n_out, T);
     }
     bool sh_par = !std::getenv("NEMO_SH_PAR") || std::atoi(std::getenv("NEMO_SH_PAR")) != 0;   // shared expert on stream2
+    // one position: the routed experts (and the shared down product) through iq2_gather_f16 (NEMO_G16=0: the q8_1 path)
+    bool g16 = !std::getenv("NEMO_G16") || std::atoi(std::getenv("NEMO_G16")) != 0;
     void iq2_q_on(const void* w, const void* xq, float* out, int n_in, int n_out, int T, cudaStream_t s) {
         if (T > 1 && sh_nr) strata::kernels::iq_mmvq_rows(kIQ2_XXS, w, xq, out, n_in, n_out, T, sh_nr, s);
         else strata::kernels::iq_mmvq(kIQ2_XXS, w, xq, out, n_in, n_out, T, s);
@@ -833,6 +843,10 @@ struct Model {
     void moe(Block& b, int T) {
         const int k = b.topk, W = b.width;
         auto route = [&](cudaStream_t st) {
+            if (T == 1 && route1) {
+                k_route1<<<(b.n_exp + 7) / 8, 256, 0, st>>>(b.router, n, scores, b.bias_dev, kHidden, b.n_exp, k, route_done, route_idx, route_w);
+                return;
+            }
             if (T == 1) k_bf16_cols<<<(b.n_exp + 7) / 8, 256, 0, st>>>(b.router, n, scores, kHidden, b.n_exp, T);
             else if (use_skinny) skinny(0, b.router, nullptr, 1.f, n, scores, kHidden, b.n_exp, T, st);
             else k_bf16_rows<<<(b.n_exp + 7) / 8, 256, 0, st>>>(b.router, n, scores, kHidden, b.n_exp, T);
@@ -851,16 +865,23 @@ struct Model {
             }
             if (!nq8) strata::kernels::quantize_q8_1_rows(n, T, kHidden, q8s, stream2);
             iq2_q_on(b.sh_up, nq8 ? q8n : q8s, tmp, kHidden, kShared, T, stream2);
-            strata::kernels::relu2_quantize_q8_1_rows(tmp, T, kShared, q8s, stream2);
-            iq2_q_on(b.sh_down, q8s, tmp2, kShared, kHidden, T, stream2);
+            // (one position: the down product from the FP32 up outputs, relu^2 applied as they load)
+            if (T == 1 && g16) strata::kernels::iq2_gather_f16(b.sh_down_tab, idx0, 1, tmp, 1, true, false, tmp2, kShared, kHidden, stream2);
+            else {
+                strata::kernels::relu2_quantize_q8_1_rows(tmp, T, kShared, q8s, stream2);
+                iq2_q_on(b.sh_down, q8s, tmp2, kShared, kHidden, T, stream2);
+            }
             CK(cudaEventRecord(ev_join, stream2));
         }
         q8_0(b.fc1, n, lat, kHidden, kLatent, T);
         const bool fq = T == 1 && fused_q;                         // (the weighted sum writes fc2's q8_1 input)
-        strata::kernels::quantize_q8_1_rows(lat, T, kLatent, q8, stream);
+        if (!(T == 1 && g16)) strata::kernels::quantize_q8_1_rows(lat, T, kLatent, q8, stream);
         if (rside) CK(cudaStreamWaitEvent(stream, ev_route, 0));
         // (gathers that quantize their own inputs measured slower: every block redid its slot's quantization)
-        if (T == 1) {
+        if (T == 1 && g16) {   // (FP32 inputs straight in, relu^2 on the up outputs: no quantize launches between)
+            strata::kernels::iq2_gather_f16(b.up_tab, route_idx, k, lat, k, false, true, ex_up, kLatent, W, stream);
+            strata::kernels::iq2_gather_f16(b.down_tab, route_idx, k, ex_up, 1, false, false, ex_down, W, kLatent, stream);
+        } else if (T == 1) {
             strata::kernels::iq_mmvq_gather(kIQ2_XXS, b.up_tab, route_idx, k, q8, kLatent / 32, k, ex_up, kLatent, W, stream);
             strata::kernels::relu2_quantize_q8_1_rows(ex_up, k, W, q8b, stream);
             strata::kernels::iq_mmvq_gather(kIQ2_XXS, b.down_tab, route_idx, k, q8b, W / 32, 1, ex_down, W, kLatent, stream);

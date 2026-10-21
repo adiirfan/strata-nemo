@@ -3758,7 +3758,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 // the card so the router needs no trip to the host.  Slot j reads x + (j / x_div) * x_stride blocks: x_div = 9 gives
 // the 9 slots of one token the same input, x_div = 1 each slot its own.
 // Same row dot as mmvq_multi_kernel, so each output is bitwise equal to iq_mmvq on that expert alone.
-template<int TY, bool STAGE_GRID>
+template<int TY, bool STAGE_GRID, int NRW = 4>
 __global__ void __launch_bounds__(128) mmvq_gather_kernel(const unsigned long long* __restrict__ table,
                                                           const int32_t* __restrict__ idx, size_t row_bytes,
                                                           const block_q8_1* __restrict__ x, int x_stride, int x_div,
@@ -3767,20 +3767,20 @@ __global__ void __launch_bounds__(128) mmvq_gather_kernel(const unsigned long lo
     const uint32_t* s_grid = stage_iq_grid<TY, STAGE_GRID>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
     // 4 rows per warp together (rows_dot_multi: the same sums as row_dot_multi): one row per warp was one or two loads
     // deep at Nemotron's sizes, so the launch was mostly block start-up and grid staging (21 us a call, ~3x its reads)
-    const int r0 = (blockIdx.x * 4 + threadIdx.y) * 4;
+    const int r0 = (blockIdx.x * 4 + threadIdx.y) * NRW;
     if (r0 >= n_out) return;
     const int j = blockIdx.y;
     const uint8_t* we = reinterpret_cast<const uint8_t*>(table[idx[j]]);
-    const uint8_t* wr[4];
+    const uint8_t* wr[NRW];
 #pragma unroll
-    for (int r = 0; r < 4; ++r) wr[r] = we + (size_t) min(r0 + r, n_out - 1) * row_bytes;
+    for (int r = 0; r < NRW; ++r) wr[r] = we + (size_t) min(r0 + r, n_out - 1) * row_bytes;
     const int nb = n_in / Fmt<TY>::qk;
     int off[1] = {(j / x_div) * x_stride};
-    float sum[4][1];
-    rows_dot_multi<TY, 4, 1, STAGE_GRID>(wr, x, off, 1, nb, threadIdx.x, sum, s_grid);
+    float sum[NRW][1];
+    rows_dot_multi<TY, NRW, 1, STAGE_GRID>(wr, x, off, 1, nb, threadIdx.x, sum, s_grid);
     if (threadIdx.x == 0)
 #pragma unroll
-        for (int r = 0; r < 4; ++r)
+        for (int r = 0; r < NRW; ++r)
             if (r0 + r < n_out) y[(size_t) j * n_out + r0 + r] = sum[r][0];
 }
 
@@ -3788,11 +3788,204 @@ void iq_mmvq_gather(int ggml_type, const unsigned long long* table, const int32_
                     const void* x_q8_1, int x_stride_blocks, int x_div, float* y, int n_in, int n_out, void* stream) {
     if (ggml_type != 16) throw std::invalid_argument("iq_mmvq_gather: only IQ2_XXS (16) so far");
     const size_t rb = iq_row_bytes(ggml_type, n_in);
-    const dim3 grid((n_out + 15) / 16, n_slots), block(32, 4);
+    // STRATA_GATHER_NR: rows per warp (4 default)
+    static const int nrw = std::getenv("STRATA_GATHER_NR") ? std::atoi(std::getenv("STRATA_GATHER_NR")) : 4;
     auto s = static_cast<cudaStream_t>(stream);
     const auto* X = static_cast<const block_q8_1*>(x_q8_1);
-    if (g_stage_grid) mmvq_gather_kernel<16, true><<<grid, block, 0, s>>>(table, idx, rb, X, x_stride_blocks, x_div, y, n_in, n_out);
-    else mmvq_gather_kernel<16, false><<<grid, block, 0, s>>>(table, idx, rb, X, x_stride_blocks, x_div, y, n_in, n_out);
+    const dim3 block(32, 4);
+    if (nrw == 8) {
+        const dim3 grid((n_out + 31) / 32, n_slots);
+        if (g_stage_grid) mmvq_gather_kernel<16, true, 8><<<grid, block, 0, s>>>(table, idx, rb, X, x_stride_blocks, x_div, y, n_in, n_out);
+        else mmvq_gather_kernel<16, false, 8><<<grid, block, 0, s>>>(table, idx, rb, X, x_stride_blocks, x_div, y, n_in, n_out);
+    } else if (nrw == 2) {
+        const dim3 grid((n_out + 7) / 8, n_slots);
+        if (g_stage_grid) mmvq_gather_kernel<16, true, 2><<<grid, block, 0, s>>>(table, idx, rb, X, x_stride_blocks, x_div, y, n_in, n_out);
+        else mmvq_gather_kernel<16, false, 2><<<grid, block, 0, s>>>(table, idx, rb, X, x_stride_blocks, x_div, y, n_in, n_out);
+    } else {
+        const dim3 grid((n_out + 15) / 16, n_slots);
+        if (g_stage_grid) mmvq_gather_kernel<16, true><<<grid, block, 0, s>>>(table, idx, rb, X, x_stride_blocks, x_div, y, n_in, n_out);
+        else mmvq_gather_kernel<16, false><<<grid, block, 0, s>>>(table, idx, rb, X, x_stride_blocks, x_div, y, n_in, n_out);
+    }
+}
+
+namespace {
+// IQ2_XXS times FP32 inputs for one position, one input row a slot (row j / x_div): each block stages its input in LDS
+// as FP16 with a power-of-two scale per 32 values and the 256 grid entries as FP16; the weights are decoded by that
+// table (grid values are positive, so each sign bit goes straight into its FP16 sign) and multiplied with
+// v_dot2_f32_f16. A warp takes 8-row chunks wid, wid + W, ... of its slot's matrix and fetches the next (chunk, item)
+// weights while it computes this one. RELU_IN / RELU_OUT: max(v, 0)^2 of the inputs / of the outputs.
+constexpr int kG16MaxIn = 5376;
+template <int M> __device__ __forceinline__ float g16_xor(float v) {
+    if constexpr (M == 16) return __int_as_float((int) __builtin_amdgcn_permlanex16((unsigned) __float_as_int(v), (unsigned) __float_as_int(v), 0x76543210u, 0xfedcba98u, false, false));
+    else return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x160 + M, 0xf, 0xf, false));
+}
+// NRW sums over 32 lanes, halving the rows each step: lane ends with row `row`; lanes (lane % (32 / NRW)) == 0 hold it
+template <int NRW, int OFF = 16>
+__device__ __forceinline__ void g16_reduce(float* v, int lane, int& row) {
+    if constexpr (OFF >= 1) {
+        constexpr int H = NRW / 2;
+        if constexpr (H >= 1) {
+            const bool hi = lane & OFF;
+#pragma unroll
+            for (int j = 0; j < H; ++j) {
+                const float mine = hi ? v[j + H] : v[j], oth = hi ? v[j] : v[j + H];
+                v[j] = mine + g16_xor<OFF>(oth);
+            }
+            row += hi ? H : 0;
+            g16_reduce<H, OFF / 2>(v, lane, row);
+        } else {
+            v[0] += g16_xor<OFF>(v[0]);
+            g16_reduce<1, OFF / 2>(v, lane, row);
+        }
+    }
+}
+__device__ __forceinline__ uint32_t g16_h2(float a, float b) {
+    return (uint32_t) __half_as_ushort(__float2half_rn(a)) | ((uint32_t) __half_as_ushort(__float2half_rn(b)) << 16);
+}
+typedef _Float16 g16_v2h __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ float g16_dot(uint32_t a, uint32_t b, float c) {
+    return __builtin_amdgcn_fdot2(__builtin_bit_cast(g16_v2h, a), __builtin_bit_cast(g16_v2h, b), c, false);
+}
+// Two jobs in one launch: blocks [0, a.n_slots * a.bx) take job a (bx blocks a slot), the rest job b
+struct G16Job {
+    const unsigned long long* table;
+    const int32_t* idx;
+    const float* x;
+    float* y;
+    int x_div, n_in, n_out, n_slots, bx;
+};
+template <int NRW, bool RELU_IN, bool RELU_OUT>
+__global__ void __launch_bounds__(128) iq2_gather_f16_kernel(G16Job ja, G16Job jb) {
+    const bool in_a = (int) blockIdx.x < ja.n_slots * ja.bx;
+    const G16Job& J = in_a ? ja : jb;
+    const int blk = in_a ? (int) blockIdx.x : (int) blockIdx.x - ja.n_slots * ja.bx;
+    const unsigned long long* __restrict__ table = J.table;
+    const int32_t* __restrict__ idx = J.idx;
+    const float* __restrict__ x = J.x;
+    float* __restrict__ y = J.y;
+    const int x_div = J.x_div, n_in = J.n_in, n_out = J.n_out;
+    typedef const __attribute__((address_space(1))) unsigned long long g8;
+    typedef const __attribute__((address_space(1))) unsigned short g2;
+    __shared__ uint4 stab[256];
+    __shared__ __align__(16) uint32_t sx[kG16MaxIn / 2];
+    __shared__ float sxs[kG16MaxIn / 32];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, j = blk / J.bx;
+    const int W = J.bx * 4, wid = (blk % J.bx) * 4 + warp;
+    const int nb = n_in / QK_K, rb = nb * (int) sizeof(block_iq2_xxs), ni = nb * 8, nit = (ni + 31) / 32;
+    const int nch = (n_out + NRW - 1) / NRW, nu = wid < nch ? ((nch - wid + W - 1) / W) * nit : 0;
+    const uint8_t* we = reinterpret_cast<const uint8_t*>(table[idx[j]]);
+    uint2 q[NRW];
+    float d[NRW];
+    auto fetch = [&](int u) {
+        if (u >= nu) return;
+        const int c = wid + (u / nit) * W, it = lane + (u % nit) * 32;
+        if (it >= ni) return;
+        const int kbx = it >> 3, sub = it & 7;
+#pragma unroll
+        for (int r = 0; r < NRW; ++r) {
+            const uint8_t* blk = we + min(c * NRW + r, n_out - 1) * rb + kbx * (int) sizeof(block_iq2_xxs);
+            const unsigned long long v = *(g8*) (blk + 2 + 8 * sub);
+            q[r] = make_uint2((uint32_t) v, (uint32_t) (v >> 32));
+            d[r] = __half2float(__ushort_as_half(*(g2*) blk));
+        }
+    };
+    fetch(0);
+    for (int e = tid; e < 256; e += 128) {
+        const uint2 gb = reinterpret_cast<const uint2*>(iq2xxs_grid)[e];
+        stab[e] = make_uint4(g16_h2((float) (gb.x & 255), (float) ((gb.x >> 8) & 255)), g16_h2((float) ((gb.x >> 16) & 255), (float) (gb.x >> 24)),
+                             g16_h2((float) (gb.y & 255), (float) ((gb.y >> 8) & 255)), g16_h2((float) ((gb.y >> 16) & 255), (float) (gb.y >> 24)));
+    }
+    {   // the input: 8 lanes a 32-value group (float4 each), scale = the power of two at or below the group's largest
+        const float4* xr = reinterpret_cast<const float4*>(x + (size_t) (j / x_div) * n_in);
+        for (int i = tid; i < n_in / 4; i += 128) {
+            float4 v = xr[i];
+            if (RELU_IN) {
+                v.x = fmaxf(v.x, 0.f); v.y = fmaxf(v.y, 0.f); v.z = fmaxf(v.z, 0.f); v.w = fmaxf(v.w, 0.f);
+                v.x *= v.x; v.y *= v.y; v.z *= v.z; v.w *= v.w;
+            }
+            float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+            m = fmaxf(m, g16_xor<1>(m));
+            m = fmaxf(m, g16_xor<2>(m));
+            m = fmaxf(m, g16_xor<4>(m));
+            const uint32_t eb = __float_as_uint(m) & 0x7f800000u;
+            const float sc = eb ? __uint_as_float(eb) : 1.f, inv = eb ? __uint_as_float((254u << 23) - eb) : 1.f;
+            sx[2 * i] = g16_h2(v.x * inv, v.y * inv);
+            sx[2 * i + 1] = g16_h2(v.z * inv, v.w * inv);
+            if ((i & 7) == 0) sxs[i >> 3] = sc;
+        }
+    }
+    __syncthreads();
+    float acc[NRW];
+#pragma unroll
+    for (int r = 0; r < NRW; ++r) acc[r] = 0.f;
+    for (int u = 0; u < nu; ++u) {
+        const int c = wid + (u / nit) * W, it = lane + (u % nit) * 32;
+        uint2 qc[NRW];
+        float dc[NRW];
+#pragma unroll
+        for (int r = 0; r < NRW; ++r) { qc[r] = q[r]; dc[r] = d[r]; }
+        fetch(u + 1);
+        if (it < ni) {
+            uint4 xv[4];
+#pragma unroll
+            for (int g = 0; g < 4; ++g) xv[g] = reinterpret_cast<const uint4*>(sx)[it * 4 + g];
+            const float xsc = sxs[it] * 0.25f;
+#pragma unroll
+            for (int r = 0; r < NRW; ++r) {
+                const uint32_t a0 = qc[r].x, a1 = qc[r].y;
+                float s = 0.f;
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    const uint4 gv = stab[(a0 >> (8 * g)) & 255];
+                    const uint32_t b7 = (a1 >> (7 * g)) & 127, u7 = b7 | (__popc(b7) << 7);
+                    uint32_t A;   // u7 | u7 << 15, opaque so the shifts below stay shifts (not multiplies)
+                    asm("v_lshl_or_b32 %0, %1, 15, %1" : "=v"(A) : "v"(u7));
+                    s = g16_dot(((A << 15) & 0x80008000u) | gv.x, xv[g].x, s);
+                    s = g16_dot(((A << 13) & 0x80008000u) | gv.y, xv[g].y, s);
+                    s = g16_dot(((A << 11) & 0x80008000u) | gv.z, xv[g].z, s);
+                    s = g16_dot(((A << 9) & 0x80008000u) | gv.w, xv[g].w, s);
+                }
+                acc[r] += s * (dc[r] * (0.5f + (float) (a1 >> 28))) * xsc;
+            }
+        }
+        if (u % nit == nit - 1) {
+            int row = 0;
+            g16_reduce<NRW>(acc, lane, row);
+            if (lane % (32 / NRW) == 0 && c * NRW + row < n_out) {
+                float v = acc[0];
+                if (RELU_OUT) { v = fmaxf(v, 0.f); v *= v; }
+                y[(size_t) j * n_out + c * NRW + row] = v;
+            }
+#pragma unroll
+            for (int r = 0; r < NRW; ++r) acc[r] = 0.f;
+        }
+    }
+}
+}
+
+namespace {
+// chunks of 8 rows: about 3 a warp when a row is one pass of the lanes, 2 when longer (min_warps: at least that many
+// warps over the job's slots)
+G16Job g16_job(const Iq2F16Job& q, int min_warps) {
+    if (q.n_in % QK_K || q.n_in > kG16MaxIn) throw std::invalid_argument("iq2_gather_f16: n_in must be a multiple of 256, at most 5376");
+    const int nch = (q.n_out + 7) / 8, nit = (q.n_in / 32 + 31) / 32, cpw = nit >= 2 ? 2 : 3;
+    int bx = std::max((nch + 4 * cpw - 1) / (4 * cpw), (min_warps / 4 + q.n_slots - 1) / q.n_slots);
+    bx = std::min(bx, (nch + 3) / 4);
+    return G16Job{q.table, q.idx, q.x, q.y, q.x_div, q.n_in, q.n_out, q.n_slots, bx};
+}
+}
+void iq2_gather_f16(const Iq2F16Job& a, const Iq2F16Job* b, bool relu_in, bool relu_out, void* stream) {
+    const G16Job ja = g16_job(a, b ? 0 : 512), jb = b ? g16_job(*b, 0) : G16Job{nullptr, nullptr, nullptr, nullptr, 1, 256, 8, 0, 1};
+    const unsigned grid = (unsigned) (ja.n_slots * ja.bx + jb.n_slots * jb.bx);
+    auto s = static_cast<cudaStream_t>(stream);
+    if (relu_in && relu_out) iq2_gather_f16_kernel<8, true, true><<<grid, 128, 0, s>>>(ja, jb);
+    else if (relu_in) iq2_gather_f16_kernel<8, true, false><<<grid, 128, 0, s>>>(ja, jb);
+    else if (relu_out) iq2_gather_f16_kernel<8, false, true><<<grid, 128, 0, s>>>(ja, jb);
+    else iq2_gather_f16_kernel<8, false, false><<<grid, 128, 0, s>>>(ja, jb);
+}
+void iq2_gather_f16(const unsigned long long* table, const int32_t* idx, int n_slots, const float* x, int x_div, bool relu_in,
+                    bool relu_out, float* y, int n_in, int n_out, void* stream) {
+    iq2_gather_f16(Iq2F16Job{table, idx, n_slots, x, x_div, y, n_in, n_out}, nullptr, relu_in, relu_out, stream);
 }
 
 // Grouped routed experts: group g is expert g_exp[g] with g_cnt[g] members (at most 16); member m reads input
