@@ -89,16 +89,25 @@ __global__ void __launch_bounds__(256) k_nvfp4_cols(const uint8_t* W, const uint
     }
 }
 
-// BF16 times T columns (the router): one warp per row
+// BF16 times T columns (the router): one warp per row, 8 weights (16 bytes) a lane a step (n % 256 == 0; 2-byte loads
+// kept too little in flight: 20 us for a 4 MB router)
 __global__ void __launch_bounds__(256) k_bf16_cols(const uint16_t* W, const float* x, float* y, int n, int rows, int T) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int row = blockIdx.x * 8 + warp;
     if (row >= rows) return;
-    const uint16_t* wr = W + size_t(row) * n;
+    const uint4* wr = reinterpret_cast<const uint4*>(W + size_t(row) * n);
     for (int c = 0; c < T; ++c) {
-        const float* xr = x + size_t(c) * n;
+        const float4* xr = reinterpret_cast<const float4*>(x + size_t(c) * n);
         float a = 0.f;
-        for (int i = lane; i < n; i += 32) a += bf16f(wr[i]) * xr[i];
+#pragma unroll 4
+        for (int i = lane; i < n / 8; i += 32) {
+            const uint4 w = wr[i];
+            const float4 x0 = xr[2 * i], x1 = xr[2 * i + 1];
+            a += __uint_as_float(w.x << 16) * x0.x + __uint_as_float(w.x & 0xffff0000u) * x0.y +
+                 __uint_as_float(w.y << 16) * x0.z + __uint_as_float(w.y & 0xffff0000u) * x0.w +
+                 __uint_as_float(w.z << 16) * x1.x + __uint_as_float(w.z & 0xffff0000u) * x1.y +
+                 __uint_as_float(w.w << 16) * x1.z + __uint_as_float(w.w & 0xffff0000u) * x1.w;
+        }
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffff, a, o, 32);
         if (lane == 0) y[size_t(c) * rows + row] = a;
