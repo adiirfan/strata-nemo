@@ -970,7 +970,6 @@ struct Model {
         W8Slot slot[kW8Slots];
         std::vector<W8Job> jobs;
         cudaStream_t side = nullptr;
-        uint16_t* side_bf16 = nullptr;          // the side stream's BF16 unpacking of an IQ2_XXS weight
         float* alpha = nullptr;
         int use = 0, issued = 0;
         bool pipe = false;
@@ -1032,7 +1031,7 @@ struct Model {
         CK(cudaMalloc(&B->alpha, size_t(kInProj) * 4));
         f(&B->rs_n, T); f(&B->rs_y, T); f(&B->rs_t, T);
         CK(cudaStreamCreateWithFlags(&B->side, cudaStreamNonBlocking));
-        CK(cudaMalloc(&B->side_bf16, size_t(kShared) * kHidden * 2));
+
         for (auto& sl : B->slot) {
             CK(cudaMalloc(&sl.w8, size_t(kInProj) * kHidden)); CK(cudaMalloc(&sl.rscale, size_t(kInProj) * 4));
             CK(cudaEventCreateWithFlags(&sl.ready, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&sl.free_, cudaEventDisableTiming));
@@ -1099,8 +1098,7 @@ struct Model {
         Big::W8Slot& sl = B->slot[j % Big::kW8Slots];
         CK(cudaStreamWaitEvent(B->side, sl.free_, 0));
         if (jb.iq2) {
-            strata::kernels::iq_dequant_bf16(kIQ2_XXS, jb.w, int64_t(jb.rows) * jb.K, B->side_bf16, B->side);
-            k_bf16_to_e4m3_rows<<<jb.rows, 256, 0, B->side>>>(B->side_bf16, jb.K, sl.w8, sl.rscale);
+            strata::kernels::iq2xxs_e4m3_rows(jb.w, jb.rows, jb.K, sl.w8, sl.rscale, B->side);
         } else {
             k_nvfp4_to_e4m3_rows<<<jb.rows, 256, 0, B->side>>>((const uint8_t*) jb.w, jb.sc, jb.K, sl.w8, sl.rscale);
         }
@@ -1175,8 +1173,7 @@ struct Model {
             CK(cudaMalloc(&B->w8, size_t(kInProj) * kHidden)); CK(cudaMalloc(&B->x8, size_t(kTBig) * kMInter));
             CK(cudaMalloc(&B->rscale, 2 * size_t(kInProj) * 4)); CK(cudaMalloc(&B->amax, 4));
         }
-        strata::kernels::iq_dequant_bf16(kIQ2_XXS, w, int64_t(rows) * K, B->gemm.scratch(), stream);
-        k_bf16_to_e4m3_rows<<<rows, 256, 0, stream>>>(B->gemm.scratch(), K, B->w8, B->rscale);
+        strata::kernels::iq2xxs_e4m3_rows(w, rows, K, B->w8, B->rscale, stream);
         if (X) {
             CK(cudaMemsetAsync(B->amax, 0, 4, stream));
             const size_t n = size_t(T) * K;

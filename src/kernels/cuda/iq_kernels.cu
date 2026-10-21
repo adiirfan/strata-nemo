@@ -2818,6 +2818,72 @@ void iq_dequant_bf16(int t, const void* src, int64_t n, uint16_t* dst, void* str
     check("iq_dequant_bf16");
 }
 
+namespace {
+// IQ2_XXS rows straight to E4M3 with one scale per row (the row's largest / 448), the same values as
+// iq_dequant_bf16 + a BF16-rows-to-E4M3 pass (each value rounded to BF16 first) without the BF16 copy in memory.
+// One block of 256 per row; a thread takes 8-value groups (one grid entry each).
+__device__ __forceinline__ uint32_t e4m3x4(float a, float b, float c, float d) {
+#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx950__)
+    int v = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0, false);
+    v = __builtin_amdgcn_cvt_pk_fp8_f32(c, d, v, true);
+    return (uint32_t) v;
+#else
+    __trap();
+    return 0;
+#endif
+}
+__global__ void __launch_bounds__(256) iq2xxs_e4m3_rows_kernel(const uint8_t* __restrict__ w, int K, uint8_t* __restrict__ w8,
+                                                               float* __restrict__ rscale) {
+    __shared__ float red[8];
+    const int64_t r = blockIdx.x;
+    const block_iq2_xxs* x = (const block_iq2_xxs*) (w + r * (int64_t) (K / QK_K) * sizeof(block_iq2_xxs));
+    const int groups = K / 8, tid = threadIdx.x;
+    // a group: its 8 values as BF16-rounded floats
+    auto group = [&](int gi, float* v) {
+        const int ib = gi / 32, sub = (gi % 32) / 4, il = gi % 4;
+        const uint16_t* q2 = x[ib].qs + 4 * sub;
+        const uint8_t* grid = (const uint8_t*) (iq2xxs_grid + ((const uint8_t*) q2)[il]);
+        const uint32_t aux32 = q2[2] | (q2[3] << 16);
+        const float d = (float) x[ib].d * (0.5f + (aux32 >> 28)) * 0.25f;
+        const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            uint32_t u = __float_as_uint(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+            u += 0x7fffu + ((u >> 16) & 1u);
+            v[j] = __uint_as_float(u & 0xffff0000u);
+        }
+    };
+    float m = 0.f;
+    for (int gi = tid; gi < groups; gi += 256) {
+        float v[8];
+        group(gi, v);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) m = fmaxf(m, fabsf(v[j]));
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o, 32));
+    if ((tid & 31) == 0) red[tid >> 5] = m;
+    __syncthreads();
+    float mx = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) mx = fmaxf(mx, red[i]);
+    const float rs = mx > 0.f ? mx / 448.f : 1.f, inv = 1.f / rs;
+    for (int gi = tid; gi < groups; gi += 256) {
+        float v[8];
+        group(gi, v);
+        reinterpret_cast<uint2*>(w8 + r * K)[gi] = make_uint2(e4m3x4(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv),
+                                                              e4m3x4(v[4] * inv, v[5] * inv, v[6] * inv, v[7] * inv));
+    }
+    if (tid == 0) rscale[r] = rs;
+}
+}  // namespace
+
+void iq2xxs_e4m3_rows(const void* w, int rows, int K, uint8_t* w8, float* rscale, void* stream) {
+    if (K % QK_K != 0 || rows <= 0) { std::fprintf(stderr, "iq2xxs_e4m3_rows: bad arguments\n"); std::exit(1); }
+    iq2xxs_e4m3_rows_kernel<<<rows, 256, 0, (cudaStream_t) stream>>>((const uint8_t*) w, K, w8, rscale);
+    check("iq2xxs_e4m3_rows");
+}
+
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
     if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst);

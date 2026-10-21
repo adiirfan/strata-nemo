@@ -29,6 +29,10 @@ void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_i
 void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream);
 /// The same to BF16 (round to nearest even).
 void iq_dequant_bf16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream);
+/// IQ2_XXS rows (K values each, K a multiple of 256) to E4M3 at one scale per row (the row's largest magnitude / 448,
+/// into rscale), each value rounded to BF16 first: the same bytes as iq_dequant_bf16 followed by a per-row E4M3
+/// conversion, without the BF16 copy.
+void iq2xxs_e4m3_rows(const void* w, int rows, int K, uint8_t* w8, float* rscale, void* stream);
 void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream);
 /// Rows `tokens[0..n_tok)` (device ids) of a GGUF embedding table (`row_bytes` per row; the table may be mapped
 /// host memory) dequantized to fp32, `n_embd` per row (a multiple of 256).
