@@ -2492,3 +2492,11 @@ __global__ void __launch_bounds__(256) k_group_slots_par(const int32_t* idx, int
     }
     if (j == 0) { int n = 0; for (int i = 0; i < S; ++i) n += first[i]; *ng = n; }
 }
+
+// rows of kHidden floats into the residual stream at the positions map[t] >= 0 names (strata-nemo --serve: an image's
+// embeddings in place of its <image> tokens)
+__global__ void k_put_rows(float* h, const float* rows, const int32_t* map) {
+    const int r = map[blockIdx.x];
+    if (r < 0) return;
+    for (int i = threadIdx.x; i < kHidden; i += blockDim.x) h[size_t(blockIdx.x) * kHidden + i] = rows[size_t(r) * kHidden + i];
+}

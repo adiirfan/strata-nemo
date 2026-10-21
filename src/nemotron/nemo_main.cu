@@ -32,6 +32,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -1571,6 +1572,8 @@ struct Model {
     double* ppl_acc = nullptr;
 
     // T (<= kTBig) prompt positions at pos, the state stored after them; returns the last position's logits
+    const float* inj_rows = nullptr;          // --serve: rows put in place of the embeddings at inj_map's positions
+    const int32_t* inj_map = nullptr;
     std::vector<float> forward_big(const std::vector<int>& toks, std::vector<float>* dump = nullptr) {
         if (!B) init_big();
         const int T = int(toks.size());
@@ -1580,6 +1583,7 @@ struct Model {
         h_tp[kTMax] = pos;
         CK(cudaMemcpyAsync(d_pos, h_tp + kTMax, 4, cudaMemcpyHostToDevice, stream));
         k_embed_many<<<dim3(16, T), 256, 0, stream>>>(embed, dt, B->h);
+        if (inj_map) k_put_rows<<<T, 256, 0, stream>>>(B->h, inj_rows, inj_map);   // (--serve: image embeddings)
         k_rmsnorm_many<<<T, 1024, 0, stream>>>(B->h, blocks[0].norm, B->n, kHidden);
         if (needs_x8(blocks[0], T)) k_rows_e4m3<kHidden, 256, false><<<T, 256, 0, stream>>>(B->n, nullptr, B->x8, B->rs_n);
         if (use_w8_pipe) w8_begin(T);
@@ -1923,12 +1927,15 @@ struct Drafter {
 
 static int argmax(const float* p, int n) { return int(std::max_element(p, p + n) - p); }
 
+#include "nemo_serve.cuh"
+
 int main(int argc, char** argv) {
     // two hardware queues unless set: with the runtime's default four, some draft-check graphs had their two branches
     // placed so that every launch boundary in them took several times as long
     setenv("GPU_MAX_HW_QUEUES", "2", 0);
     std::string dir, ids_s, dump_path, mode = "plain", draft_dir;
-    bool ppl = false;
+    bool ppl = false, serve_mode = false;
+    std::vector<int> eos_ids = {2, 11};                         // </s> and <|im_end|> (generation_config.json)
     int n_new = 0, ctx = 4096;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1944,13 +1951,19 @@ int main(int argc, char** argv) {
         }
         else if (a == "--new") n_new = std::stoi(next());
         else if (a == "--dump") dump_path = next();
-        else if (a == "--max-ctx") ctx = std::stoi(next());
+        else if (a == "--max-ctx" || a == "--max-context") ctx = std::stoi(next());
+        else if (a == "--serve") serve_mode = true;
+        else if (a == "--eos-ids") {
+            eos_ids.clear();
+            std::stringstream es(next());
+            for (std::string v; std::getline(es, v, ',');) eos_ids.push_back(std::stoi(v));
+        }
         else if (a == "--mode") mode = next();
         else if (a == "--draft") draft_dir = next();
         else if (a == "--ppl") ppl = true;
-        else { std::fprintf(stderr, "usage: strata-nemo --model DIR --ids 1,2,3|@FILE [--new N] [--dump FILE] [--max-ctx N] [--mode plain|small|onebyone|spec] [--draft DIR] [--ppl]\n"); return 2; }
+        else { std::fprintf(stderr, "usage: strata-nemo --model DIR (--ids 1,2,3|@FILE [--new N] [--dump FILE] [--mode plain|small|onebyone|spec] [--ppl] | --serve [--eos-ids 2,11]) [--max-ctx N] [--draft DIR]\n"); return 2; }
     }
-    if (dir.empty() || ids_s.empty()) { std::fprintf(stderr, "strata-nemo: --model and --ids are needed\n"); return 2; }
+    if (dir.empty() || (ids_s.empty() && !serve_mode)) { std::fprintf(stderr, "strata-nemo: --model and --ids (or --serve) are needed\n"); return 2; }
     std::vector<int> ids;
     std::stringstream ss(ids_s);
     for (std::string v; std::getline(ss, v, ',');) ids.push_back(std::stoi(v));
@@ -1973,6 +1986,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata-nemo: card memory %.1f GB free of %.1f GB after load\n", fr / 1e9, tot / 1e9);
     }
     std::fprintf(stderr, "strata-nemo: %.1f GB on the card in %.1f s\n", m.st.loaded / 1e9, load_s);
+    if (serve_mode) {   // Strata's engine protocol on stdin / stdout (nemo_serve.cuh)
+        std::unique_ptr<Drafter> D;
+        if (!draft_dir.empty()) D = std::make_unique<Drafter>(m, draft_dir);
+        return serve(m, D.get(), eos_ids);
+    }
 
     if (ppl) {   // how well the prompt path predicts each next token of the text (quality checks of numeric changes)
         int32_t* d_ids = nullptr;
