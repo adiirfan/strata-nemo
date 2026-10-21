@@ -546,12 +546,10 @@ __global__ void __launch_bounds__(256) k_nvfp4_to_e4m3_rows(const uint8_t* W, co
     const int64_t r = blockIdx.x;
     const uint8_t* wr = W + r * (K / 2);
     const uint8_t* sr = S + r * (K / 16);
+    // the row's largest from the block scales alone (6 x scale: E2M1's largest; a block whose values stop short of 6
+    // only leaves E4M3 headroom unused), so the 4-bit values are read once
     float m = 0.f;
-    for (int i = threadIdx.x; i < K / 2; i += 256) {
-        const uint8_t b = wr[i];
-        const float sc = e4m3f(sr[(2 * i) / 16]);
-        m = fmaxf(m, fmaxf(fabsf(e2m1x2(b & 15)), fabsf(e2m1x2(b >> 4))) * 0.5f * sc);
-    }
+    for (int i = threadIdx.x; i < K / 16; i += 256) m = fmaxf(m, 6.f * fabsf(e4m3f(sr[i])));
     red[threadIdx.x] = m;
     __syncthreads();
     for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]); __syncthreads(); }
