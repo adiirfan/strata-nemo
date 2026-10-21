@@ -3699,22 +3699,30 @@ __global__ void __launch_bounds__(128) mmvq_gather_kernel(const unsigned long lo
                                                           float* __restrict__ y, int n_in, int n_out) {
     STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TY, STAGE_GRID>::value);
     const uint32_t* s_grid = stage_iq_grid<TY, STAGE_GRID>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
-    const int row = blockIdx.x * 4 + threadIdx.y;
-    if (row >= n_out) return;
+    // 4 rows per warp together (rows_dot_multi: the same sums as row_dot_multi): one row per warp was one or two loads
+    // deep at Nemotron's sizes, so the launch was mostly block start-up and grid staging (21 us a call, ~3x its reads)
+    const int r0 = (blockIdx.x * 4 + threadIdx.y) * 4;
+    if (r0 >= n_out) return;
     const int j = blockIdx.y;
-    const uint8_t* wr = reinterpret_cast<const uint8_t*>(table[idx[j]]) + (size_t) row * row_bytes;
+    const uint8_t* we = reinterpret_cast<const uint8_t*>(table[idx[j]]);
+    const uint8_t* wr[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) wr[r] = we + (size_t) min(r0 + r, n_out - 1) * row_bytes;
     const int nb = n_in / Fmt<TY>::qk;
     int off[1] = {(j / x_div) * x_stride};
-    float sum[1];
-    row_dot_multi<TY, 1, true, STAGE_GRID>(wr, x, off, 1, nb, threadIdx.x, sum, s_grid);
-    if (threadIdx.x == 0) y[(size_t) j * n_out + row] = sum[0];
+    float sum[4][1];
+    rows_dot_multi<TY, 4, 1, STAGE_GRID>(wr, x, off, 1, nb, threadIdx.x, sum, s_grid);
+    if (threadIdx.x == 0)
+#pragma unroll
+        for (int r = 0; r < 4; ++r)
+            if (r0 + r < n_out) y[(size_t) j * n_out + r0 + r] = sum[r][0];
 }
 
 void iq_mmvq_gather(int ggml_type, const unsigned long long* table, const int32_t* idx, int n_slots,
                     const void* x_q8_1, int x_stride_blocks, int x_div, float* y, int n_in, int n_out, void* stream) {
     if (ggml_type != 16) throw std::invalid_argument("iq_mmvq_gather: only IQ2_XXS (16) so far");
     const size_t rb = iq_row_bytes(ggml_type, n_in);
-    const dim3 grid((n_out + 3) / 4, n_slots), block(32, 4);
+    const dim3 grid((n_out + 15) / 16, n_slots), block(32, 4);
     auto s = static_cast<cudaStream_t>(stream);
     const auto* X = static_cast<const block_q8_1*>(x_q8_1);
     if (g_stage_grid) mmvq_gather_kernel<16, true><<<grid, block, 0, s>>>(table, idx, rb, X, x_stride_blocks, x_div, y, n_in, n_out);
