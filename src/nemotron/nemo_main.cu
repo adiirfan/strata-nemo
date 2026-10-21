@@ -935,6 +935,17 @@ struct Model {
         uint8_t *w8 = nullptr, *x8 = nullptr;   // NEMO_FP8: E4M3 weight and activations, row scales and alpha, amax
         float* rscale = nullptr;
         uint32_t* amax = nullptr;
+        // the FP8 weights of a chunk's products, converted on a side stream a few products ahead (w8_*)
+        struct W8Job { bool iq2; const void* w; const uint8_t* sc; int rows, K; };
+        struct W8Slot { uint8_t* w8; float* rscale; cudaEvent_t ready, free_; };
+        static constexpr int kW8Slots = 3;
+        W8Slot slot[kW8Slots];
+        std::vector<W8Job> jobs;
+        cudaStream_t side = nullptr;
+        uint16_t* side_bf16 = nullptr;          // the side stream's BF16 unpacking of an IQ2_XXS weight
+        float* alpha = nullptr;
+        int use = 0, issued = 0;
+        bool pipe = false;
         uint16_t *lat16, *exh;        // its inputs in the scaled FP16 form, and their scales
         float *lats, *exs;
         int32_t* small_bounds;        // {0, T} for T <= kTMax, at 2 T
@@ -985,6 +996,27 @@ struct Model {
         std::string err;
         if (!B->gemm.init(stream, std::max<int64_t>(int64_t(kInProj) * kHidden, int64_t(kHidden) * kAux), err)) { std::fprintf(stderr, "strata-nemo: %s\n", err.c_str()); std::exit(1); }
         if (!strata::prefill::mmq::built()) { std::fprintf(stderr, "strata-nemo: this build has no MMQ\n"); std::exit(1); }
+        // the FP8 weight pipeline: slots, a side stream, and the products in the order the prompt pass runs them
+        if (!B->w8) {
+            CK(cudaMalloc(&B->w8, size_t(kInProj) * kHidden)); CK(cudaMalloc(&B->x8, size_t(kTBig) * kMInter));
+            CK(cudaMalloc(&B->rscale, 2 * size_t(kInProj) * 4)); CK(cudaMalloc(&B->amax, 4));
+        }
+        CK(cudaMalloc(&B->alpha, size_t(kInProj) * 4));
+        CK(cudaStreamCreateWithFlags(&B->side, cudaStreamNonBlocking));
+        CK(cudaMalloc(&B->side_bf16, size_t(kShared) * kHidden * 2));
+        for (auto& sl : B->slot) {
+            CK(cudaMalloc(&sl.w8, size_t(kInProj) * kHidden)); CK(cudaMalloc(&sl.rscale, size_t(kInProj) * 4));
+            CK(cudaEventCreateWithFlags(&sl.ready, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&sl.free_, cudaEventDisableTiming));
+        }
+        for (auto& b : blocks) {
+            if (b.kind == MAMBA) {
+                if (fp8_mode == 1 || fp8_mode == 2) B->jobs.push_back({false, b.in_w, b.in_s, kInProj, kHidden});
+                if (fp8_mode == 1 || fp8_mode == 3) B->jobs.push_back({false, b.out_w, b.out_s, kHidden, kMInter});
+            } else if (b.kind == MOE && sh_fp8) {
+                B->jobs.push_back({true, b.sh_up, nullptr, kShared, kHidden});
+                B->jobs.push_back({true, b.sh_down, nullptr, kHidden, kShared});
+            }
+        }
         // one product now, so the library's first-use set-up (~0.4 s) is not paid inside the first prompt
         B->gemm.bf16(B->xb, B->gemm.scratch(), B->proj, kTBig, kInProj, kHidden, 0, 0.0f, 0, 1.0f);
         if (use_fp8) {   // and the FP8 products' (their first call cost ~0.45 s): both NVFP4 shapes at a full chunk
@@ -1032,7 +1064,53 @@ struct Model {
     // 7.5674 (+0.13%, +0.23%; top-1 66.03 -> 65.95%, 53.04 -> 53.14%); reading 8K 2,661 -> 3,064 tokens a second
     int fp8_mode = std::getenv("NEMO_FP8") ? std::atoi(std::getenv("NEMO_FP8")) : 1;
     bool use_fp8 = fp8_mode != 0;
+    // the side stream's conversion of job j into its slot (after the slot's last product has read it)
+    void w8_issue(int j) {
+        const Big::W8Job& jb = B->jobs[j];
+        Big::W8Slot& sl = B->slot[j % Big::kW8Slots];
+        CK(cudaStreamWaitEvent(B->side, sl.free_, 0));
+        if (jb.iq2) {
+            strata::kernels::iq_dequant_bf16(kIQ2_XXS, jb.w, int64_t(jb.rows) * jb.K, B->side_bf16, B->side);
+            k_bf16_to_e4m3_rows<<<jb.rows, 256, 0, B->side>>>(B->side_bf16, jb.K, sl.w8, sl.rscale);
+        } else {
+            k_nvfp4_to_e4m3_rows<<<jb.rows, 256, 0, B->side>>>((const uint8_t*) jb.w, jb.sc, jb.K, sl.w8, sl.rscale);
+        }
+        CK(cudaEventRecord(sl.ready, B->side));
+    }
+    // a chunk's prompt pass starts: the first few weights go to the side stream
+    void w8_begin(int T) {
+        B->pipe = T >= 256 && !B->jobs.empty();
+        B->use = 0;
+        if (!B->pipe) return;
+        CK(cudaEventRecord(B->slot[0].free_, stream));            // (the side stream starts after the main stream's work so far)
+        for (int k = 1; k < Big::kW8Slots; ++k) CK(cudaEventRecord(B->slot[k].free_, stream));
+        for (B->issued = 0; B->issued < std::min<int>(Big::kW8Slots, int(B->jobs.size())); ++B->issued) w8_issue(B->issued);
+    }
+    // the slot holding weight w if it is the next one of the pipeline (else nullptr: convert in line)
+    Big::W8Slot* w8_take(const void* w) {
+        if (!B->pipe || B->use >= int(B->jobs.size()) || B->jobs[B->use].w != w) return nullptr;
+        Big::W8Slot* sl = &B->slot[B->use % Big::kW8Slots];
+        CK(cudaStreamWaitEvent(stream, sl->ready, 0));
+        return sl;
+    }
+    // the product that read slot sl is queued: free it and convert the job kW8Slots ahead into it
+    void w8_done(Big::W8Slot* sl) {
+        CK(cudaEventRecord(sl->free_, stream));
+        ++B->use;
+        if (B->issued < int(B->jobs.size())) w8_issue(B->issued++);
+    }
     bool nvfp4_fp8(const uint8_t* w, const uint8_t* sc, float s2, const float* X, float* Y, int T, int rows, int K) {
+        if (Big::W8Slot* sl = w8_take(w)) {
+            CK(cudaMemsetAsync(B->amax, 0, 4, stream));
+            const size_t n = size_t(T) * K;
+            k_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
+            k_to_e4m3<<<2048, 256, 0, stream>>>(X, n, B->amax, B->x8);
+            k_fp8_alpha<<<(rows + 255) / 256, 256, 0, stream>>>(sl->rscale, rows, B->amax, s2, B->alpha);
+            const bool ok = B->gemm.fp8(B->x8, sl->w8, B->alpha, Y, T, rows, K);
+            w8_done(sl);
+            if (!ok) { std::fprintf(stderr, "strata-nemo: no FP8 plan for a pipelined product\n"); std::exit(1); }
+            return true;
+        }
         if (!B->w8) {
             CK(cudaMalloc(&B->w8, size_t(kInProj) * kHidden)); CK(cudaMalloc(&B->x8, size_t(kTBig) * kMInter));
             CK(cudaMalloc(&B->rscale, 2 * size_t(kInProj) * 4)); CK(cudaMalloc(&B->amax, 4));
@@ -1049,6 +1127,18 @@ struct Model {
     // the shared expert's IQ2_XXS products in FP8 (NEMO_SH_FP8): weight unpacked to BF16, then E4M3 per row; X in
     // E4M3 per chunk (relu^2 applied first, in place, when relu2)
     bool iq2_fp8(const void* w, float* X, float* Y, int T, int rows, int K, bool relu2) {
+        if (Big::W8Slot* sl = w8_take(w)) {
+            CK(cudaMemsetAsync(B->amax, 0, 4, stream));
+            const size_t n = size_t(T) * K;
+            if (relu2) k_relu2_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
+            else k_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
+            k_to_e4m3<<<2048, 256, 0, stream>>>(X, n, B->amax, B->x8);
+            k_fp8_alpha<<<(rows + 255) / 256, 256, 0, stream>>>(sl->rscale, rows, B->amax, 1.f, B->alpha);
+            const bool ok = B->gemm.fp8(B->x8, sl->w8, B->alpha, Y, T, rows, K);
+            w8_done(sl);
+            if (!ok) { std::fprintf(stderr, "strata-nemo: no FP8 plan for a pipelined product\n"); std::exit(1); }
+            return true;
+        }
         if (!B->w8) {
             CK(cudaMalloc(&B->w8, size_t(kInProj) * kHidden)); CK(cudaMalloc(&B->x8, size_t(kTBig) * kMInter));
             CK(cudaMalloc(&B->rscale, 2 * size_t(kInProj) * 4)); CK(cudaMalloc(&B->amax, 4));
@@ -1068,6 +1158,8 @@ struct Model {
     // +0.17% over the BF16 shared expert (all FP8 together vs all BF16: README 4.5585 -> 4.5710, DETAILS.md 7.5497 ->
     // 7.5795), reading 8K 3,392 -> 3,553 a second
     bool sh_fp8 = !std::getenv("NEMO_SH_FP8") || std::atoi(std::getenv("NEMO_SH_FP8")) != 0;
+    // the FP8 weights converted on a side stream ahead of their products (NEMO_W8_PIPE=0: in line)
+    bool use_w8_pipe = !std::getenv("NEMO_W8_PIPE") || std::atoi(std::getenv("NEMO_W8_PIPE")) != 0;
     void nvfp4_big(const uint8_t* w, const uint8_t* sc, float s2, const float* X, float* Y, int T, int rows, int K) {
         const bool fp8_here = T >= 256 && (fp8_mode == 1 || (fp8_mode == 2 && rows == kInProj) || (fp8_mode == 3 && rows == kHidden && K == kMInter));
         if (fp8_here && nvfp4_fp8(w, sc, s2, X, Y, T, rows, K)) return;
@@ -1301,6 +1393,7 @@ struct Model {
         CK(cudaMemcpyAsync(d_pos, h_tp + kTMax, 4, cudaMemcpyHostToDevice, stream));
         k_embed_many<<<dim3(16, T), 256, 0, stream>>>(embed, dt, B->h);
         k_rmsnorm_many<<<T, 1024, 0, stream>>>(B->h, blocks[0].norm, B->n, kHidden);
+        if (use_w8_pipe) w8_begin(T);
         for (size_t i = 0; i < blocks.size(); ++i) {
             Block& b = blocks[i];
             const float* e = nullptr;
@@ -1324,6 +1417,8 @@ struct Model {
                 k_nll_rows<<<nt, 1024, 0, stream>>>(logits, kVocab, ppl_ids + pos + t0 + 1, ppl_n - (pos + t0 + 1), ppl_acc);
             }
         }
+        if (B->pipe && B->use != int(B->jobs.size())) { std::fprintf(stderr, "strata-nemo: the FP8 pipeline ran %d of %zu products\n", B->use, B->jobs.size()); std::exit(1); }
+        B->pipe = false;
         std::vector<float> out;
         if (dump) {   // every row's logits, for the comparison
             out.resize(size_t(T) * kVocab);
