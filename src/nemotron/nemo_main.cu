@@ -924,6 +924,7 @@ struct Model {
         float *h, *n, *d, *proj, *xbc, *y, *lat, *eo, *tmp, *tmp2, *scores, *exu, *exd, *rw;
         uint16_t* xb;                 // BF16 activations for hipBLASLt (up to kTBig x kMInter)
         uint16_t *kb, *vtb, *qb, *P;  // attention: K, V^T, Q of one KV head and the probabilities, BF16
+        uint16_t *kb2, *vtb2;         // k_attn_flash: K and V^T of both KV heads, BF16
         float *S, *O;
         float *ssd_dt, *ssd_acs, *ssd_ea, *ssd_cb, *ssd_S;   // the SSD Mamba path
         int32_t *ridx, *bounds, *src, *rowof, *ident, *one_bounds, *toks;
@@ -960,6 +961,7 @@ struct Model {
         // the prompt attention products hold (16 T x max_ctx) scores: this caps the context they serve
         const size_t Lmax = size_t(max_ctx + 64);
         CK(cudaMalloc(&B->kb, Lmax * kAHeadDim * 2)); CK(cudaMalloc(&B->vtb, Lmax * kAHeadDim * 2));
+        CK(cudaMalloc(&B->kb2, kAKv * Lmax * kAHeadDim * 2)); CK(cudaMalloc(&B->vtb2, kAKv * Lmax * kAHeadDim * 2));
         CK(cudaMalloc(&B->qb, 16 * kAttSub * kAHeadDim * 2)); CK(cudaMalloc(&B->O, 16 * kAttSub * kAHeadDim * 4));
         CK(cudaMalloc(&B->S, 16 * kAttSub * Lmax * 4)); CK(cudaMalloc(&B->P, 16 * kAttSub * Lmax * 2));
         CK(cudaMalloc(&B->ridx, S * 4)); CK(cudaMalloc(&B->bounds, 513 * 4)); CK(cudaMalloc(&B->src, S * 4));
@@ -1054,6 +1056,7 @@ struct Model {
     }
 
     bool ssd_old = std::getenv("NEMO_SSD_OLD") != nullptr;
+    bool att_old = std::getenv("NEMO_ATT_OLD") != nullptr;   // the two-GEMM prompt attention (before k_attn_flash)
     bool sh_mmq = std::getenv("NEMO_SH_MMQ") != nullptr;
     // routed experts on the FP16 matrix cores (strata::kernels::moe_wmma_iq2xxs); NEMO_MOE_MMQ = llama.cpp's MMQ.
     // 8K README: perplexity 4.5585 vs 4.5630, 2,675 vs 2,484 tokens a second
@@ -1093,8 +1096,19 @@ struct Model {
         mmq_dense(b.k, 8, B->n, kk, T, kAKv * kAHeadDim, kHidden);
         mmq_dense(b.v, 8, B->n, vv, T, kAKv * kAHeadDim, kHidden);
         k_kv_append_many<<<dim3(T, kAKv), kAHeadDim, 0, stream>>>(kk, vv, b.K, b.V, d_pos, max_ctx);
-        // two products per KV head through hipBLASLt: S = Q K^T (16 T x L), causal softmax, O = P V
         const int Lp = (pos + T + 63) / 64 * 64;
+        if (!att_old) {
+            // one pass on the matrix cores per (KV head, 8 positions): the scores stay on the chip (k_attn_flash)
+            const size_t kvs = size_t(max_ctx + 64) * kAHeadDim;
+            for (int g = 0; g < kAKv; ++g) {
+                k_k_bf16<<<1024, 256, 0, stream>>>(b.K + size_t(g) * max_ctx * kAHeadDim, B->kb2 + g * kvs, d_pos, T, max_ctx, Lp);
+                k_vt_bf16<<<1024, 256, 0, stream>>>(b.V + size_t(g) * max_ctx * kAHeadDim, B->vtb2 + g * kvs, d_pos, T, Lp);
+            }
+            k_attn_flash<<<dim3((T + kFwPos - 1) / kFwPos, kAKv), 256, 0, stream>>>(q, B->kb2, B->vtb2, kvs, d_pos, T, Lp, B->y);
+            mmq_dense(b.o, 8, B->y, B->d, T, kHidden, kAHeads * kAHeadDim);
+            return;
+        }
+        // two products per KV head through hipBLASLt: S = Q K^T (16 T x L), causal softmax, O = P V
         for (int g = 0; g < kAKv; ++g) {
             const float* Kg = b.K + size_t(g) * max_ctx * kAHeadDim;
             const float* Vg = b.V + size_t(g) * max_ctx * kAHeadDim;

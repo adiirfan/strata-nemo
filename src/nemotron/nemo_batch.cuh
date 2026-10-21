@@ -954,6 +954,121 @@ __global__ void k_q_bf16(const float* q, uint16_t* out, int g, int T, int t_off)
         out[i] = f2bf(q[(size_t(t) * kAHeads + g * 16 + hl) * kAHeadDim + d] * rsqrtf(float(kAHeadDim)));
     }
 }
+// Prompt attention in one pass on the BF16 matrix cores (gfx12), the scores never leaving the chip. Block: KV head
+// blockIdx.y, 8 consecutive positions (one per warp); a warp's 16 rows are its position's 16 query heads (one WMMA tile,
+// one causal limit). Keys go 32 at a time through LDS (K rows and V transposed, BF16 as k_k_bf16 / k_vt_bf16 write
+// them), shared by the 8 warps; online softmax in fp32 per row; P to BF16 for the P.V product. The same BF16 operands
+// as the two-GEMM path (k_q_bf16, the 1/sqrt(128) here applied to the fp32 scores instead).
+typedef short att_v8s __attribute__((ext_vector_type(8)));
+typedef float att_v8f __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ att_v8f att_wmma(const att_v8s& a, const att_v8s& b, const att_v8f& c) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+#else
+    __trap();
+    return c;
+#endif
+}
+constexpr int kFwKeys = 32, kFwPos = 8, kFwKS = kAHeadDim + 8, kFwVS = kFwKeys + 8;   // LDS row strides (bf16)
+__global__ void __launch_bounds__(256) k_attn_flash(const float* __restrict__ q, const uint16_t* __restrict__ kb,
+                                                    const uint16_t* __restrict__ vtb, size_t kv_stride, const int* pos0,
+                                                    int T, int Lp, float* __restrict__ y) {
+    __shared__ __align__(16) uint16_t sk[kFwKeys][kFwKS];          // keys j0 .. j0 + 31, 128 dims
+    __shared__ __align__(16) uint16_t sv[kAHeadDim][kFwVS];        // V transposed: 128 dims x 32 keys
+    __shared__ __align__(16) uint16_t sp[kFwPos][16][kFwVS];       // each warp's P (16 heads x 32 keys)
+    const int g = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, l16 = lane & 15, g8 = lane >> 4;
+    const int t0 = blockIdx.x * kFwPos, t = t0 + warp, P0 = *pos0;
+    const bool live = t < T;
+    const int p = P0 + t;                                          // this warp's position: keys 0 .. p
+    const int pmax = P0 + min(T - 1, t0 + kFwPos - 1);
+    const uint16_t* K = kb + g * kv_stride;
+    const uint16_t* V = vtb + g * kv_stride;
+    // Q: rows = heads g * 16 + l16 of position t, as WMMA A operands for the 8 steps of 16 dims
+    att_v8s qa[kAHeadDim / 16];
+#pragma unroll
+    for (int kk = 0; kk < kAHeadDim / 16; ++kk) {
+        uint32_t w[4] = {0, 0, 0, 0};
+        if (live) {
+            const float* qr = q + (size_t(t) * kAHeads + g * 16 + l16) * kAHeadDim + kk * 16 + g8 * 8;
+            const float4 a = reinterpret_cast<const float4*>(qr)[0], b = reinterpret_cast<const float4*>(qr)[1];
+            w[0] = f2bf(a.x) | (uint32_t(f2bf(a.y)) << 16); w[1] = f2bf(a.z) | (uint32_t(f2bf(a.w)) << 16);
+            w[2] = f2bf(b.x) | (uint32_t(f2bf(b.y)) << 16); w[3] = f2bf(b.z) | (uint32_t(f2bf(b.w)) << 16);
+        }
+        qa[kk] = __builtin_bit_cast(att_v8s, make_uint4(w[0], w[1], w[2], w[3]));
+    }
+    const float scale = rsqrtf(float(kAHeadDim));
+    att_v8f o[kAHeadDim / 16];
+#pragma unroll
+    for (int d = 0; d < kAHeadDim / 16; ++d) o[d] = att_v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float m[8], l[8];                                              // rows g8 * 8 + i: running max, this lane's sum
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { m[i] = -INFINITY; l[i] = 0.f; }
+    for (int j0 = 0; j0 <= pmax; j0 += kFwKeys) {
+        __syncthreads();
+        for (int i = tid; i < kFwKeys * (kAHeadDim / 8); i += 256) {               // K: 32 rows x 16 pieces
+            const int r = i / (kAHeadDim / 8), c = i % (kAHeadDim / 8);
+            *reinterpret_cast<uint4*>(&sk[r][c * 8]) = *reinterpret_cast<const uint4*>(K + size_t(j0 + r) * kAHeadDim + c * 8);
+        }
+        for (int i = tid; i < kAHeadDim * (kFwKeys / 8); i += 256) {               // V^T: 128 rows x 4 pieces
+            const int d = i / (kFwKeys / 8), c = i % (kFwKeys / 8);
+            *reinterpret_cast<uint4*>(&sv[d][c * 8]) = *reinterpret_cast<const uint4*>(V + size_t(d) * Lp + j0 + c * 8);
+        }
+        __syncthreads();
+        if (!live || j0 > p) continue;                             // (warp-uniform)
+        att_v8f s[2];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            s[nt] = att_v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int kk = 0; kk < kAHeadDim / 16; ++kk)
+                s[nt] = att_wmma(qa[kk], *reinterpret_cast<const att_v8s*>(&sk[nt * 16 + l16][kk * 16 + g8 * 8]), s[nt]);
+        }
+        // this lane: rows (heads) g8 * 8 + i, keys j0 + nt * 16 + l16
+        float alpha[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float v0 = s[0][i] * scale, v1 = s[1][i] * scale;
+            if (j0 + l16 > p) v0 = -INFINITY;
+            if (j0 + 16 + l16 > p) v1 = -INFINITY;
+            float mx = fmaxf(v0, v1);
+#pragma unroll
+            for (int off = 1; off < 16; off <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off, 32));
+            const float mn = fmaxf(m[i], mx);
+            alpha[i] = expf(m[i] - mn);
+            m[i] = mn;
+            const float e0 = expf(v0 - mn), e1 = expf(v1 - mn);
+            l[i] = l[i] * alpha[i] + e0 + e1;
+            sp[warp][g8 * 8 + i][l16] = f2bf(e0);
+            sp[warp][g8 * 8 + i][16 + l16] = f2bf(e1);
+        }
+#pragma unroll
+        for (int d = 0; d < kAHeadDim / 16; ++d)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) o[d][i] *= alpha[i];
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
+#pragma unroll
+        for (int kk = 0; kk < kFwKeys / 16; ++kk) {
+            const att_v8s pa = *reinterpret_cast<const att_v8s*>(&sp[warp][l16][kk * 16 + g8 * 8]);
+#pragma unroll
+            for (int d = 0; d < kAHeadDim / 16; ++d)
+                o[d] = att_wmma(pa, *reinterpret_cast<const att_v8s*>(&sv[d * 16 + l16][kk * 16 + g8 * 8]), o[d]);
+        }
+    }
+    if (!live) return;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float sum = l[i];
+#pragma unroll
+        for (int off = 1; off < 16; off <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off, 32);
+        const float inv = 1.f / sum;
+        float* yr = y + (size_t(t) * kAHeads + g * 16 + g8 * 8 + i) * kAHeadDim + l16;
+#pragma unroll
+        for (int d = 0; d < kAHeadDim / 16; ++d) yr[d * 16] = o[d][i] * inv;
+    }
+}
+
 // causal softmax of S (16 T x Lp, row (hl, t) sees keys 0 .. pos0 + t) into BF16 P
 __global__ void k_softmax_causal(const float* S, uint16_t* P, const int* pos0, int T, int Lp, int t_off) {
     __shared__ float sh[256];
