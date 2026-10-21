@@ -283,32 +283,56 @@ __global__ void k_att_out_many(const float* sc, const float* V, float* o, const 
     o[(size_t(t) * kAHeads + h) * kAHeadDim + d] = a;
 }
 
-// the router for T positions: block t routes row t of raw (stride n); idx / wts are (T, k)
-__global__ void k_route_many(const float* raw, const float* bias, int n, int k, int32_t* idx, float* wts) {
-    __shared__ float c[512], sg[512], bv[512];
-    __shared__ int bi[512];
-    __shared__ int chosen[16];
-    const int t = threadIdx.x, row = blockIdx.x;
+// the router for T positions: sigmoid scores plus bias, the top k (larger first, ties to the smaller index), their
+// sigmoids normalized x kRouteScale; idx / wts are (T, k). One warp a row (8 rows a block of 256, n <= 512, k <= 16):
+// each lane holds n/32 scores, k rounds of a warp argmax by shuffles, no barriers (a 512-wide LDS reduction per round
+// took ~80 barriers a row)
+__global__ void __launch_bounds__(256) k_route_warp(const float* raw, const float* bias, int n, int k, int T, int32_t* idx, float* wts) {
+    constexpr int M = 16;
+    const int lane = threadIdx.x & 31, row = blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (row >= T) return;
     const float* r = raw + size_t(row) * n;
-    const float s = t < n ? 1.f / (1.f + expf(-r[t])) : 0.f;
-    sg[t] = s;
-    c[t] = t < n ? s + bias[t] : -INFINITY;
-    __syncthreads();
-    for (int q = 0; q < k; ++q) {
-        bv[t] = c[t]; bi[t] = t;
-        __syncthreads();
-        for (int st = 256; st > 0; st >>= 1) {
-            if (t < st && (bv[t + st] > bv[t] || (bv[t + st] == bv[t] && bi[t + st] < bi[t]))) { bv[t] = bv[t + st]; bi[t] = bi[t + st]; }
-            __syncthreads();
+    float c[M], sg[M];
+#pragma unroll
+    for (int j = 0; j < M; ++j) {
+        const int e = lane + 32 * j;
+        const float s = e < n ? 1.f / (1.f + expf(-r[e])) : 0.f;
+        sg[j] = s;
+        c[j] = e < n ? s + bias[e] : -INFINITY;
+    }
+    float sv[M];
+    int si[M];
+    float sum = 0.f;
+#pragma unroll
+    for (int q = 0; q < M; ++q) {
+        if (q >= k) break;
+        float bv = -INFINITY;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int j = 0; j < M; ++j)
+            if (c[j] > bv) { bv = c[j]; bi = lane + 32 * j; }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o, 32);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o, 32);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
-        if (t == 0) { chosen[q] = bi[0]; c[bi[0]] = -INFINITY; }
-        __syncthreads();
+        float w = 0.f;
+#pragma unroll
+        for (int j = 0; j < M; ++j)
+            if (lane + 32 * j == bi) { w = sg[j]; c[j] = -INFINITY; }
+        w = __shfl_sync(0xffffffffu, w, bi & 31, 32);
+        sv[q] = w;
+        si[q] = bi;
+        sum += w;
     }
-    if (t == 0) {
-        float sum = 0.f;
-        for (int q = 0; q < k; ++q) sum += sg[chosen[q]];
-        for (int q = 0; q < k; ++q) { idx[row * k + q] = chosen[q]; wts[row * k + q] = sg[chosen[q]] / (sum + 1e-20f) * kRouteScale; }
-    }
+    if (lane == 0)
+#pragma unroll
+        for (int q = 0; q < M; ++q) {
+            if (q >= k) break;
+            idx[row * k + q] = si[q];
+            wts[row * k + q] = sv[q] / (sum + 1e-20f) * kRouteScale;
+        }
 }
 
 // eo[t] = sum_j w[t][j] * y[t * k + j], eo (T, n)

@@ -797,7 +797,7 @@ struct Model {
             iq2_q_on(b.sh_down, q8s, tmp2, kShared, kHidden, T, stream2);
             CK(cudaEventRecord(ev_join, stream2));
         }
-        k_route_many<<<T, 512, 0, stream>>>(scores, b.bias_dev, b.n_exp, k, route_idx, route_w);
+        k_route_warp<<<(T + 7) / 8, 256, 0, stream>>>(scores, b.bias_dev, b.n_exp, k, T, route_idx, route_w);
         q8_0(b.fc1, n, lat, kHidden, kLatent, T);
         strata::kernels::quantize_q8_1_rows(lat, T, kLatent, q8, stream);
         if (T == 1) {
@@ -1378,7 +1378,7 @@ struct Model {
         k_to_bf16<<<1024, 256, 0, stream>>>(B->n, B->xb, size_t(T) * kHidden);
         // the router through hipBLASLt (its weights are BF16 already)
         B->gemm.bf16(B->xb, b.router, B->scores, T, b.n_exp, kHidden);
-        k_route_many<<<T, 512, 0, stream>>>(B->scores, b.bias_dev, b.n_exp, k, B->ridx, B->rw);
+        k_route_warp<<<(T + 7) / 8, 256, 0, stream>>>(B->scores, b.bias_dev, b.n_exp, k, T, B->ridx, B->rw);
         sort_slots(B->ridx, S, k, b.n_exp);
         if (!moe_wmma) {
             CK(cudaMemcpyAsync(B->hbounds, B->bounds, (b.n_exp + 1) * 4, cudaMemcpyDeviceToHost, stream));
