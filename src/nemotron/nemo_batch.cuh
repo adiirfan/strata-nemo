@@ -243,11 +243,13 @@ __global__ void k_gated_norm_many(float* y, const float* proj, const uint16_t* w
 __device__ inline uint16_t f2bf(float f);   // (below)
 // (the cache is BF16, as the reference keeps it: kv_rows = max_ctx + 64 rows a KV head, the 64 for k_attn_flash's
 // reads past the last key)
+// V is kept transposed in runs of 32 keys - (key / 32, dim, key % 32) - the layout both k_attn_flash and
+// k_attn_dec_wm read their V operands in, so neither transposes it again
+__device__ __forceinline__ size_t vt_at(int key, int d) { return (size_t(key >> 5) * kAHeadDim + d) * 32 + (key & 31); }
 __global__ void k_kv_append_many(const float* k, const float* v, uint16_t* K, uint16_t* V, const int* pos0, int kv_rows) {
-    const int t = blockIdx.x, kv = blockIdx.y, i = threadIdx.x;
-    const size_t at = (size_t(kv) * kv_rows + *pos0 + t) * kAHeadDim + i;
-    K[at] = f2bf(k[size_t(t) * kAKv * kAHeadDim + kv * kAHeadDim + i]);
-    V[at] = f2bf(v[size_t(t) * kAKv * kAHeadDim + kv * kAHeadDim + i]);
+    const int t = blockIdx.x, kv = blockIdx.y, i = threadIdx.x, pos = *pos0 + t;
+    K[(size_t(kv) * kv_rows + pos) * kAHeadDim + i] = f2bf(k[size_t(t) * kAKv * kAHeadDim + kv * kAHeadDim + i]);
+    V[size_t(kv) * kv_rows * kAHeadDim + vt_at(pos, i)] = f2bf(v[size_t(t) * kAKv * kAHeadDim + kv * kAHeadDim + i]);
 }
 // sc: (T, kAHeads, max_ctx)
 __global__ void k_att_scores_many(const float* q, const float* K, float* sc, const int* pos0, int max_ctx) {
@@ -968,20 +970,36 @@ __global__ void __launch_bounds__(128) k_flash(const float* q, const float* K, c
     }
 }
 // the splits of each (row, head) merged: out = sum_s acc_s e^(m_s - M) / sum_s l_s e^(m_s - M)
-__global__ void k_flash_combine(const float* part, float* out, int splits) {
+__global__ void __launch_bounds__(512) k_flash_combine(const float* part, float* out, int splits) {
+    // 4 groups of 128 (one per dim) take every 4th split with a running max, then merge (one group over 128+
+    // splits was a 50 us latency chain a call)
+    __shared__ float sm[4], sd[4], sn[4][kAHeadDim];
     const size_t o = size_t(blockIdx.y) * kAHeads + blockIdx.x;      // (row, head)
-    const int d = threadIdx.x;
+    const int d = threadIdx.x & 127, grp = threadIdx.x >> 7;
     const float* pp = part + o * splits * (kAHeadDim + 2);
-    float M = -1e30f;
-    for (int s = 0; s < splits; ++s) M = fmaxf(M, pp[s * (kAHeadDim + 2) + kAHeadDim]);
-    float num = 0.f, den = 0.f;
-    for (int s = 0; s < splits; ++s) {
+    float M = -INFINITY, num = 0.f, den = 0.f;
+    for (int s = grp; s < splits; s += 4) {
         const float* p = pp + s * (kAHeadDim + 2);
-        const float w = p[kAHeadDim + 1] > 0.f ? expf(p[kAHeadDim] - M) : 0.f;
-        num += p[d] * w;
-        den += p[kAHeadDim + 1] * w;
+        const float ls = p[kAHeadDim + 1];
+        if (!(ls > 0.f)) continue;
+        const float ms = p[kAHeadDim], mn = fmaxf(M, ms), a = expf(M - mn), b = expf(ms - mn);
+        num = num * a + p[d] * b;
+        den = den * a + ls * b;
+        M = mn;
     }
-    out[o * kAHeadDim + d] = num / den;
+    sn[grp][d] = num;
+    if (d == 0) { sm[grp] = M; sd[grp] = den; }
+    __syncthreads();
+    if (grp) return;
+    float Mx = sm[0];
+    for (int i = 1; i < 4; ++i) Mx = fmaxf(Mx, sm[i]);
+    float n = 0.f, dn = 0.f;
+    for (int i = 0; i < 4; ++i) {
+        const float w = sd[i] > 0.f ? expf(sm[i] - Mx) : 0.f;
+        n += sn[i][d] * w;
+        dn += sd[i] * w;
+    }
+    out[o * kAHeadDim + d] = n / dn;
 }
 
 // the chunk's slots sorted by expert, one thread per expert (stable: each expert takes its slots in slot order);
@@ -1124,7 +1142,8 @@ __global__ void __launch_bounds__(128) k_attn_dec(const float* q, const uint16_t
     for (int j0 = z * kDecRun; j0 < p0 + T; j0 += splits * kDecRun)
     for (int j = j0 + warp; j < min(p0 + T, j0 + kDecRun); j += 4) {
         const uint2 kb = reinterpret_cast<const uint2*>(Kh + size_t(j) * kAHeadDim)[lane];
-        const uint2 vb = reinterpret_cast<const uint2*>(Vh + size_t(j) * kAHeadDim)[lane];
+        const uint2 vb = make_uint2(uint32_t(Vh[vt_at(j, lane * 4)]) | (uint32_t(Vh[vt_at(j, lane * 4 + 1)]) << 16),
+                                    uint32_t(Vh[vt_at(j, lane * 4 + 2)]) | (uint32_t(Vh[vt_at(j, lane * 4 + 3)]) << 16));
         const float4 kv = make_float4(__uint_as_float(kb.x << 16), __uint_as_float(kb.x & 0xffff0000u),
                                       __uint_as_float(kb.y << 16), __uint_as_float(kb.y & 0xffff0000u));
         const float4 vv = make_float4(__uint_as_float(vb.x << 16), __uint_as_float(vb.x & 0xffff0000u),
@@ -1181,7 +1200,7 @@ __global__ void k_vt_bf16(const uint16_t* V, uint16_t* out, const int* pos0, int
     const int L = *pos0 + T;
     for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < size_t(Lp) * kAHeadDim; i += size_t(gridDim.x) * blockDim.x) {
         const int d = int(i / Lp), j = int(i % Lp);
-        out[i] = j < L ? V[size_t(j) * kAHeadDim + d] : 0;
+        out[i] = j < L ? V[vt_at(j, d)] : 0;
     }
 }
 // the 16 query heads of KV head g to BF16, rows (head-in-group, t): (16 T x 128), the 1/sqrt(128) folded in
@@ -1248,7 +1267,7 @@ __global__ void __launch_bounds__(256) k_attn_flash(const float* __restrict__ q,
         }
         for (int i = tid; i < kAHeadDim * (kFwKeys / 8); i += 256) {               // V^T: 128 rows x 4 pieces
             const int d = i / (kFwKeys / 8), c = i % (kFwKeys / 8);
-            *reinterpret_cast<uint4*>(&sv[d][c * 8]) = *reinterpret_cast<const uint4*>(V + size_t(d) * Lp + j0 + c * 8);
+            *reinterpret_cast<uint4*>(&sv[d][c * 8]) = *reinterpret_cast<const uint4*>(V + (size_t(j0 / 32) * kAHeadDim + d) * 32 + c * 8);
         }
         __syncthreads();
         if (!live || j0 > p) continue;                             // (warp-uniform)
@@ -1307,33 +1326,29 @@ __global__ void __launch_bounds__(256) k_attn_flash(const float* __restrict__ q,
 }
 
 // Writing / small steps on the matrix cores: one block per (key split, KV head) serves all 16 query heads of the KV
-// head from one read of each 32-key run (k_attn_dec read the cache once per query head: 16 times a layer). Warp w
-// takes position w's tile (16 heads x 128); the run's K rows and its V (transposed on the way into LDS) are shared.
-// Runs go to splits round robin (run c to split c % splits); each split leaves k_attn_dec's partials (unnormalized
-// output, running max, sum) for k_flash_combine. NW: warps (positions) a block, T <= NW.
-template <int NW>
+// head from one read of each 32-key run (k_attn_dec read the cache once per query head: 16 times a layer). Both
+// operands come straight from the cache (K rows; V in its transposed runs): each warp is independent, only its P
+// goes through LDS. Warp w: position w / PH, run phase w % PH; position t's runs c = z * PH + phase + k * (splits *
+// PH) - each (split, phase) a partial (unnormalized output, running max, sum) for k_flash_combine over splits * PH.
+template <int NW, int PH>
 __global__ void __launch_bounds__(NW * 32) k_attn_dec_wm(const float* __restrict__ q, const uint16_t* __restrict__ K,
                                                          const uint16_t* __restrict__ V, float* __restrict__ part,
                                                          const int* pos0, int kv_rows, int T, int splits) {
-    __shared__ __align__(16) uint16_t sk[kFwKeys][kFwKS];
-    __shared__ __align__(16) uint16_t sv[kAHeadDim][kFwVS];
     __shared__ __align__(16) uint16_t sp[NW][16][kFwVS];
     const int z = blockIdx.x, g = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, l16 = lane & 15, g8 = lane >> 4;
-    const int P0 = *pos0, t = warp, p = P0 + t;
-    const bool live = t < T;
+    const int t = warp / PH, ph = warp % PH, P0 = *pos0, p = P0 + t;
+    if (t >= T) return;                                            // (warps are independent: no block barrier)
+    const int nsp = splits * PH, sidx = z * PH + ph;
     const uint16_t* Kh = K + size_t(g) * kv_rows * kAHeadDim;
     const uint16_t* Vh = V + size_t(g) * kv_rows * kAHeadDim;
     att_v8s qa[kAHeadDim / 16];
 #pragma unroll
     for (int kk = 0; kk < kAHeadDim / 16; ++kk) {
-        uint32_t w[4] = {0, 0, 0, 0};
-        if (live) {
-            const float* qr = q + (size_t(t) * kAHeads + g * 16 + l16) * kAHeadDim + kk * 16 + g8 * 8;
-            const float4 a = reinterpret_cast<const float4*>(qr)[0], b = reinterpret_cast<const float4*>(qr)[1];
-            w[0] = f2bf(a.x) | (uint32_t(f2bf(a.y)) << 16); w[1] = f2bf(a.z) | (uint32_t(f2bf(a.w)) << 16);
-            w[2] = f2bf(b.x) | (uint32_t(f2bf(b.y)) << 16); w[3] = f2bf(b.z) | (uint32_t(f2bf(b.w)) << 16);
-        }
-        qa[kk] = __builtin_bit_cast(att_v8s, make_uint4(w[0], w[1], w[2], w[3]));
+        const float* qr = q + (size_t(t) * kAHeads + g * 16 + l16) * kAHeadDim + kk * 16 + g8 * 8;
+        const float4 a = reinterpret_cast<const float4*>(qr)[0], b = reinterpret_cast<const float4*>(qr)[1];
+        const uint32_t w0 = f2bf(a.x) | (uint32_t(f2bf(a.y)) << 16), w1 = f2bf(a.z) | (uint32_t(f2bf(a.w)) << 16);
+        const uint32_t w2 = f2bf(b.x) | (uint32_t(f2bf(b.y)) << 16), w3 = f2bf(b.z) | (uint32_t(f2bf(b.w)) << 16);
+        qa[kk] = __builtin_bit_cast(att_v8s, make_uint4(w0, w1, w2, w3));
     }
     const float scale = rsqrtf(float(kAHeadDim));
     att_v8f o[kAHeadDim / 16];
@@ -1342,29 +1357,26 @@ __global__ void __launch_bounds__(NW * 32) k_attn_dec_wm(const float* __restrict
     float m[8], l[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) { m[i] = -INFINITY; l[i] = 0.f; }
-    const int L = P0 + T;                                          // keys 0 .. L - 1 exist
-    for (int j0 = z * kFwKeys; j0 < L; j0 += splits * kFwKeys) {
-        __syncthreads();
-        for (int i = tid; i < kFwKeys * (kAHeadDim / 8); i += NW * 32) {   // K rows: 32 x 16 pieces of 8
-            const int r = i / (kAHeadDim / 8), c = i % (kAHeadDim / 8);
-            *reinterpret_cast<uint4*>(&sk[r][c * 8]) = *reinterpret_cast<const uint4*>(Kh + size_t(j0 + r) * kAHeadDim + c * 8);
-        }
-        for (int i = tid; i < kFwKeys * (kAHeadDim / 8); i += NW * 32) {   // V rows, transposed into sv[dim][key]
-            const int r = i / (kAHeadDim / 8), c = i % (kAHeadDim / 8);
-            const uint4 v = *reinterpret_cast<const uint4*>(Vh + size_t(j0 + r) * kAHeadDim + c * 8);
-            const uint32_t vw[4] = {v.x, v.y, v.z, v.w};
+    for (int j0 = sidx * kFwKeys; j0 <= p; j0 += nsp * kFwKeys) {
+        // the run's operands: K rows j0 + nt * 16 + l16 (dims kk * 16 + g8 * 8 ..), V^T dims d * 16 + l16 (keys kk * 16 + g8 * 8 ..)
+        att_v8s kb[2][kAHeadDim / 16], vb[kFwKeys / 16][kAHeadDim / 16];
 #pragma unroll
-            for (int e = 0; e < 8; ++e) sv[c * 8 + e][r] = uint16_t(vw[e / 2] >> (16 * (e % 2)));
-        }
-        __syncthreads();
-        if (!live || j0 > p) continue;                             // (warp-uniform)
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+            for (int kk = 0; kk < kAHeadDim / 16; ++kk)
+                kb[nt][kk] = *reinterpret_cast<const att_v8s*>(Kh + size_t(j0 + nt * 16 + l16) * kAHeadDim + kk * 16 + g8 * 8);
+        const uint16_t* Vr = Vh + size_t(j0 / 32) * kAHeadDim * 32;
+#pragma unroll
+        for (int kk = 0; kk < kFwKeys / 16; ++kk)
+#pragma unroll
+            for (int d = 0; d < kAHeadDim / 16; ++d)
+                vb[kk][d] = *reinterpret_cast<const att_v8s*>(Vr + (d * 16 + l16) * 32 + kk * 16 + g8 * 8);
         att_v8f s[2];
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
             s[nt] = att_v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-            for (int kk = 0; kk < kAHeadDim / 16; ++kk)
-                s[nt] = att_wmma(qa[kk], *reinterpret_cast<const att_v8s*>(&sk[nt * 16 + l16][kk * 16 + g8 * 8]), s[nt]);
+            for (int kk = 0; kk < kAHeadDim / 16; ++kk) s[nt] = att_wmma(qa[kk], kb[nt][kk], s[nt]);
         }
         float alpha[8];
 #pragma unroll
@@ -1394,18 +1406,19 @@ __global__ void __launch_bounds__(NW * 32) k_attn_dec_wm(const float* __restrict
         for (int kk = 0; kk < kFwKeys / 16; ++kk) {
             const att_v8s pa = *reinterpret_cast<const att_v8s*>(&sp[warp][l16][kk * 16 + g8 * 8]);
 #pragma unroll
-            for (int d = 0; d < kAHeadDim / 16; ++d)
-                o[d] = att_wmma(pa, *reinterpret_cast<const att_v8s*>(&sv[d * 16 + l16][kk * 16 + g8 * 8]), o[d]);
+            for (int d = 0; d < kAHeadDim / 16; ++d) o[d] = att_wmma(pa, vb[kk][d], o[d]);
         }
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront", "local");   // (sp is rewritten next run)
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront", "local");
     }
-    if (!live) return;
     // this lane: heads g * 16 + g8 * 8 + i, dims d * 16 + l16; a split without keys leaves sum 0 (weight 0)
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         float sum = l[i];
 #pragma unroll
         for (int off = 1; off < 16; off <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off, 32);
-        float* pp = part + ((size_t(t) * kAHeads + g * 16 + g8 * 8 + i) * splits + z) * (kAHeadDim + 2);
+        float* pp = part + ((size_t(t) * kAHeads + g * 16 + g8 * 8 + i) * nsp + sidx) * (kAHeadDim + 2);
 #pragma unroll
         for (int d = 0; d < kAHeadDim / 16; ++d) pp[d * 16 + l16] = o[d][i];
         if (l16 == 0) { pp[kAHeadDim] = m[i]; pp[kAHeadDim + 1] = sum; }

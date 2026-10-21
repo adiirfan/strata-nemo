@@ -539,10 +539,13 @@ struct Model {
     Store st;
     std::vector<Block> blocks;
     int max_ctx;
-    int kv_rows() const { return max_ctx + 64; }
+    int kv_rows() const { return (max_ctx + 64 + 31) / 32 * 32; }   // (whole 32-key runs for V's layout)
     // the decode attention's key splits: enough blocks for a long context (32-key runs, round robin);
     // NEMO_DEC_OLD=1: k_attn_dec (one block per query head, 16 splits)
-    int dec_splits() const { return std::min(256, std::max(32, max_ctx / 2048)); }
+    int dec_splits() const {
+        if (const char* e = std::getenv("NEMO_DEC_SPLITS")) return std::atoi(e);
+        return std::min(256, std::max(32, max_ctx / 2048));
+    }
     bool dec_old = std::getenv("NEMO_DEC_OLD") != nullptr;   // the BF16 KV cache's rows a KV head (k_attn_flash reads up to 63 past)
     const uint16_t *embed = nullptr, *norm_f = nullptr;
     const void* head = nullptr;
@@ -772,10 +775,11 @@ struct Model {
         if (!dec_old) {
             // all 16 query heads of a KV head from one read of each 32-key run, on the matrix cores (k_attn_dec_wm)
             const int splits = dec_splits();
-            if (T == 1) k_attn_dec_wm<1><<<dim3(splits, kAKv), 32, 0, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
-            else if (T <= 8) k_attn_dec_wm<8><<<dim3(splits, kAKv), 256, 0, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
-            else k_attn_dec_wm<kTMax><<<dim3(splits, kAKv), kTMax * 32, 0, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
-            k_flash_combine<<<dim3(kAHeads, T), kAHeadDim, 0, stream>>>(att_sc, y, splits);
+            // (one position: 4 warps a block, each its own runs - 4 partials a split)
+            if (T == 1) k_attn_dec_wm<4, 4><<<dim3(splits, kAKv), 128, 0, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
+            else if (T <= 8) k_attn_dec_wm<8, 1><<<dim3(splits, kAKv), 256, 0, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
+            else k_attn_dec_wm<kTMax, 1><<<dim3(splits, kAKv), kTMax * 32, 0, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
+            k_flash_combine<<<dim3(kAHeads, T), 512, 0, stream>>>(att_sc, y, T == 1 ? 4 * splits : splits);
             q8_0(b.o, y, d, kAHeads * kAHeadDim, kHidden, T);
             return;
         }
@@ -784,7 +788,7 @@ struct Model {
         if (T == 1) k_attn_dec<1><<<dim3(kAHeads, splits), 128, lds, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
         else if (T <= 8) k_attn_dec<8><<<dim3(kAHeads, splits), 128, lds, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
         else k_attn_dec<kTMax><<<dim3(kAHeads, splits), 128, lds, stream>>>(qkv, b.K, b.V, att_sc, d_pos, kv_rows(), T, splits);
-        k_flash_combine<<<dim3(kAHeads, T), kAHeadDim, 0, stream>>>(att_sc, y, splits);
+        k_flash_combine<<<dim3(kAHeads, T), 512, 0, stream>>>(att_sc, y, splits);
         q8_0(b.o, y, d, kAHeads * kAHeadDim, kHidden, T);
     }
 
@@ -1020,7 +1024,6 @@ struct Model {
         }         // BF16 activations up to kTBig x 24,576 (the drafter's fc)
         // the prompt attention products hold (16 T x max_ctx) scores: this caps the context they serve
         const size_t Lmax = size_t(max_ctx + 64);
-        CK(cudaMalloc(&B->vtb2, kAKv * Lmax * kAHeadDim * 2));   // (the keys are read from the BF16 cache itself)
         if (att_old) {   // the two-GEMM attention's score tables (24 KB a context position) only when it runs
             CK(cudaMalloc(&B->kb, Lmax * kAHeadDim * 2)); CK(cudaMalloc(&B->vtb, Lmax * kAHeadDim * 2));
             CK(cudaMalloc(&B->qb, 16 * kAttSub * kAHeadDim * 2)); CK(cudaMalloc(&B->O, 16 * kAttSub * kAHeadDim * 4));
@@ -1309,12 +1312,9 @@ struct Model {
         const int Lp = (pos + T + 63) / 64 * 64;
         if (!att_old) {
             // one pass on the matrix cores per (KV head, 8 positions): the scores stay on the chip (k_attn_flash)
-            const size_t kvs = size_t(max_ctx + 64) * kAHeadDim;
-            // (the keys straight from the BF16 cache; V transposed for the product)
-            for (int g = 0; g < kAKv; ++g)
-                k_vt_bf16<<<1024, 256, 0, stream>>>(b.V + size_t(g) * kv_rows() * kAHeadDim, B->vtb2 + g * kvs, d_pos, T, Lp);
-            k_attn_flash<<<dim3((T + kFwPos - 1) / kFwPos, kAKv), 256, 0, stream>>>(q, b.K, size_t(kv_rows()) * kAHeadDim, B->vtb2, kvs,
-                                                                                     d_pos, T, Lp, B->y);
+            // (K and V straight from the BF16 cache: V is kept transposed in 32-key runs)
+            const size_t kvh = size_t(kv_rows()) * kAHeadDim;
+            k_attn_flash<<<dim3((T + kFwPos - 1) / kFwPos, kAKv), 256, 0, stream>>>(q, b.K, kvh, b.V, kvh, d_pos, T, Lp, B->y);
             mmq_dense(b.o, 8, B->y, B->d, T, kHidden, kAHeads * kAHeadDim);
             return;
         }
