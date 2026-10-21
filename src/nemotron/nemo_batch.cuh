@@ -220,16 +220,17 @@ __global__ void __launch_bounds__(128) k_mamba_scan(const float* xbc, const floa
 
 // gated group norm for T rows: y (T, kMInter), z = proj + t * kInProj. zero_out (T, kHidden), if given, is zeroed
 // for the out_proj slices to add into (saves a fill launch)
-__global__ void k_gated_norm_many(float* y, const float* proj, const uint16_t* w, float* zero_out = nullptr) {
+__global__ void k_gated_norm_many(float* y, const float* proj, const uint16_t* w, float* zero_out = nullptr, const float* prs = nullptr) {
     __shared__ float sh[256];
     const int G = kMInter / kMGroups, base = blockIdx.x * G, t = blockIdx.y;
+    const float zs = prs ? prs[t] : 1.f;                              // proj's row scale (per-row FP8 in_proj)
     if (zero_out)
         for (int i = threadIdx.x; i < kHidden / kMGroups; i += 256) zero_out[size_t(t) * kHidden + blockIdx.x * (kHidden / kMGroups) + i] = 0.f;
     float* yr = y + size_t(t) * kMInter;
     const float* z = proj + size_t(t) * kInProj;
     float a = 0.f;
     for (int i = threadIdx.x; i < G; i += 256) {
-        const float zz = z[base + i];
+        const float zz = z[base + i] * zs;
         const float v = yr[base + i] * (zz / (1.f + expf(-zz)));
         yr[base + i] = v;
         a += v * v;
@@ -612,11 +613,140 @@ __global__ void __launch_bounds__(256) k_relu2_amax(float* x, size_t n, uint32_t
     for (int o = 128; o > 0; o >>= 1) { if (threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]); __syncthreads(); }
     if (threadIdx.x == 0 && red[0] > 0.f) atomicMax(amax, __float_as_uint(red[0]));
 }
-// alpha[n] = row scale x activation scale x scale_2
+// alpha[n] = row scale x activation scale x scale_2 (amax null: the activations' scales are per row, applied by
+// the product's consumers)
 __global__ void k_fp8_alpha(const float* rscale, int N, const uint32_t* amax, float s2, float* alpha) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const float m = __uint_as_float(*amax), xs = m > 0.f ? m / 448.f : 1.f;
+    const float m = amax ? __uint_as_float(*amax) : 448.f, xs = m > 0.f ? m / 448.f : 1.f;
     if (i < N) alpha[i] = rscale[i] * xs * s2;
+}
+
+// ---- FP8 activations with one scale per row ----------------------------------------------------------------
+// The producers below write a row in E4M3 at (its largest magnitude / 448) with that scale in xrs; the product
+// (Gemm::fp8, alpha = weight row scale only) then leaves each output row short of that factor, which its consumers
+// multiply back in (the *rs arguments of k_add_rmsnorm_rows, k_gated_norm_*, k_mamba_conv_tiles, k_conv_state_set,
+// k_ssd_dt, k_rows_e4m3). Against one scale a chunk this drops the amax and conversion passes, and small rows keep
+// more of FP8's precision.
+__device__ __forceinline__ float rw_sum32(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o, 32);
+    return v;
+}
+__device__ __forceinline__ float rw_max32(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o, 32));
+    return v;
+}
+// the residual add and RMSNorm of one row (kHidden) a block of 1024: h += d * drs + e * ers (scales optional), then
+// y (fp32, if given) and/or the row in E4M3 (x8, xrs; if given)
+__global__ void __launch_bounds__(1024) k_add_rmsnorm_rows(float* h, const float* d, const float* drs, const float* e, const float* ers,
+                                                          const uint16_t* w, float* y, uint8_t* x8, float* xrs) {
+    __shared__ float ss[32], sm[32];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const size_t r = blockIdx.x, o = r * kHidden + tid * 4;
+    const float ds = drs ? drs[r] : 1.f;
+    float4 v = *reinterpret_cast<const float4*>(h + o);
+    const float4 dv = *reinterpret_cast<const float4*>(d + o);
+    v.x += dv.x * ds; v.y += dv.y * ds; v.z += dv.z * ds; v.w += dv.w * ds;
+    if (e) {
+        const float es = ers ? ers[r] : 1.f;
+        const float4 ev = *reinterpret_cast<const float4*>(e + o);
+        v.x += ev.x * es; v.y += ev.y * es; v.z += ev.z * es; v.w += ev.w * es;
+    }
+    *reinterpret_cast<float4*>(h + o) = v;
+    const float a = rw_sum32(v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w);
+    if (lane == 0) ss[warp] = a;
+    __syncthreads();
+    const float inv = rsqrtf(rw_sum32(ss[lane]) / kHidden + kEps);
+    const uint2 wb = *reinterpret_cast<const uint2*>(w + tid * 4);
+    const float4 nv = make_float4(bf16f(uint16_t(wb.x)) * (v.x * inv), bf16f(uint16_t(wb.x >> 16)) * (v.y * inv),
+                                  bf16f(uint16_t(wb.y)) * (v.z * inv), bf16f(uint16_t(wb.y >> 16)) * (v.w * inv));
+    if (y) *reinterpret_cast<float4*>(y + o) = nv;
+    if (x8) {
+        const float m = rw_max32(fmaxf(fmaxf(fabsf(nv.x), fabsf(nv.y)), fmaxf(fabsf(nv.z), fabsf(nv.w))));
+        if (lane == 0) sm[warp] = m;
+        __syncthreads();
+        const float mx = rw_max32(sm[lane]), sc = mx > 0.f ? mx / 448.f : 1.f, i8 = 1.f / sc;
+        reinterpret_cast<uint32_t*>(x8 + r * kHidden)[tid] = fp8x4(nv.x * i8, nv.y * i8, nv.z * i8, nv.w * i8);
+        if (tid == 0) xrs[r] = sc;
+    }
+}
+// the gated group norm of one row (kMInter, 8 groups of 1024) a block of 1024, into E4M3 with the row's scale: z is
+// proj's gate times its row scale prs (if given)
+__global__ void __launch_bounds__(1024) k_gated_norm_rows(const float* y, const float* proj, const float* prs, const uint16_t* w,
+                                                         uint8_t* x8, float* xrs) {
+    __shared__ float ss[32], sm[32];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const size_t r = blockIdx.x;
+    const float zs = prs ? prs[r] : 1.f;
+    const float* yr = y + r * kMInter + tid * 8;
+    const float* zr = proj + r * kInProj + tid * 8;
+    float v[8];
+    float a = 0.f;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const float4 yy = *reinterpret_cast<const float4*>(yr + 4 * j), zz4 = *reinterpret_cast<const float4*>(zr + 4 * j);
+        const float yv[4] = {yy.x, yy.y, yy.z, yy.w}, zv[4] = {zz4.x, zz4.y, zz4.z, zz4.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float zz = zv[i] * zs;
+            v[4 * j + i] = yv[i] * (zz / (1.f + expf(-zz)));
+            a += v[4 * j + i] * v[4 * j + i];
+        }
+    }
+    a = rw_sum32(a);
+    if (lane == 0) ss[warp] = a;
+    __syncthreads();
+    const int g4 = (warp / 4) * 4;                                    // a group is 4 warps (128 threads x 8)
+    const float inv = rsqrtf((ss[g4] + ss[g4 + 1] + ss[g4 + 2] + ss[g4 + 3]) / (kMInter / kMGroups) + kEps);
+    const uint4 wb = *reinterpret_cast<const uint4*>(w + tid * 8);
+    const uint32_t ww[4] = {wb.x, wb.y, wb.z, wb.w};
+    float m = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        v[i] = v[i] * inv * bf16f(uint16_t(ww[i / 2] >> (16 * (i % 2))));
+        m = fmaxf(m, fabsf(v[i]));
+    }
+    m = rw_max32(m);
+    if (lane == 0) sm[warp] = m;
+    __syncthreads();
+    const float mx = rw_max32(sm[lane]), sc = mx > 0.f ? mx / 448.f : 1.f, i8 = 1.f / sc;
+    *reinterpret_cast<uint2*>(x8 + r * kMInter + tid * 8) = make_uint2(fp8x4(v[0] * i8, v[1] * i8, v[2] * i8, v[3] * i8),
+                                                                       fp8x4(v[4] * i8, v[5] * i8, v[6] * i8, v[7] * i8));
+    if (tid == 0) xrs[r] = sc;
+}
+// one row of K (times its row scale rs, if given; relu(.)^2 if RELU2) a block of NT, into E4M3 with the row's scale
+template <int K, int NT, bool RELU2>
+__global__ void __launch_bounds__(NT) k_rows_e4m3(const float* x, const float* rs, uint8_t* x8, float* xrs) {
+    static_assert(K % (4 * NT) == 0 && NT % 32 == 0, "whole float4 steps");
+    constexpr int V = K / 4 / NT;
+    __shared__ float sm[NT / 32];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const size_t r = blockIdx.x;
+    const float s = rs ? rs[r] : 1.f;
+    float4 v[V];
+    float m = 0.f;
+#pragma unroll
+    for (int j = 0; j < V; ++j) {
+        float4 a = reinterpret_cast<const float4*>(x + r * K)[tid + j * NT];
+        a.x *= s; a.y *= s; a.z *= s; a.w *= s;
+        if (RELU2) {
+            a.x = fmaxf(a.x, 0.f); a.y = fmaxf(a.y, 0.f); a.z = fmaxf(a.z, 0.f); a.w = fmaxf(a.w, 0.f);
+            a.x *= a.x; a.y *= a.y; a.z *= a.z; a.w *= a.w;
+        }
+        v[j] = a;
+        m = fmaxf(m, fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)), fmaxf(fabsf(a.z), fabsf(a.w))));
+    }
+    m = rw_max32(m);
+    if (lane == 0) sm[warp] = m;
+    __syncthreads();
+    float mx = 0.f;
+#pragma unroll
+    for (int i = 0; i < NT / 32; ++i) mx = fmaxf(mx, sm[i]);
+    const float sc = mx > 0.f ? mx / 448.f : 1.f, i8 = 1.f / sc;
+#pragma unroll
+    for (int j = 0; j < V; ++j) reinterpret_cast<uint32_t*>(x8 + r * K)[tid + j * NT] = fp8x4(v[j].x * i8, v[j].y * i8, v[j].z * i8, v[j].w * i8);
+    if (tid == 0) xrs[r] = sc;
 }
 
 __global__ void k_relu2_to_bf16(const float* x, uint16_t* y, size_t n) {
@@ -876,28 +1006,30 @@ __global__ void __launch_bounds__(512) k_sort_place(const int32_t* idx, int S, i
 // for the first). The same sums, so the same outputs; the state after T is written by k_conv_state_set (after this
 // kernel: the first tile reads the old state).
 constexpr int kConvTile = 64;
-__global__ void k_mamba_conv_tiles(const float* proj, const float* state, const uint16_t* cw, const uint16_t* cb, float* out, int T) {
+__global__ void k_mamba_conv_tiles(const float* proj, const float* state, const uint16_t* cw, const uint16_t* cb, float* out, int T,
+                                   const float* prs = nullptr) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= kConvDim) return;
     const int t0 = blockIdx.y * kConvTile, t1 = min(T, t0 + kConvTile);
     const float* st = state + size_t(c) * (kConvK - 1);
-    auto in = [&](int t) { return t < 0 ? st[t + 3] : proj[size_t(t) * kInProj + kMInter + c]; };
+    // (prs: proj's row scales, when in_proj ran in FP8 with per-row activation scales)
+    auto in = [&](int t) { return t < 0 ? st[t + 3] : proj[size_t(t) * kInProj + kMInter + c] * (prs ? prs[t] : 1.f); };
     float v0 = in(t0 - 3), v1 = in(t0 - 2), v2 = in(t0 - 1);
     const float w0 = bf16f(cw[c * kConvK]), w1 = bf16f(cw[c * kConvK + 1]), w2 = bf16f(cw[c * kConvK + 2]), w3 = bf16f(cw[c * kConvK + 3]);
     const float b = bf16f(cb[c]);
     for (int t = t0; t < t1; ++t) {
-        const float x = proj[size_t(t) * kInProj + kMInter + c];
+        const float x = in(t);
         const float a = b + w0 * v0 + w1 * v1 + w2 * v2 + w3 * x;
         out[size_t(t) * kConvDim + c] = a / (1.f + expf(-a));
         v0 = v1; v1 = v2; v2 = x;
     }
 }
 // the conv state after T >= 3 positions: their last three inputs
-__global__ void k_conv_state_set(const float* proj, float* state, int T) {
+__global__ void k_conv_state_set(const float* proj, float* state, int T, const float* prs = nullptr) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= kConvDim) return;
     float* st = state + size_t(c) * (kConvK - 1);
-    for (int i = 0; i < 3; ++i) st[i] = proj[size_t(T - 3 + i) * kInProj + kMInter + c];
+    for (int i = 0; i < 3; ++i) st[i] = proj[size_t(T - 3 + i) * kInProj + kMInter + c] * (prs ? prs[T - 3 + i] : 1.f);
 }
 
 // ---- attention v2 ----------------------------------------------------------------------------------------------
@@ -1367,14 +1499,15 @@ __global__ void __launch_bounds__(256) k_skinny(const void* W, const uint8_t* S,
 //   4. k_ssd_out:   y_t += e^(A_t) C_t . H_in[c]
 // A_t is the running sum of dt A inside each Q-block (dt = softplus(dt + bias)), stored per (head, position).
 constexpr int kSq = 32;              // positions per Q-block
-__global__ void k_ssd_dt(const float* proj, const uint16_t* A_log, const uint16_t* dt_bias, float* dtv, float* acs, float* ea, int T) {
+__global__ void k_ssd_dt(const float* proj, const uint16_t* A_log, const uint16_t* dt_bias, float* dtv, float* acs, float* ea, int T,
+                         const float* prs = nullptr) {
     // per (head, Q-block): dt and the running decay sum; ea = e^(A_Q) for the block
     const int hd = blockIdx.x, c = blockIdx.y, t = threadIdx.x;      // kSq threads
     __shared__ float a[kSq];
     const int pos = c * kSq + t;
     const float A = -expf(bf16f(A_log[hd])), db = bf16f(dt_bias[hd]);
     float dt = 0.f;
-    if (pos < T) { dt = proj[size_t(pos) * kInProj + kMInter + kConvDim + hd] + db; dt = dt > 20.f ? dt : log1pf(expf(dt)); }
+    if (pos < T) { dt = proj[size_t(pos) * kInProj + kMInter + kConvDim + hd] * (prs ? prs[pos] : 1.f) + db; dt = dt > 20.f ? dt : log1pf(expf(dt)); }
     a[t] = dt * A;
     __syncthreads();
     if (t == 0) { float s = 0.f; for (int i = 0; i < kSq; ++i) { s += a[i]; a[i] = s; } }

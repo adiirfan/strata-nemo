@@ -960,6 +960,9 @@ struct Model {
         uint8_t *w8 = nullptr, *x8 = nullptr;   // NEMO_FP8: E4M3 weight and activations, row scales and alpha, amax
         float* rscale = nullptr;
         uint32_t* amax = nullptr;
+        // per-row FP8 activations (x8 with these row scales): of n (in_proj / shared up), of the gated norm's output
+        // (out_proj), of relu^2 of the shared up output (shared down)
+        float *rs_n = nullptr, *rs_y = nullptr, *rs_t = nullptr;
         // the FP8 weights of a chunk's products, converted on a side stream a few products ahead (w8_*)
         struct W8Job { bool iq2; const void* w; const uint8_t* sc; int rows, K; };
         struct W8Slot { uint8_t* w8; float* rscale; cudaEvent_t ready, free_; };
@@ -1027,6 +1030,7 @@ struct Model {
             CK(cudaMalloc(&B->rscale, 2 * size_t(kInProj) * 4)); CK(cudaMalloc(&B->amax, 4));
         }
         CK(cudaMalloc(&B->alpha, size_t(kInProj) * 4));
+        f(&B->rs_n, T); f(&B->rs_y, T); f(&B->rs_t, T);
         CK(cudaStreamCreateWithFlags(&B->side, cudaStreamNonBlocking));
         CK(cudaMalloc(&B->side_bf16, size_t(kShared) * kHidden * 2));
         for (auto& sl : B->slot) {
@@ -1124,13 +1128,17 @@ struct Model {
         ++B->use;
         if (B->issued < int(B->jobs.size())) w8_issue(B->issued++);
     }
+    // X null: B->x8 already holds the input rows in E4M3 with per-row scales (k_add_rmsnorm_rows / k_gated_norm_rows
+    // / k_rows_e4m3), which the output's consumers apply; otherwise X is quantized here at one scale (amax / 448)
+    void x8_from(const float* X, size_t n) {
+        CK(cudaMemsetAsync(B->amax, 0, 4, stream));
+        k_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
+        k_to_e4m3<<<2048, 256, 0, stream>>>(X, n, B->amax, B->x8);
+    }
     bool nvfp4_fp8(const uint8_t* w, const uint8_t* sc, float s2, const float* X, float* Y, int T, int rows, int K) {
         if (Big::W8Slot* sl = w8_take(w)) {
-            CK(cudaMemsetAsync(B->amax, 0, 4, stream));
-            const size_t n = size_t(T) * K;
-            k_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
-            k_to_e4m3<<<2048, 256, 0, stream>>>(X, n, B->amax, B->x8);
-            k_fp8_alpha<<<(rows + 255) / 256, 256, 0, stream>>>(sl->rscale, rows, B->amax, s2, B->alpha);
+            if (X) x8_from(X, size_t(T) * K);
+            k_fp8_alpha<<<(rows + 255) / 256, 256, 0, stream>>>(sl->rscale, rows, X ? B->amax : nullptr, s2, B->alpha);
             const bool ok = B->gemm.fp8(B->x8, sl->w8, B->alpha, Y, T, rows, K);
             w8_done(sl);
             if (!ok) { std::fprintf(stderr, "strata-nemo: no FP8 plan for a pipelined product\n"); std::exit(1); }
@@ -1141,24 +1149,23 @@ struct Model {
             CK(cudaMalloc(&B->rscale, 2 * size_t(kInProj) * 4)); CK(cudaMalloc(&B->amax, 4));
         }
         k_nvfp4_to_e4m3_rows<<<rows, 256, 0, stream>>>(w, sc, K, B->w8, B->rscale);
-        CK(cudaMemsetAsync(B->amax, 0, 4, stream));
-        const size_t n = size_t(T) * K;
-        k_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
-        k_to_e4m3<<<2048, 256, 0, stream>>>(X, n, B->amax, B->x8);
+        if (X) x8_from(X, size_t(T) * K);
         float* alpha = B->rscale + kInProj;
-        k_fp8_alpha<<<(rows + 255) / 256, 256, 0, stream>>>(B->rscale, rows, B->amax, s2, alpha);
+        k_fp8_alpha<<<(rows + 255) / 256, 256, 0, stream>>>(B->rscale, rows, X ? B->amax : nullptr, s2, alpha);
         return B->gemm.fp8(B->x8, B->w8, alpha, Y, T, rows, K);
     }
     // the shared expert's IQ2_XXS products in FP8 (NEMO_SH_FP8): weight unpacked to BF16, then E4M3 per row; X in
     // E4M3 per chunk (relu^2 applied first, in place, when relu2)
     bool iq2_fp8(const void* w, float* X, float* Y, int T, int rows, int K, bool relu2) {
         if (Big::W8Slot* sl = w8_take(w)) {
-            CK(cudaMemsetAsync(B->amax, 0, 4, stream));
-            const size_t n = size_t(T) * K;
-            if (relu2) k_relu2_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
-            else k_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
-            k_to_e4m3<<<2048, 256, 0, stream>>>(X, n, B->amax, B->x8);
-            k_fp8_alpha<<<(rows + 255) / 256, 256, 0, stream>>>(sl->rscale, rows, B->amax, 1.f, B->alpha);
+            if (X) {
+                CK(cudaMemsetAsync(B->amax, 0, 4, stream));
+                const size_t n = size_t(T) * K;
+                if (relu2) k_relu2_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
+                else k_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
+                k_to_e4m3<<<2048, 256, 0, stream>>>(X, n, B->amax, B->x8);
+            }
+            k_fp8_alpha<<<(rows + 255) / 256, 256, 0, stream>>>(sl->rscale, rows, X ? B->amax : nullptr, 1.f, B->alpha);
             const bool ok = B->gemm.fp8(B->x8, sl->w8, B->alpha, Y, T, rows, K);
             w8_done(sl);
             if (!ok) { std::fprintf(stderr, "strata-nemo: no FP8 plan for a pipelined product\n"); std::exit(1); }
@@ -1170,13 +1177,15 @@ struct Model {
         }
         strata::kernels::iq_dequant_bf16(kIQ2_XXS, w, int64_t(rows) * K, B->gemm.scratch(), stream);
         k_bf16_to_e4m3_rows<<<rows, 256, 0, stream>>>(B->gemm.scratch(), K, B->w8, B->rscale);
-        CK(cudaMemsetAsync(B->amax, 0, 4, stream));
-        const size_t n = size_t(T) * K;
-        if (relu2) k_relu2_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
-        else k_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
-        k_to_e4m3<<<2048, 256, 0, stream>>>(X, n, B->amax, B->x8);
+        if (X) {
+            CK(cudaMemsetAsync(B->amax, 0, 4, stream));
+            const size_t n = size_t(T) * K;
+            if (relu2) k_relu2_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
+            else k_amax<<<1024, 256, 0, stream>>>(X, n, B->amax);
+            k_to_e4m3<<<2048, 256, 0, stream>>>(X, n, B->amax, B->x8);
+        }
         float* alpha = B->rscale + kInProj;
-        k_fp8_alpha<<<(rows + 255) / 256, 256, 0, stream>>>(B->rscale, rows, B->amax, 1.f, alpha);
+        k_fp8_alpha<<<(rows + 255) / 256, 256, 0, stream>>>(B->rscale, rows, X ? B->amax : nullptr, 1.f, alpha);
         return B->gemm.fp8(B->x8, B->w8, alpha, Y, T, rows, K);
     }
     // the shared expert in FP8 for chunks of 256+ rows (default; NEMO_SH_FP8=0: BF16). 8K texts: perplexity +0.07% /
@@ -1200,18 +1209,31 @@ struct Model {
     // routed experts on the FP16 matrix cores (strata::kernels::moe_wmma_iq2xxs); NEMO_MOE_MMQ = llama.cpp's MMQ.
     // 8K README: perplexity 4.5585 vs 4.5630, 2,675 vs 2,484 tokens a second
     bool moe_wmma = std::getenv("NEMO_MOE_MMQ") == nullptr;     // the shared expert through MMQ (before: BF16 GEMM)   // the three-kernel state hand-off, for comparison
+    // which prompt products take per-row FP8 activations, written by their producers (NEMO_ROW_FP8=0: one scale a
+    // chunk, quantized in front of each product as before)
+    bool row_fp8 = !std::getenv("NEMO_ROW_FP8") || std::atoi(std::getenv("NEMO_ROW_FP8")) != 0;
+    bool fp8_in(int T) const {
+        return row_fp8 && T >= 256 && (fp8_mode == 1 || fp8_mode == 2) && !std::getenv("NEMO_SSD1") && !std::getenv("NEMO_SEQ_SCAN");
+    }
+    bool fp8_out(int T) const { return row_fp8 && T >= 256 && (fp8_mode == 1 || fp8_mode == 3); }
+    bool fp8_sh(int T) const { return row_fp8 && sh_fp8 && !sh_mmq && T >= 256; }
+    bool needs_x8(const Block& b, int T) const { return (b.kind == MAMBA && fp8_in(T)) || (b.kind == MOE && fp8_sh(T)); }
+    const float* e_rs = nullptr;    // tmp2's row scales after a MoE block (null: true values)
     // NEMO_SSD_FP32=1: the fp32 SSD kernels instead of k_ssd_full
     bool ssd_fp32 = std::getenv("NEMO_SSD_FP32") && std::atoi(std::getenv("NEMO_SSD_FP32")) != 0;
     void mamba_big(Block& b, int T) {
-        nvfp4_big(b.in_w, b.in_s, b.in_s2, B->n, B->proj, T, kInProj, kHidden);
-        k_mamba_conv_tiles<<<dim3((kConvDim + 255) / 256, (T + kConvTile - 1) / kConvTile), 256, 0, stream>>>(B->proj, b.conv_state, b.conv_w, b.conv_b, B->xbc, T);
-        k_conv_state_set<<<(kConvDim + 255) / 256, 256, 0, stream>>>(B->proj, b.conv_state, T);
+        const bool fin = fp8_in(T), fout = fp8_out(T);
+        const float* prs = fin ? B->rs_n : nullptr;                   // proj's row scales
+        if (!fin) nvfp4_big(b.in_w, b.in_s, b.in_s2, B->n, B->proj, T, kInProj, kHidden);
+        else if (!nvfp4_fp8(b.in_w, b.in_s, b.in_s2, nullptr, B->proj, T, kInProj, kHidden)) { std::fprintf(stderr, "strata-nemo: no FP8 in_proj\n"); std::exit(1); }
+        k_mamba_conv_tiles<<<dim3((kConvDim + 255) / 256, (T + kConvTile - 1) / kConvTile), 256, 0, stream>>>(B->proj, b.conv_state, b.conv_w, b.conv_b, B->xbc, T, prs);
+        k_conv_state_set<<<(kConvDim + 255) / 256, 256, 0, stream>>>(B->proj, b.conv_state, T, prs);
         // the step-by-step scan measured faster than this first SSD kernel (1,499 vs 1,065 a second on a 4K prompt)
         if (std::getenv("NEMO_SSD1")) k_mamba_ssd<<<dim3(kMHeads, kMHeadDim / 16), 256, 0, stream>>>(B->xbc, B->proj, b.A_log, b.D, b.dt_bias, b.ssm, B->y, T);
         else if (!std::getenv("NEMO_SEQ_SCAN") && T > 64) {
             // the Q-blocks in parallel, only the state hand-off in order (k_ssd_*)
             const int nc = (T + kSq - 1) / kSq;
-            k_ssd_dt<<<dim3(kMHeads, nc), kSq, 0, stream>>>(B->proj, b.A_log, b.dt_bias, B->ssd_dt, B->ssd_acs, B->ssd_ea, T);
+            k_ssd_dt<<<dim3(kMHeads, nc), kSq, 0, stream>>>(B->proj, b.A_log, b.dt_bias, B->ssd_dt, B->ssd_acs, B->ssd_ea, T, prs);
             k_ssd_cb<<<dim3(kMGroups, nc), 256, 0, stream>>>(B->xbc, B->ssd_cb, T);
             if (ssd_old) {
                 k_ssd_intra2<<<dim3(kMGroups, nc), 256, 0, stream>>>(B->xbc, B->ssd_cb, B->ssd_dt, B->ssd_acs, b.D, B->ssd_S, B->y, T, nc);
@@ -1230,8 +1252,14 @@ struct Model {
             }
         }
         else k_mamba_scan<<<dim3(kMHeads, kScanSlices), kMState, 0, stream>>>(B->xbc, B->proj, b.A_log, b.D, b.dt_bias, b.ssm, B->y, T, T);
-        k_gated_norm_many<<<dim3(kMGroups, T), 256, 0, stream>>>(B->y, B->proj, b.gnorm);
-        nvfp4_big(b.out_w, b.out_s, b.out_s2, B->y, B->d, T, kHidden, kMInter);
+        if (fout) {
+            // straight into E4M3 with the row scales (d's, applied by the next k_add_rmsnorm_rows)
+            k_gated_norm_rows<<<T, 1024, 0, stream>>>(B->y, B->proj, prs, b.gnorm, B->x8, B->rs_y);
+            if (!nvfp4_fp8(b.out_w, b.out_s, b.out_s2, nullptr, B->d, T, kHidden, kMInter)) { std::fprintf(stderr, "strata-nemo: no FP8 out_proj\n"); std::exit(1); }
+        } else {
+            k_gated_norm_many<<<dim3(kMGroups, T), 256, 0, stream>>>(B->y, B->proj, b.gnorm, nullptr, prs);
+            nvfp4_big(b.out_w, b.out_s, b.out_s2, B->y, B->d, T, kHidden, kMInter);
+        }
     }
 
     void attention_big(Block& b, int T) {
@@ -1348,6 +1376,7 @@ struct Model {
 
     void moe_big(Block& b, int T) {
         namespace mq = strata::prefill::mmq;
+        e_rs = nullptr;
         const int k = b.topk, W = b.width, S = T * k;
         k_to_bf16<<<1024, 256, 0, stream>>>(B->n, B->xb, size_t(T) * kHidden);
         // the router through hipBLASLt (its weights are BF16 already)
@@ -1366,7 +1395,12 @@ struct Model {
             mmq_dense(b.sh_up, kIQ2_XXS, B->n, B->tmp, T, kShared, kHidden);
             k_relu2<<<1024, 256, 0, stream>>>(B->tmp, size_t(T) * kShared);
             mmq_dense(b.sh_down, kIQ2_XXS, B->tmp, B->tmp2, T, kHidden, kShared);
-        } else if (sh_fp8 && T >= 256 && iq2_fp8(b.sh_up, B->n, B->tmp, T, kShared, kHidden, false)) {
+        } else if (fp8_sh(T) && iq2_fp8(b.sh_up, nullptr, B->tmp, T, kShared, kHidden, false)) {
+            // per-row FP8: n's rows came from k_add_rmsnorm_rows; relu^2 of tmp (times those scales) into E4M3 per row
+            k_rows_e4m3<kShared, 448, true><<<T, 448, 0, stream>>>(B->tmp, B->rs_n, B->x8, B->rs_t);
+            if (!iq2_fp8(b.sh_down, nullptr, B->tmp2, T, kHidden, kShared, true)) { std::fprintf(stderr, "strata-nemo: shared FP8\n"); std::exit(1); }
+            e_rs = B->rs_t;
+        } else if (!row_fp8 && sh_fp8 && T >= 256 && iq2_fp8(b.sh_up, B->n, B->tmp, T, kShared, kHidden, false)) {
             if (!iq2_fp8(b.sh_down, B->tmp, B->tmp2, T, kHidden, kShared, true)) { std::fprintf(stderr, "strata-nemo: shared FP8\n"); std::exit(1); }
         } else {
             // the shared expert unpacked to BF16 and through the BLAS GEMM (B->xb still holds n in BF16, from the
@@ -1425,6 +1459,7 @@ struct Model {
         CK(cudaMemcpyAsync(d_pos, h_tp + kTMax, 4, cudaMemcpyHostToDevice, stream));
         k_embed_many<<<dim3(16, T), 256, 0, stream>>>(embed, dt, B->h);
         k_rmsnorm_many<<<T, 1024, 0, stream>>>(B->h, blocks[0].norm, B->n, kHidden);
+        if (needs_x8(blocks[0], T)) k_rows_e4m3<kHidden, 256, false><<<T, 256, 0, stream>>>(B->n, nullptr, B->x8, B->rs_n);
         if (use_w8_pipe) w8_begin(T);
         for (size_t i = 0; i < blocks.size(); ++i) {
             Block& b = blocks[i];
@@ -1433,7 +1468,12 @@ struct Model {
             else if (b.kind == MOE) { moe_big(b, T); e = B->tmp2; }
             else attention_big(b, T);
             const uint16_t* nw = i + 1 < blocks.size() ? blocks[i + 1].norm : norm_f;
-            k_add_rmsnorm_many<<<T, 1024, 0, stream>>>(B->h, B->d, e, nw, B->n, kHidden);
+            // the next block's input: in E4M3 per row for its FP8 product, in fp32 unless only that product reads it
+            const Block* nx = i + 1 < blocks.size() ? &blocks[i + 1] : nullptr;
+            const bool x8 = nx && needs_x8(*nx, T), keep_n = !(x8 && nx->kind == MAMBA);
+            const float* drs = b.kind == MAMBA && fp8_out(T) ? B->rs_y : nullptr;
+            k_add_rmsnorm_rows<<<T, 1024, 0, stream>>>(B->h, B->d, drs, e, b.kind == MOE ? e_rs : nullptr, nw, keep_n ? B->n : nullptr,
+                                                       x8 ? B->x8 : nullptr, B->rs_n);
             tap(i, B->h, aux_big, T);
             if (dump) {
                 std::vector<float> rows(size_t(T) * kHidden);
