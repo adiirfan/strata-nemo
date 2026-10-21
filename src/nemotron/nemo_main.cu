@@ -1592,8 +1592,8 @@ struct Drafter {
             y.q_norm = bf(P + "self_attn.q_norm.weight"); y.k_norm = bf(P + "self_attn.k_norm.weight");
             y.sink = bf(P + "self_attn.attention_sink_bias");
             y.gate = nv(P + "mlp.gate_proj", false); y.up = nv(P + "mlp.up_proj", false); y.down = nv(P + "mlp.down_proj", false);
-            CK(cudaMalloc(&y.K, sizeof(float) * kAKv * size_t(M.max_ctx) * 128));
-            CK(cudaMalloc(&y.V, sizeof(float) * kAKv * size_t(M.max_ctx) * 128));
+            CK(cudaMalloc(&y.K, sizeof(float) * kAKv * size_t(kDRing) * 128));   // (rings: see kDRing)
+            CK(cudaMalloc(&y.V, sizeof(float) * kAKv * size_t(kDRing) * 128));
         }
         const std::string C = "lilicorr.";
         token_proj = nv(C + "token_proj", true); pass_proj = nv(C + "pass_hidden_proj", true); context_proj = nv(C + "context_proj", true);

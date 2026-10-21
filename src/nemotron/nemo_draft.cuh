@@ -12,6 +12,10 @@
 #pragma once
 
 constexpr int kDBlock = 8, kDSlots = 7, kDTopK = 8, kDWindow = 1024, kDLayers = 5, kDFf = 12288;
+// the draft layers attend over the last kDWindow positions only: their K / V live in a ring of kDRing slots
+// (position p in slot p & (kDRing - 1)) instead of max_ctx rows - 10 KB a context position saved
+constexpr int kDRing = 2048;
+static_assert((kDRing & (kDRing - 1)) == 0 && kDRing >= kDWindow + kDBlock, "a power of two past the window and a block");
 constexpr int kLl = 1024;                  // LiLiCorr width
 constexpr float kDEps = 1e-6f;
 constexpr int kTaps[6] = {1, 18, 35, 51, 68, 85};
@@ -57,7 +61,7 @@ __global__ void k_embed_ids(const uint16_t* table, const int32_t* ids, float* y,
 }
 
 // per (row, head): RMSNorm over the 128 dims (eps 1e-6) then neox RoPE at position pos0 + row (theta 10000);
-// x: (R, heads, 128) in place; when K is given the result is also stored at (head, pos0 + row) of K (max_ctx rows)
+// x: (R, heads, 128) in place; when K is given the result is also stored at (head, pos0 + row) of the K ring (kDRing)
 __global__ void k_head_norm_rope(float* x, const uint16_t* w, int heads, const int* pos0p, int pos0_add, float* K, int max_ctx) {
     __shared__ float v[128], sh[128];
     const int row = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
@@ -75,12 +79,15 @@ __global__ void k_head_norm_rope(float* x, const uint16_t* w, int heads, const i
     const float c = cosf(ang), s = sinf(ang);
     const float out = d < 64 ? v[d] * c - v[d + 64] * s : v[d] * c + v[d - 64] * s;
     xr[d] = out;
-    if (K) K[(size_t(h) * max_ctx + pos) * 128 + d] = out;
+    // (K: the draft ring - a call of more than kDRing rows stores only its last kDRing, so no two rows share a slot)
+    if (K && row + kDRing >= int(gridDim.x)) K[(size_t(h) * kDRing + (pos & (kDRing - 1))) * 128 + d] = out;
 }
 // V rows straight into the cache at (head, pos0 + row)
 __global__ void k_v_store(const float* v, float* V, const int* pos0p, int pos0_add, int max_ctx) {
     const int row = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
-    V[(size_t(h) * max_ctx + *pos0p + pos0_add + row) * 128 + d] = v[(size_t(row) * kAKv + h) * 128 + d];
+    if (row + kDRing < int(gridDim.x)) return;                       // (the ring keeps a call's last kDRing rows)
+    const int pos = *pos0p + pos0_add + row;
+    V[(size_t(h) * kDRing + (pos & (kDRing - 1))) * 128 + d] = v[(size_t(row) * kAKv + h) * 128 + d];
 }
 
 // grouped dynamic convolution over the 8-row block: out[r] = sum_tap (base[tap] + delta[r][tap][c / 16]) x[r - tap]
@@ -106,12 +113,12 @@ __global__ void __launch_bounds__(128) k_draft_attn(const float* q, const float*
     const int pos0 = *pos0p, p = pos0 + t, kvh = h / (kAHeads / kAKv);
     const float scale = rsqrtf(128.f);
     const float4 qq = reinterpret_cast<const float4*>(q + (size_t(t) * kAHeads + h) * 128)[lane];
-    const float* Kh = K + size_t(kvh) * max_ctx * 128;
-    const float* Vh = V + size_t(kvh) * max_ctx * 128;
+    const float* Kh = K + size_t(kvh) * kDRing * 128;               // (the ring: slot j & (kDRing - 1))
+    const float* Vh = V + size_t(kvh) * kDRing * 128;
     float m = -1e30f, l = 0.f, a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
     for (int j = max(0, p - (kDWindow - 1)) + warp; j < pos0 + kDBlock; j += 4) {
-        const float4 kv = reinterpret_cast<const float4*>(Kh + size_t(j) * 128)[lane];
-        const float4 vv = reinterpret_cast<const float4*>(Vh + size_t(j) * 128)[lane];
+        const float4 kv = reinterpret_cast<const float4*>(Kh + size_t(j & (kDRing - 1)) * 128)[lane];
+        const float4 vv = reinterpret_cast<const float4*>(Vh + size_t(j & (kDRing - 1)) * 128)[lane];
         float s = qq.x * kv.x + qq.y * kv.y + qq.z * kv.z + qq.w * kv.w;
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o, 32);
