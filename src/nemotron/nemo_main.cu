@@ -562,7 +562,10 @@ struct Model {
     bool nq8 = false;
     bool use_q8n = !std::getenv("NEMO_Q8N") || std::atoi(std::getenv("NEMO_Q8N")) != 0;
     cudaStream_t stream2 = nullptr;         // the shared expert's stream in a small step
-    cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
+    cudaEvent_t ev_fork = nullptr, ev_join = nullptr, ev_route = nullptr;
+    // the router and the top-k on the second stream ahead of the shared expert, beside fc1 (NEMO_ROUTE_SIDE=0: on the
+    // main stream before fc1)
+    bool route_side = !std::getenv("NEMO_ROUTE_SIDE") || std::atoi(std::getenv("NEMO_ROUTE_SIDE")) != 0;
     cudaStream_t stream = nullptr;
     int *d_toks = nullptr, *d_pos = nullptr, *h_tp = nullptr;   // [kTMax tokens, position of the first]
     // per Mamba layer: the window's projections and conv outputs, kept until the accepted count is known
@@ -678,6 +681,7 @@ struct Model {
         CK(cudaMalloc(&q8n, size_t(kTMax) * (kHidden / 32) * 36));
         CK(cudaStreamCreateWithFlags(&stream2, cudaStreamNonBlocking));
         CK(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
         reset();
     }
 
@@ -721,7 +725,9 @@ struct Model {
         else strata::kernels::iq_mmvq(kIQ2_XXS, w, xq, out, n_in, n_out, T, stream);
     }
     // W (rows x n_in, BF16 or NVFP4) times T <= 16 rows of x into (T, rows): the skinny kernel, 8 columns a launch
-    void skinny(int fmt, const void* w, const uint8_t* sc, float s2, const float* x, float* out, int n_in, int rows, int T) {
+    void skinny(int fmt, const void* w, const uint8_t* sc, float s2, const float* x, float* out, int n_in, int rows, int T,
+                cudaStream_t on = nullptr) {
+        cudaStream_t stream = on ? on : this->stream;
         int rb = rows / 256;                                       // aim for >= 256 blocks
         rb = std::max(16, std::min(kSkRB, rb / 16 * 16));
         const int grid = (rows + rb - 1) / rb;
@@ -817,23 +823,32 @@ struct Model {
 
     void moe(Block& b, int T) {
         const int k = b.topk, W = b.width;
-        if (T == 1) k_bf16_cols<<<(b.n_exp + 7) / 8, 256, 0, stream>>>(b.router, n, scores, kHidden, b.n_exp, T);
-        else if (use_skinny) skinny(0, b.router, nullptr, 1.f, n, scores, kHidden, b.n_exp, T);
-        else k_bf16_rows<<<(b.n_exp + 7) / 8, 256, 0, stream>>>(b.router, n, scores, kHidden, b.n_exp, T);
+        auto route = [&](cudaStream_t st) {
+            if (T == 1) k_bf16_cols<<<(b.n_exp + 7) / 8, 256, 0, st>>>(b.router, n, scores, kHidden, b.n_exp, T);
+            else if (use_skinny) skinny(0, b.router, nullptr, 1.f, n, scores, kHidden, b.n_exp, T, st);
+            else k_bf16_rows<<<(b.n_exp + 7) / 8, 256, 0, st>>>(b.router, n, scores, kHidden, b.n_exp, T);
+            k_route_warp<<<(T + 7) / 8, 256, 0, st>>>(scores, b.bias_dev, b.n_exp, k, T, route_idx, route_w);
+        };
+        const bool rside = sh_par && route_side;
+        if (!rside) route(stream);
         // the shared expert on the second stream, beside the routed path (they meet in the residual add): at these
         // sizes each product is a few us of ramp around a few us of reading, and two chains overlap those
         if (sh_par) {
             CK(cudaEventRecord(ev_fork, stream));
             CK(cudaStreamWaitEvent(stream2, ev_fork, 0));
+            if (rside) {   // (the routing first there, beside fc1 on the main stream)
+                route(stream2);
+                CK(cudaEventRecord(ev_route, stream2));
+            }
             if (!nq8) strata::kernels::quantize_q8_1_rows(n, T, kHidden, q8s, stream2);
             iq2_q_on(b.sh_up, nq8 ? q8n : q8s, tmp, kHidden, kShared, T, stream2);
             strata::kernels::relu2_quantize_q8_1_rows(tmp, T, kShared, q8s, stream2);
             iq2_q_on(b.sh_down, q8s, tmp2, kShared, kHidden, T, stream2);
             CK(cudaEventRecord(ev_join, stream2));
         }
-        k_route_warp<<<(T + 7) / 8, 256, 0, stream>>>(scores, b.bias_dev, b.n_exp, k, T, route_idx, route_w);
         q8_0(b.fc1, n, lat, kHidden, kLatent, T);
         strata::kernels::quantize_q8_1_rows(lat, T, kLatent, q8, stream);
+        if (rside) CK(cudaStreamWaitEvent(stream, ev_route, 0));
         if (T == 1) {
             strata::kernels::iq_mmvq_gather(kIQ2_XXS, b.up_tab, route_idx, k, q8, kLatent / 32, k, ex_up, kLatent, W, stream);
             strata::kernels::relu2_quantize_q8_1_rows(ex_up, k, W, q8b, stream);
