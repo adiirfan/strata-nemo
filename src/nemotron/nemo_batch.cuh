@@ -370,6 +370,24 @@ __global__ void __launch_bounds__(256) k_route_warp(const float* raw, const floa
     }
 }
 
+// k_wsum_many with eo also as q8_1 rows (n == gridDim.x * blockDim.x: a warp holds 32 consecutive outputs; the same
+// xor-tree quantizer as native_quantize_q8_1), for fc2 without its quantize launch
+__global__ void k_wsum_q8(float* eo, const float* y, const float* w, int k, int n, void* q8) {
+    const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    float a = 0.f;
+    for (int j = 0; j < k; ++j) a += w[t * k + j] * y[(size_t(t) * k + j) * n + i];
+    eo[size_t(t) * n + i] = a;
+    float amax = fabsf(a), sum = a;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+        sum += __shfl_xor_sync(0xffffffffu, sum, off);
+    }
+    const float dq = strata::kernels::q8_1_finite(amax / 127.0f);
+    Q8Blk* yb = reinterpret_cast<Q8Blk*>(q8) + (size_t(t) * n + i) / 32;
+    yb->qs[i % 32] = strata::kernels::q8_1_quant(a, dq, amax);
+    if (i % 32 == 0) yb->ds = strata::kernels::q8_1_ds(dq, sum);
+}
 // eo[t] = sum_j w[t][j] * y[t * k + j], eo (T, n)
 __global__ void k_wsum_many(float* eo, const float* y, const float* w, int k, int n) {
     const int t = blockIdx.y;

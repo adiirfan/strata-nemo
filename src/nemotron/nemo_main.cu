@@ -566,6 +566,8 @@ struct Model {
     // the router and the top-k on the second stream ahead of the shared expert, beside fc1 (NEMO_ROUTE_SIDE=0: on the
     // main stream before fc1)
     bool route_side = !std::getenv("NEMO_ROUTE_SIDE") || std::atoi(std::getenv("NEMO_ROUTE_SIDE")) != 0;
+    // one-position MoE steps: the weighted sum writes fc2's q8_1 input (NEMO_FUSED_Q=0: fc2 quantizes it)
+    bool fused_q = !std::getenv("NEMO_FUSED_Q") || std::atoi(std::getenv("NEMO_FUSED_Q")) != 0;
     cudaStream_t stream = nullptr;
     int *d_toks = nullptr, *d_pos = nullptr, *h_tp = nullptr;   // [kTMax tokens, position of the first]
     // per Mamba layer: the window's projections and conv outputs, kept until the accepted count is known
@@ -847,8 +849,10 @@ struct Model {
             CK(cudaEventRecord(ev_join, stream2));
         }
         q8_0(b.fc1, n, lat, kHidden, kLatent, T);
+        const bool fq = T == 1 && fused_q;                         // (the weighted sum writes fc2's q8_1 input)
         strata::kernels::quantize_q8_1_rows(lat, T, kLatent, q8, stream);
         if (rside) CK(cudaStreamWaitEvent(stream, ev_route, 0));
+        // (gathers that quantize their own inputs measured slower: every block redid its slot's quantization)
         if (T == 1) {
             strata::kernels::iq_mmvq_gather(kIQ2_XXS, b.up_tab, route_idx, k, q8, kLatent / 32, k, ex_up, kLatent, W, stream);
             strata::kernels::relu2_quantize_q8_1_rows(ex_up, k, W, q8b, stream);
@@ -862,8 +866,13 @@ struct Model {
             strata::kernels::relu2_quantize_q8_1_rows(ex_up, S, W, q8b, stream);
             strata::kernels::iq_mmvq_grouped(kIQ2_XXS, b.down_tab, g_n, G, g_exp, g_cnt, g_slot, g_slot, q8b, W / 32, ex_down, W, kLatent, stream);
         }
-        k_wsum_many<<<dim3(4, T), 256, 0, stream>>>(eo, ex_down, route_w, k, kLatent);
-        q8_0(b.fc2, eo, d, kLatent, kHidden, T);
+        if (fq) {   // (the weighted sum writes fc2's q8_1 input too)
+            k_wsum_q8<<<dim3(4, T), 256, 0, stream>>>(eo, ex_down, route_w, k, kLatent, q8);
+            strata::kernels::native_q8_0_mmvq(b.fc2, q8, d, kLatent, kHidden, T, stream);
+        } else {
+            k_wsum_many<<<dim3(4, T), 256, 0, stream>>>(eo, ex_down, route_w, k, kLatent);
+            q8_0(b.fc2, eo, d, kLatent, kHidden, T);
+        }
         // (llama.cpp's MMQ for these two at T = 8 measured slower: 46 vs 34 us a call)
         if (sh_par) CK(cudaStreamWaitEvent(stream, ev_join, 0));
         else {
