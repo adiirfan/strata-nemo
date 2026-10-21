@@ -1472,7 +1472,7 @@ struct Model {
             const Block* nx = i + 1 < blocks.size() ? &blocks[i + 1] : nullptr;
             const bool x8 = nx && needs_x8(*nx, T), keep_n = !(x8 && nx->kind == MAMBA);
             const float* drs = b.kind == MAMBA && fp8_out(T) ? B->rs_y : nullptr;
-            k_add_rmsnorm_rows<<<T, 1024, 0, stream>>>(B->h, B->d, drs, e, b.kind == MOE ? e_rs : nullptr, nw, keep_n ? B->n : nullptr,
+            k_add_rmsnorm_rows<<<T, 256, 0, stream>>>(B->h, B->d, drs, e, b.kind == MOE ? e_rs : nullptr, nw, keep_n ? B->n : nullptr,
                                                        x8 ? B->x8 : nullptr, B->rs_n);
             tap(i, B->h, aux_big, T);
             if (dump) {

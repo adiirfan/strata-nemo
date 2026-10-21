@@ -637,37 +637,61 @@ __device__ __forceinline__ float rw_max32(float v) {
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o, 32));
     return v;
 }
-// the residual add and RMSNorm of one row (kHidden) a block of 1024: h += d * drs + e * ers (scales optional), then
+// the residual add and RMSNorm of one row (kHidden) a block of 256 (16 values a thread: four 16-byte loads of each
+// input in flight; 1024 threads of 4: ~650 us a 4K chunk, this ~475): h += d * drs + e * ers (scales optional), then
 // y (fp32, if given) and/or the row in E4M3 (x8, xrs; if given)
-__global__ void __launch_bounds__(1024) k_add_rmsnorm_rows(float* h, const float* d, const float* drs, const float* e, const float* ers,
-                                                          const uint16_t* w, float* y, uint8_t* x8, float* xrs) {
-    __shared__ float ss[32], sm[32];
+__global__ void __launch_bounds__(256) k_add_rmsnorm_rows(float* h, const float* d, const float* drs, const float* e, const float* ers,
+                                                         const uint16_t* w, float* y, uint8_t* x8, float* xrs) {
+    constexpr int NT = 256, V = kHidden / 4 / NT;
+    __shared__ float ss[NT / 32], sm[NT / 32];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const size_t r = blockIdx.x, o = r * kHidden + tid * 4;
-    const float ds = drs ? drs[r] : 1.f;
-    float4 v = *reinterpret_cast<const float4*>(h + o);
-    const float4 dv = *reinterpret_cast<const float4*>(d + o);
-    v.x += dv.x * ds; v.y += dv.y * ds; v.z += dv.z * ds; v.w += dv.w * ds;
-    if (e) {
-        const float es = ers ? ers[r] : 1.f;
-        const float4 ev = *reinterpret_cast<const float4*>(e + o);
-        v.x += ev.x * es; v.y += ev.y * es; v.z += ev.z * es; v.w += ev.w * es;
+    const size_t r = blockIdx.x;
+    float4* h4 = reinterpret_cast<float4*>(h + r * kHidden);
+    const float4* d4 = reinterpret_cast<const float4*>(d + r * kHidden);
+    const float4* e4 = e ? reinterpret_cast<const float4*>(e + r * kHidden) : nullptr;
+    const float ds = drs ? drs[r] : 1.f, es = ers ? ers[r] : 1.f;
+    float4 v[V], dv[V], ev[V];
+#pragma unroll
+    for (int j = 0; j < V; ++j) {
+        v[j] = h4[tid + j * NT];
+        dv[j] = d4[tid + j * NT];
+        ev[j] = e4 ? e4[tid + j * NT] : make_float4(0.f, 0.f, 0.f, 0.f);
     }
-    *reinterpret_cast<float4*>(h + o) = v;
-    const float a = rw_sum32(v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w);
+    float a = 0.f;
+#pragma unroll
+    for (int j = 0; j < V; ++j) {
+        v[j].x += dv[j].x * ds + ev[j].x * es; v[j].y += dv[j].y * ds + ev[j].y * es;
+        v[j].z += dv[j].z * ds + ev[j].z * es; v[j].w += dv[j].w * ds + ev[j].w * es;
+        h4[tid + j * NT] = v[j];
+        a += v[j].x * v[j].x + v[j].y * v[j].y + v[j].z * v[j].z + v[j].w * v[j].w;
+    }
+    a = rw_sum32(a);
     if (lane == 0) ss[warp] = a;
     __syncthreads();
-    const float inv = rsqrtf(rw_sum32(ss[lane]) / kHidden + kEps);
-    const uint2 wb = *reinterpret_cast<const uint2*>(w + tid * 4);
-    const float4 nv = make_float4(bf16f(uint16_t(wb.x)) * (v.x * inv), bf16f(uint16_t(wb.x >> 16)) * (v.y * inv),
-                                  bf16f(uint16_t(wb.y)) * (v.z * inv), bf16f(uint16_t(wb.y >> 16)) * (v.w * inv));
-    if (y) *reinterpret_cast<float4*>(y + o) = nv;
+    float t = 0.f;
+#pragma unroll
+    for (int i = 0; i < NT / 32; ++i) t += ss[i];
+    const float inv = rsqrtf(t / kHidden + kEps);
+    float m = 0.f;
+#pragma unroll
+    for (int j = 0; j < V; ++j) {
+        const uint2 wb = reinterpret_cast<const uint2*>(w)[tid + j * NT];
+        v[j] = make_float4(bf16f(uint16_t(wb.x)) * (v[j].x * inv), bf16f(uint16_t(wb.x >> 16)) * (v[j].y * inv),
+                           bf16f(uint16_t(wb.y)) * (v[j].z * inv), bf16f(uint16_t(wb.y >> 16)) * (v[j].w * inv));
+        if (y) reinterpret_cast<float4*>(y + r * kHidden)[tid + j * NT] = v[j];
+        m = fmaxf(m, fmaxf(fmaxf(fabsf(v[j].x), fabsf(v[j].y)), fmaxf(fabsf(v[j].z), fabsf(v[j].w))));
+    }
     if (x8) {
-        const float m = rw_max32(fmaxf(fmaxf(fabsf(nv.x), fabsf(nv.y)), fmaxf(fabsf(nv.z), fabsf(nv.w))));
+        m = rw_max32(m);
         if (lane == 0) sm[warp] = m;
         __syncthreads();
-        const float mx = rw_max32(sm[lane]), sc = mx > 0.f ? mx / 448.f : 1.f, i8 = 1.f / sc;
-        reinterpret_cast<uint32_t*>(x8 + r * kHidden)[tid] = fp8x4(nv.x * i8, nv.y * i8, nv.z * i8, nv.w * i8);
+        float mx = 0.f;
+#pragma unroll
+        for (int i = 0; i < NT / 32; ++i) mx = fmaxf(mx, sm[i]);
+        const float sc = mx > 0.f ? mx / 448.f : 1.f, i8 = 1.f / sc;
+#pragma unroll
+        for (int j = 0; j < V; ++j)
+            reinterpret_cast<uint32_t*>(x8 + r * kHidden)[tid + j * NT] = fp8x4(v[j].x * i8, v[j].y * i8, v[j].z * i8, v[j].w * i8);
         if (tid == 0) xrs[r] = sc;
     }
 }
