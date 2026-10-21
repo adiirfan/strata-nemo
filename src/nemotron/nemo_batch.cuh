@@ -283,6 +283,11 @@ __global__ void k_att_out_many(const float* sc, const float* V, float* o, const 
     o[(size_t(t) * kAHeads + h) * kAHeadDim + d] = a;
 }
 
+// lane i's value from lane i ^ M (M < 16, within a row of 16: DPP row_xmask) and from lane i ^ 16 (permlanex16)
+template <int M> __device__ __forceinline__ int rt_xmask(int v) { return __builtin_amdgcn_mov_dpp(v, 0x160 + M, 0xf, 0xf, false); }
+template <int M> __device__ __forceinline__ float rt_xmask(float v) { return __int_as_float(rt_xmask<M>(__float_as_int(v))); }
+__device__ __forceinline__ int rt_x16(int v) { return (int) __builtin_amdgcn_permlanex16((unsigned) v, (unsigned) v, 0x76543210u, 0xfedcba98u, false, false); }
+__device__ __forceinline__ float rt_x16(float v) { return __int_as_float(rt_x16(__float_as_int(v))); }
 // the router for T positions: sigmoid scores plus bias, the top k (larger first, ties to the smaller index), their
 // sigmoids normalized x kRouteScale; idx / wts are (T, k). One warp a row (8 rows a block of 256, n <= 512, k <= 16):
 // each lane holds n/32 scores, k rounds of a warp argmax by shuffles, no barriers (a 512-wide LDS reduction per round
@@ -293,46 +298,52 @@ __global__ void __launch_bounds__(256) k_route_warp(const float* raw, const floa
     if (row >= T) return;
     const float* r = raw + size_t(row) * n;
     float c[M], sg[M];
+    // (every load issued unconditionally at a clamped index, then masked: guarded loads became 16 branches whose
+    // memory waits ran one after another)
+    float rv[M], bv0[M];
 #pragma unroll
     for (int j = 0; j < M; ++j) {
-        const int e = lane + 32 * j;
-        const float s = e < n ? 1.f / (1.f + expf(-r[e])) : 0.f;
-        sg[j] = s;
-        c[j] = e < n ? s + bias[e] : -INFINITY;
+        const int e = min(lane + 32 * j, n - 1);
+        rv[j] = r[e];
+        bv0[j] = bias[e];
     }
-    float sv[M];
-    int si[M];
-    float sum = 0.f;
 #pragma unroll
-    for (int q = 0; q < M; ++q) {
-        if (q >= k) break;
+    for (int j = 0; j < M; ++j) {
+        const bool in = lane + 32 * j < n;
+        const float s = 1.f / (1.f + expf(-rv[j]));
+        sg[j] = in ? s : 0.f;
+        c[j] = in ? s + bv0[j] : -INFINITY;
+    }
+    float sum = 0.f, myw = 0.f;                                       // lane q keeps choice q
+    int myi = 0;
+    for (int q = 0; q < k; ++q) {
         float bv = -INFINITY;
         int bi = 0x7fffffff;
 #pragma unroll
         for (int j = 0; j < M; ++j)
             if (c[j] > bv) { bv = c[j]; bi = lane + 32 * j; }
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o, 32);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, o, 32);
-            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-        }
+        // (lane exchanges by DPP / permlanex16: a few cycles each, where a shuffle goes through LDS)
+        auto take = [&](float ov, int oi) { if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; } };
+        take(rt_xmask<1>(bv), rt_xmask<1>(bi));
+        take(rt_xmask<2>(bv), rt_xmask<2>(bi));
+        take(rt_xmask<4>(bv), rt_xmask<4>(bi));
+        take(rt_xmask<8>(bv), rt_xmask<8>(bi));
+        take(rt_x16(bv), rt_x16(bi));
         float w = 0.f;
 #pragma unroll
-        for (int j = 0; j < M; ++j)
-            if (lane + 32 * j == bi) { w = sg[j]; c[j] = -INFINITY; }
+        for (int j = 0; j < M; ++j) {
+            const bool hit = lane + 32 * j == bi;
+            w = hit ? sg[j] : w;
+            c[j] = hit ? -INFINITY : c[j];
+        }
         w = __shfl_sync(0xffffffffu, w, bi & 31, 32);
-        sv[q] = w;
-        si[q] = bi;
+        if (lane == q) { myw = w; myi = bi; }
         sum += w;
     }
-    if (lane == 0)
-#pragma unroll
-        for (int q = 0; q < M; ++q) {
-            if (q >= k) break;
-            idx[row * k + q] = si[q];
-            wts[row * k + q] = sv[q] / (sum + 1e-20f) * kRouteScale;
-        }
+    if (lane < k) {
+        idx[row * k + lane] = myi;
+        wts[row * k + lane] = myw / (sum + 1e-20f) * kRouteScale;
+    }
 }
 
 // eo[t] = sum_j w[t][j] * y[t * k + j], eo (T, n)
