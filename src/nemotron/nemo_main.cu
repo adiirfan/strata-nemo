@@ -1078,14 +1078,16 @@ struct Model {
     }
 
     // Y[T, N] = X[T, K] . W^T through MMQ, W one matrix of `type` (dense: one "expert" with all T rows)
+    int one_bounds_t = -1;                                          // the T that B->one_bounds holds
     void mmq_dense(const void* W, int type, const float* X, float* Y, int T, int N, int K) {
         namespace mq = strata::prefill::mmq;
         mq::quantize(X, nullptr, B->xq2, type, K, K, T, stream);
         const int32_t* bounds = B->one_bounds;
         if (T <= kTMax) bounds = B->small_bounds + 2 * T;          // preset {0, T}: no host copy, so graphs can hold it
-        else {
+        else if (T != one_bounds_t) {                              // (once a chunk: each copy left a ~20 us gap)
             const int32_t hb[2] = {0, T};
             CK(cudaMemcpyAsync(B->one_bounds, hb, 8, cudaMemcpyHostToDevice, stream));
+            one_bounds_t = T;
         }
         mq::Product p;
         p.w = W; p.type = type; p.w_rows = N; p.w_cols = K; p.expert_bytes = mq::matrix_bytes(type, N, K);
