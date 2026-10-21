@@ -1056,6 +1056,16 @@ struct Model {
                     nvfp4_fp8(b.out_w, b.out_s, b.out_s2, B->y, B->d, kTBig, kHidden, kMInter);
                     break;
                 }
+            // and the side-stream weight pipeline once: its first use cost ~11 ms of idle card in the first prompt
+            if (use_w8_pipe && !B->jobs.empty()) {
+                const Big::W8Job& j0 = B->jobs[0];
+                float* X = j0.K == kHidden ? B->n : j0.K == kMInter ? B->y : B->tmp;
+                float* Y = j0.rows == kInProj ? B->proj : j0.rows == kHidden ? B->d : B->tmp2;
+                w8_begin(kTBig);
+                if (j0.iq2) iq2_fp8(j0.w, X, Y, kTBig, j0.rows, j0.K, false);
+                else nvfp4_fp8((const uint8_t*) j0.w, j0.sc, 1.f, X, Y, kTBig, j0.rows, j0.K);
+                CK(cudaDeviceSynchronize());
+            }
         }
         CK(cudaStreamSynchronize(stream));
     }
