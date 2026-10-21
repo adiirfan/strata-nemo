@@ -1433,19 +1433,21 @@ __global__ void __launch_bounds__(kFwPos * 32) k_attn_flash(const float* __restr
     const uint16_t* K = kb + g * k_stride;
     const uint16_t* V = vtb + g * kv_stride;
     // Q^T as B operands: lane holds head l16's dims kk * 16 + g8 * 8 .. + 8
+    // (scaled by 1/sqrt(128) and log2(e) before the rounding: the scores come out in the log2 domain, for exp2)
     att_v8s qb[kAHeadDim / 16];
+    const float qs = rsqrtf(float(kAHeadDim)) * 1.4426950408889634f;
 #pragma unroll
     for (int kk = 0; kk < kAHeadDim / 16; ++kk) {
         uint32_t w[4] = {0, 0, 0, 0};
         if (live) {
             const float* qr = q + (size_t(t) * kAHeads + g * 16 + l16) * kAHeadDim + kk * 16 + g8 * 8;
-            const float4 a = reinterpret_cast<const float4*>(qr)[0], b = reinterpret_cast<const float4*>(qr)[1];
+            float4 a = reinterpret_cast<const float4*>(qr)[0], b = reinterpret_cast<const float4*>(qr)[1];
+            a.x *= qs; a.y *= qs; a.z *= qs; a.w *= qs; b.x *= qs; b.y *= qs; b.z *= qs; b.w *= qs;
             w[0] = f2bf(a.x) | (uint32_t(f2bf(a.y)) << 16); w[1] = f2bf(a.z) | (uint32_t(f2bf(a.w)) << 16);
             w[2] = f2bf(b.x) | (uint32_t(f2bf(b.y)) << 16); w[3] = f2bf(b.z) | (uint32_t(f2bf(b.w)) << 16);
         }
         qb[kk] = __builtin_bit_cast(att_v8s, make_uint4(w[0], w[1], w[2], w[3]));
     }
-    const float scale = rsqrtf(float(kAHeadDim)) * 1.4426950408889634f;   // (log2 domain: exp2)
     att_v8f o[kAHeadDim / 16];                                     // O^T: lane = head l16, dims d * 16 + g8 * 8 + i
 #pragma unroll
     for (int d = 0; d < kAHeadDim / 16; ++d) o[d] = att_v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
@@ -1471,16 +1473,28 @@ __global__ void __launch_bounds__(kFwPos * 32) k_attn_flash(const float* __restr
                 st[nt] = att_wmma(*reinterpret_cast<const att_v8s*>(&sk[nt * 16 + l16][kk * 16 + g8 * 8]), qb[kk], st[nt]);
         }
         float v[2][8], mx = -INFINITY;
+        if (j0 + kFwKeys - 1 > p) {                                // (the causal mask on the run that reaches p only)
 #pragma unroll
-        for (int nt = 0; nt < 2; ++nt)
+            for (int nt = 0; nt < 2; ++nt)
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int key = j0 + nt * 16 + g8 * 8 + i;
-                v[nt][i] = key > p ? -INFINITY : st[nt][i] * scale;
-                mx = fmaxf(mx, v[nt][i]);
-            }
+                for (int i = 0; i < 8; ++i) {
+                    const int key = j0 + nt * 16 + g8 * 8 + i;
+                    v[nt][i] = key > p ? -INFINITY : st[nt][i];
+                    mx = fmaxf(mx, v[nt][i]);
+                }
+        } else {
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    v[nt][i] = st[nt][i];
+                    mx = fmaxf(mx, v[nt][i]);
+                }
+        }
         mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 16, 32));
-        const float mn = fmaxf(m, mx), alpha = exp2f(m - mn);
+        // (the bare v_exp_f32: exp2f's guard for results below the normal range is several instructions an exp, and
+        // such results only need to come out as 0)
+        const float mn = fmaxf(m, mx), alpha = __builtin_amdgcn_exp2f(m - mn);
         m = mn;
         att_v8s pb[2];
         float sum = 0.f;
@@ -1489,9 +1503,10 @@ __global__ void __launch_bounds__(kFwPos * 32) k_attn_flash(const float* __restr
             uint32_t w[4];
 #pragma unroll
             for (int i = 0; i < 8; i += 2) {
-                const float e0 = exp2f(v[nt][i] - mn), e1 = exp2f(v[nt][i + 1] - mn);
+                const float e0 = __builtin_amdgcn_exp2f(v[nt][i] - mn), e1 = __builtin_amdgcn_exp2f(v[nt][i + 1] - mn);
                 sum += e0 + e1;
-                w[i / 2] = f2bf(e0) | (uint32_t(f2bf(e1)) << 16);
+                // (to BF16 by adding half a unit and keeping the top halves: e is finite and in [0, 1])
+                w[i / 2] = __builtin_amdgcn_perm(__float_as_uint(e1) + 0x8000u, __float_as_uint(e0) + 0x8000u, 0x07060302u);
             }
             pb[nt] = __builtin_bit_cast(att_v8s, make_uint4(w[0], w[1], w[2], w[3]));
         }
