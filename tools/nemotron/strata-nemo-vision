@@ -1,0 +1,7 @@
+#!/bin/sh
+# strata-nemo-vision: the server's image encoder command for Nemotron (vision_encoder.py beside this script), run by
+# the Python in NEMO_VISION_PYTHON (one with PyTorch and transformers 5.x), else python3
+# (without the engine's library path: a PyTorch build finds its own ROCm or CUDA libraries, and another ROCm's first in
+# that path breaks it)
+unset LD_LIBRARY_PATH
+exec "${NEMO_VISION_PYTHON:-python3}" "$(dirname "$0")/vision_encoder.py" "$@"

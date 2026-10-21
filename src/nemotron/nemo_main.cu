@@ -1953,6 +1953,9 @@ int main(int argc, char** argv) {
         else if (a == "--dump") dump_path = next();
         else if (a == "--max-ctx" || a == "--max-context") ctx = std::stoi(next());
         else if (a == "--serve") serve_mode = true;
+        // flags Strata's server adds for its own engine (images take no flag here; the cache needs no reserve)
+        else if (a == "--vision") {}
+        else if (a == "--vram-reserve-mib") next();
         else if (a == "--eos-ids") {
             eos_ids.clear();
             std::stringstream es(next());
