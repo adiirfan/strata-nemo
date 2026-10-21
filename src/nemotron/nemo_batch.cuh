@@ -1672,6 +1672,170 @@ __global__ void __launch_bounds__(NT) k_ssd_state(const float* xbc, const float*
     for (int j = 0; j < PT; ++j) hp[size_t(p0 + pp + j) * kMState + n] = H[j];
 }
 
+// The SSD state walk on the BF16 matrix cores. Each warp keeps one (head, 16-row P slice) of the state as 8 matrix
+// accumulator tiles (16 states x 16 rows each) for the whole walk; fp32 values go in as a BF16 high part plus a BF16
+// remainder (three products: hi.hi + hi.lo + lo.hi, ~2^-15 relative each), the sums are fp32.
+// A Q-block of kSq positions: outputs y[t][p] += et[t] * sum_n C[t][n] H[n][p] (H before the block), then
+// H[n][p] = e * H[n][p] + sum_t B[t][n] (w[t] x[t][p]). An accumulator tile's lane layout (states g*8 + i, row l16) is
+// exactly the B operand layout of the output product, so the state never leaves the registers.
+// HPB heads a block (one group shares C and B), 4 warps a head.
+typedef __bf16 sw_v8bf __attribute__((ext_vector_type(8)));
+typedef float sw_v8f __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ sw_v8f sw_wmma(const uint4& a, const uint4& b, const sw_v8f& c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(__builtin_bit_cast(sw_v8bf, a), __builtin_bit_cast(sw_v8bf, b), c);
+}
+// two floats to packed BF16 high parts (truncated) and packed BF16 remainders (truncated)
+__device__ __forceinline__ void sw_split2(float x0, float x1, uint32_t& hi, uint32_t& lo) {
+    const uint32_t b0 = __float_as_uint(x0), b1 = __float_as_uint(x1);
+    hi = __builtin_amdgcn_perm(b1, b0, 0x07060302u);
+    const float r0 = x0 - __uint_as_float(b0 & 0xffff0000u), r1 = x1 - __uint_as_float(b1 & 0xffff0000u);
+    lo = __builtin_amdgcn_perm(__float_as_uint(r1), __float_as_uint(r0), 0x07060302u);
+}
+__device__ __forceinline__ void sw_split8(const float* v, uint4& hi, uint4& lo) {
+    sw_split2(v[0], v[1], hi.x, lo.x); sw_split2(v[2], v[3], hi.y, lo.y);
+    sw_split2(v[4], v[5], hi.z, lo.z); sw_split2(v[6], v[7], hi.w, lo.w);
+}
+
+template <int HPB>
+__global__ void __launch_bounds__(HPB * 128) k_ssd_wm(const float* xbc, const float* dtv, const float* acs, const float* ea,
+                                                     float* ssm, float* y, int T, int nc) {
+    constexpr int NT = HPB * 128, LDC = kMState + 8, LDB = kSq + 8;
+    __shared__ __align__(16) uint16_t Ch[kSq][LDC], Cl[kSq][LDC], Bh[kMState][LDB], Bl[kMState][LDB];
+    __shared__ float w[HPB][kSq], et[HPB][kSq];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, l16 = lane & 15, g = lane >> 4;
+    const int hl = warp / 4, hd = blockIdx.x * HPB + hl, grp = hd / (kMHeads / kMGroups);
+    const int p = (warp % 4) * 16 + l16;                              // this lane's P row
+    float* hp = ssm + size_t(hd) * kMHeadDim * kMState;               // ssm layout [p][n]
+    sw_v8f H[8];
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+        const float4 a = *reinterpret_cast<const float4*>(hp + size_t(p) * kMState + nt * 16 + g * 8);
+        const float4 b = *reinterpret_cast<const float4*>(hp + size_t(p) * kMState + nt * 16 + g * 8 + 4);
+        H[nt] = sw_v8f{a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+    }
+    // a Q-block's reads go to registers one block ahead. C: thread = 2 states (np), kSq / (NT / 64) positions;
+    // B: thread = 1 state, kSq / (NT / 128) positions; x: this lane's 16 (position, row) values
+    constexpr int CT = kSq / (NT / 64), BT = kSq / (NT / 128);
+    const int cn = (tid % 64) * 2, ct0 = (tid / 64) * CT, bn = tid % 128, bt0 = (tid / 128) * BT;
+    float2 pc[CT];
+    float pb[BT], px[16], py[16], pat = 0.f, pdt = 0.f, paq = 0.f;
+    auto fetch_cb = [&](int c) {
+        if (c >= nc) return;
+        const int c0 = c * kSq, nq = min(kSq, T - c0);
+#pragma unroll
+        for (int j = 0; j < CT; ++j) {
+            const int t = ct0 + j;
+            pc[j] = t < nq ? *reinterpret_cast<const float2*>(xbc + size_t(c0 + t) * kConvDim + kMInter + kMGroups * kMState + grp * kMState + cn)
+                           : make_float2(0.f, 0.f);
+        }
+#pragma unroll
+        for (int j = 0; j < BT; ++j) {
+            const int t = bt0 + j;
+            pb[j] = t < nq ? xbc[size_t(c0 + t) * kConvDim + kMInter + grp * kMState + bn] : 0.f;
+        }
+        if (lane < kSq && warp % 4 == 0) {
+            pat = lane < nq ? acs[size_t(c0 + lane) * kMHeads + hd] : 0.f;
+            pdt = lane < nq ? dtv[size_t(c0 + lane) * kMHeads + hd] : 0.f;
+            paq = acs[size_t(c0 + nq - 1) * kMHeads + hd];
+        }
+    };
+    // this lane's x values and the outputs' own part (written before the walk: this block adds to it)
+    auto fetch_xy = [&](int c) {
+        if (c >= nc) return;
+        const int c0 = c * kSq, nq = min(kSq, T - c0);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int t = (j / 8) * 16 + g * 8 + j % 8;
+            px[j] = t < nq ? xbc[size_t(c0 + t) * kConvDim + hd * kMHeadDim + p] : 0.f;
+            py[j] = t < nq ? y[size_t(c0 + t) * kMInter + hd * kMHeadDim + p] : 0.f;
+        }
+    };
+    fetch_cb(0);
+    fetch_xy(0);
+    for (int c = 0; c < nc; ++c) {
+        const int c0 = c * kSq, nq = min(kSq, T - c0);
+        __syncthreads();                                              // the last Q-block's LDS reads are done
+        if (lane < kSq && warp % 4 == 0) {
+            w[hl][lane] = lane < nq ? expf(paq - pat) * pdt : 0.f;
+            et[hl][lane] = expf(pat);
+        }
+#pragma unroll
+        for (int j = 0; j < CT; ++j) {
+            uint32_t hi, lo;
+            sw_split2(pc[j].x, pc[j].y, hi, lo);
+            *reinterpret_cast<uint32_t*>(&Ch[ct0 + j][cn]) = hi;
+            *reinterpret_cast<uint32_t*>(&Cl[ct0 + j][cn]) = lo;
+        }
+#pragma unroll
+        for (int j = 0; j < BT; j += 8) {
+            uint4 hi, lo;
+            sw_split8(pb + j, hi, lo);
+            *reinterpret_cast<uint4*>(&Bh[bn][bt0 + j]) = hi;
+            *reinterpret_cast<uint4*>(&Bl[bn][bt0 + j]) = lo;
+        }
+        __syncthreads();
+        fetch_cb(c + 1);
+        // x scaled by w, split (px is free after this)
+        uint4 xh[2], xl[2];
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            float v[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) v[i] = px[ks * 8 + i] * w[hl][ks * 16 + g * 8 + i];
+            sw_split8(v, xh[ks], xl[ks]);
+        }
+        // outputs with the state before this block
+        {
+            sw_v8f Y[2] = {};
+#pragma unroll
+            for (int ks = 0; ks < 8; ++ks) {
+                float hv[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) hv[i] = H[ks][i];
+                uint4 hh, hlo;
+                sw_split8(hv, hh, hlo);
+#pragma unroll
+                for (int tt = 0; tt < 2; ++tt) {
+                    const uint4 ah = *reinterpret_cast<const uint4*>(&Ch[tt * 16 + l16][ks * 16 + g * 8]);
+                    const uint4 al = *reinterpret_cast<const uint4*>(&Cl[tt * 16 + l16][ks * 16 + g * 8]);
+                    Y[tt] = sw_wmma(ah, hh, Y[tt]);
+                    Y[tt] = sw_wmma(ah, hlo, Y[tt]);
+                    Y[tt] = sw_wmma(al, hh, Y[tt]);
+                }
+            }
+#pragma unroll
+            for (int tt = 0; tt < 2; ++tt)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int t = tt * 16 + g * 8 + i;
+                    if (t < nq) y[size_t(c0 + t) * kMInter + hd * kMHeadDim + p] = py[tt * 8 + i] + et[hl][t] * Y[tt][i];
+                }
+        }
+        // the state: decay, then the block's inputs (x scaled by w)
+        fetch_xy(c + 1);
+        {
+            const float e = ea[size_t(c) * kMHeads + hd];
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                H[nt] = H[nt] * e;
+#pragma unroll
+                for (int ks = 0; ks < 2; ++ks) {
+                    const uint4 ah = *reinterpret_cast<const uint4*>(&Bh[nt * 16 + l16][ks * 16 + g * 8]);
+                    const uint4 al = *reinterpret_cast<const uint4*>(&Bl[nt * 16 + l16][ks * 16 + g * 8]);
+                    H[nt] = sw_wmma(ah, xh[ks], H[nt]);
+                    H[nt] = sw_wmma(ah, xl[ks], H[nt]);
+                    H[nt] = sw_wmma(al, xh[ks], H[nt]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+        *reinterpret_cast<float4*>(hp + size_t(p) * kMState + nt * 16 + g * 8) = make_float4(H[nt][0], H[nt][1], H[nt][2], H[nt][3]);
+        *reinterpret_cast<float4*>(hp + size_t(p) * kMState + nt * 16 + g * 8 + 4) = make_float4(H[nt][4], H[nt][5], H[nt][6], H[nt][7]);
+    }
+}
+
 // commit: move the Mamba state forward over the first m <= kScanTile positions of a checked window (no outputs).
 // The same per-step arithmetic as k_mamba_scan (h = h * dA + dt B x), so the stored state equals the scan's at the
 // same step; the step values are read before the steps, as there.

@@ -1200,6 +1200,7 @@ struct Model {
     // routed experts on the FP16 matrix cores (strata::kernels::moe_wmma_iq2xxs); NEMO_MOE_MMQ = llama.cpp's MMQ.
     // 8K README: perplexity 4.5585 vs 4.5630, 2,675 vs 2,484 tokens a second
     bool moe_wmma = std::getenv("NEMO_MOE_MMQ") == nullptr;     // the shared expert through MMQ (before: BF16 GEMM)   // the three-kernel state hand-off, for comparison
+    bool ssd_fp32 = std::getenv("NEMO_SSD_FP32") && std::atoi(std::getenv("NEMO_SSD_FP32")) != 0;
     void mamba_big(Block& b, int T) {
         nvfp4_big(b.in_w, b.in_s, b.in_s2, B->n, B->proj, T, kInProj, kHidden);
         k_mamba_conv_tiles<<<dim3((kConvDim + 255) / 256, (T + kConvTile - 1) / kConvTile), 256, 0, stream>>>(B->proj, b.conv_state, b.conv_w, b.conv_b, B->xbc, T);
@@ -1219,7 +1220,9 @@ struct Model {
                 // the outputs' own part, then the state walk adding the carried-in part (k_ssd_state)
                 k_ssd_intra2<<<dim3(kMGroups, nc), 256, 0, stream>>>(B->xbc, B->ssd_cb, B->ssd_dt, B->ssd_acs, b.D, B->ssd_S, B->y, T, nc, false);
                 // half a head per block (a whole head at 512 threads measured slower: 2,305 vs 2,380 a second on 8K)
-                k_ssd_state<32, 256><<<dim3(kMHeads, 2), 256, 0, stream>>>(B->xbc, B->ssd_dt, B->ssd_acs, B->ssd_ea, b.ssm, B->y, T, nc);
+                // (on the BF16 matrix cores, fp32 values as high part + remainder; NEMO_SSD_FP32=1: the fp32 walk)
+                if (ssd_fp32) k_ssd_state<32, 256><<<dim3(kMHeads, 2), 256, 0, stream>>>(B->xbc, B->ssd_dt, B->ssd_acs, B->ssd_ea, b.ssm, B->y, T, nc);
+                else k_ssd_wm<2><<<kMHeads / 2, 256, 0, stream>>>(B->xbc, B->ssd_dt, B->ssd_acs, B->ssd_ea, b.ssm, B->y, T, nc);
             }
         }
         else k_mamba_scan<<<dim3(kMHeads, kScanSlices), kMState, 0, stream>>>(B->xbc, B->proj, b.A_log, b.D, b.dt_bias, b.ssm, B->y, T, T);
