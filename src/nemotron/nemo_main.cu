@@ -128,6 +128,38 @@ __global__ void k_add(float* a, const float* b, int n) {
 __global__ void k_axpy(float* a, const float* b, float w, int n) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) a[i] += w * b[i];
 }
+// row r of logits: -log p(next[r]) and whether it is the top token, added to acc[0], acc[1] (rows), acc[2] (top-1);
+// rows with no next token (left <= r) are skipped
+__global__ void __launch_bounds__(1024) k_nll_rows(const float* logits, int V, const int32_t* next, int left, double* acc) {
+    __shared__ float sm[1024], ss[1024];
+    __shared__ int si[1024];
+    const int r = blockIdx.x;
+    if (r >= left) return;
+    const float* x = logits + size_t(r) * V;
+    float m = -INFINITY; int mi = 0;
+    for (int i = threadIdx.x; i < V; i += 1024) if (x[i] > m) { m = x[i]; mi = i; }
+    sm[threadIdx.x] = m; si[threadIdx.x] = mi;
+    __syncthreads();
+    for (int o = 512; o > 0; o >>= 1) {
+        if (threadIdx.x < o && sm[threadIdx.x + o] > sm[threadIdx.x]) { sm[threadIdx.x] = sm[threadIdx.x + o]; si[threadIdx.x] = si[threadIdx.x + o]; }
+        __syncthreads();
+    }
+    const float M = sm[0];
+    float z = 0.f;
+    for (int i = threadIdx.x; i < V; i += 1024) z += expf(x[i] - M);
+    ss[threadIdx.x] = z;
+    __syncthreads();
+    for (int o = 512; o > 0; o >>= 1) {
+        if (threadIdx.x < o) ss[threadIdx.x] += ss[threadIdx.x + o];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const int tgt = next[r];
+        atomicAdd(&acc[0], double(M) + log(double(ss[0])) - double(x[tgt]));
+        atomicAdd(&acc[1], 1.0);
+        atomicAdd(&acc[2], si[0] == tgt ? 1.0 : 0.0);
+    }
+}
 __global__ void k_relu2(float* a, int n) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) { float v = fmaxf(a[i], 0.f); a[i] = v * v; }
 }
@@ -898,6 +930,9 @@ struct Model {
         int32_t* hbounds;             // pinned host copy of bounds
         int32_t* ccnt;                // the sort's per-chunk expert counts / offsets
         cudaEvent_t counted;          // bounds copied to hbounds
+        int32_t *mtiles, *mtiles_n;   // the matrix-core expert kernel's work list
+        uint16_t *lat16, *exh;        // its inputs in the scaled FP16 form, and their scales
+        float *lats, *exs;
         int32_t* small_bounds;        // {0, T} for T <= kTMax, at 2 T
         void *xq, *xq2;
         strata::prefill::Gemm gemm;
@@ -930,6 +965,9 @@ struct Model {
         CK(cudaMallocHost(&B->hbounds, 513 * 4));
         CK(cudaMalloc(&B->ccnt, (S / kSortChunk + 1) * 512 * 4));
         CK(cudaEventCreateWithFlags(&B->counted, cudaEventDisableTiming));
+        CK(cudaMalloc(&B->mtiles, 2 * strata::kernels::moe_wmma_max_tiles(S, 512) * 4)); CK(cudaMalloc(&B->mtiles_n, 4));
+        CK(cudaMalloc(&B->lat16, T * kLatent * 2)); f(&B->lats, T * kLatent / 128);
+        CK(cudaMalloc(&B->exh, S * 2560 * 2)); f(&B->exs, S * 2560 / 128);
         {
             std::vector<int32_t> sb(2 * (kTMax + 1));
             for (int t = 0; t <= kTMax; ++t) { sb[2 * t] = 0; sb[2 * t + 1] = t; }
@@ -980,7 +1018,10 @@ struct Model {
     }
 
     bool ssd_old = std::getenv("NEMO_SSD_OLD") != nullptr;
-    bool sh_mmq = std::getenv("NEMO_SH_MMQ") != nullptr;     // the shared expert through MMQ (before: BF16 GEMM)   // the three-kernel state hand-off, for comparison
+    bool sh_mmq = std::getenv("NEMO_SH_MMQ") != nullptr;
+    // routed experts on the FP16 matrix cores (strata::kernels::moe_wmma_iq2xxs); NEMO_MOE_MMQ = llama.cpp's MMQ.
+    // 8K README: perplexity 4.5585 vs 4.5630, 2,675 vs 2,484 tokens a second
+    bool moe_wmma = std::getenv("NEMO_MOE_MMQ") == nullptr;     // the shared expert through MMQ (before: BF16 GEMM)   // the three-kernel state hand-off, for comparison
     void mamba_big(Block& b, int T) {
         nvfp4_big(b.in_w, b.in_s, b.in_s2, B->n, B->proj, T, kInProj, kHidden);
         k_mamba_conv_tiles<<<dim3((kConvDim + 255) / 256, (T + kConvTile - 1) / kConvTile), 256, 0, stream>>>(B->proj, b.conv_state, b.conv_w, b.conv_b, B->xbc, T);
@@ -1035,6 +1076,80 @@ struct Model {
         mmq_dense(b.o, 8, B->y, B->d, T, kHidden, kAHeads * kAHeadDim);
     }
 
+    // debug (NEMO_MW_CHECK): the matrix-core expert outputs (exu after relu^2 is applied inside the down call, so up's
+    // raw output and the final exd) against llama.cpp's MMQ path on the same inputs, per row
+    void mw_check(Block& b, int T, int S, int W) {
+        namespace mq = strata::prefill::mmq;
+        std::vector<float> u1(size_t(S) * W), d1(size_t(S) * kLatent), u2(u1.size()), d2(d1.size());
+        {   // the matrix cores' up output: relu^2 in the scaled FP16 form -> fp32 (sqrt back for the comparisons below)
+            std::vector<uint16_t> h(size_t(S) * W); std::vector<float> sc(size_t(S) * W / 128);
+            CK(cudaStreamSynchronize(stream));
+            CK(cudaMemcpy(h.data(), B->exh, h.size() * 2, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(sc.data(), B->exs, sc.size() * 4, cudaMemcpyDeviceToHost));
+            for (size_t i = 0; i < h.size(); ++i) { const float v = __half2float(__ushort_as_half(h[i])) * sc[i / 128]; u1[i] = std::sqrt(std::max(v, 0.f)); }
+        }
+        std::vector<int32_t> hb(b.n_exp + 1);
+        CK(cudaStreamSynchronize(stream));
+        CK(cudaMemcpy(d1.data(), B->exd, d1.size() * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(hb.data(), B->bounds, hb.size() * 4, cudaMemcpyDeviceToHost));
+        int maxr = 1;
+        for (int e = 0; e < b.n_exp; ++e) maxr = std::max(maxr, hb[e + 1] - hb[e]);
+        mq::quantize(B->lat, B->src, B->xq, kIQ2_XXS, kLatent, kLatent, S, stream);
+        mq::Product up;
+        up.w = b.up_all; up.type = kIQ2_XXS; up.w_rows = W; up.w_cols = kLatent; up.expert_bytes = b.up_bytes;
+        up.n = b.n_exp; up.xq = B->xq; up.bounds = B->bounds; up.ids = B->ident; up.total_rows = S; up.max_rows = maxr;
+        up.dst = B->exu; up.ld_dst = W;
+        B->mmq.run(up, stream);
+        CK(cudaStreamSynchronize(stream));
+        CK(cudaMemcpy(u2.data(), B->exu, u2.size() * 4, cudaMemcpyDeviceToHost));
+        k_relu2<<<1024, 256, 0, stream>>>(B->exu, size_t(S) * W);
+        mq::quantize(B->exu, nullptr, B->xq, kIQ2_XXS, W, W, S, stream);
+        mq::Product dn = up;
+        dn.w = b.down_all; dn.w_rows = kLatent; dn.w_cols = W; dn.expert_bytes = b.down_bytes; dn.dst = B->exd; dn.ld_dst = kLatent;
+        B->mmq.run(dn, stream);
+        CK(cudaStreamSynchronize(stream));
+        CK(cudaMemcpy(d2.data(), B->exd, d2.size() * 4, cudaMemcpyDeviceToHost));
+        auto rel = [](const float* a, const float* b, int n) { double x = 0, y = 0; for (int i = 0; i < n; ++i) { x += double(a[i] - b[i]) * (a[i] - b[i]); y += double(b[i]) * b[i]; } return std::sqrt(x / (y + 1e-30)); };
+        int bad = 0; double su = 0, sd = 0;
+        for (int e = 0; e < b.n_exp; ++e)
+            for (int r = hb[e]; r < hb[e + 1]; ++r) {
+                const double eu = rel(&u1[size_t(r) * W], &u2[size_t(r) * W], W), ed = rel(&d1[size_t(r) * kLatent], &d2[size_t(r) * kLatent], kLatent);
+                su += eu; sd += ed;
+                if ((eu > 0.03 || ed > 0.05) && bad++ < 8) std::fprintf(stderr, "mw_check: expert %d row %d of %d: up %.4f down %.4f\n", e, r - hb[e], hb[e + 1] - hb[e], eu, ed);
+            }
+        std::fprintf(stderr, "mw_check: W %d, %d rows: mean up %.4f, down %.4f, %d rows off\n", W, S, su / S, sd / S, bad);
+        // exact down products (fp64 on the host, each path's own up output as the input) for the first 48 rows
+        static int layer = 0;
+        if (layer++ < 3) {
+            std::vector<float> wd(size_t(kLatent) * W);
+            float* dw = nullptr;
+            CK(cudaMalloc(&dw, wd.size() * 4));
+            double e1 = 0, e2 = 0; int n = 0;
+            for (int e = 0; e < b.n_exp && n < 48; ++e) {
+                if (hb[e + 1] == hb[e]) continue;
+                strata::kernels::iq_dequant_f32(kIQ2_XXS, (const uint8_t*) b.down_all + size_t(e) * b.down_bytes, int64_t(kLatent) * W, dw, stream);
+                CK(cudaStreamSynchronize(stream));
+                CK(cudaMemcpy(wd.data(), dw, wd.size() * 4, cudaMemcpyDeviceToHost));
+                for (int r = hb[e]; r < hb[e + 1] && n < 48; ++r, ++n) {
+                    double x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+                    for (int o = 0; o < kLatent; ++o) {
+                        double r1 = 0, r2 = 0;
+                        for (int q = 0; q < W; ++q) {
+                            const double a1 = std::max(0.f, u1[size_t(r) * W + q]), a2 = std::max(0.f, u2[size_t(r) * W + q]);
+                            r1 += double(wd[size_t(o) * W + q]) * a1 * a1;
+                            r2 += double(wd[size_t(o) * W + q]) * a2 * a2;
+                        }
+                        x1 += (d1[size_t(r) * kLatent + o] - r1) * (d1[size_t(r) * kLatent + o] - r1); y1 += r1 * r1;
+                        x2 += (d2[size_t(r) * kLatent + o] - r2) * (d2[size_t(r) * kLatent + o] - r2); y2 += r2 * r2;
+                    }
+                    e1 += std::sqrt(x1 / (y1 + 1e-30)); e2 += std::sqrt(x2 / (y2 + 1e-30));
+                }
+            }
+            CK(cudaFree(dw));
+            std::fprintf(stderr, "mw_check: exact down, %d rows: matrix cores %.5f, MMQ %.5f (mean relative error)\n", n, e1 / n, e2 / n);
+        }
+    }
+
     void moe_big(Block& b, int T) {
         namespace mq = strata::prefill::mmq;
         const int k = b.topk, W = b.width, S = T * k;
@@ -1043,12 +1158,14 @@ struct Model {
         B->gemm.bf16(B->xb, b.router, B->scores, T, b.n_exp, kHidden);
         k_route_many<<<T, 512, 0, stream>>>(B->scores, b.bias_dev, b.n_exp, k, B->ridx, B->rw);
         sort_slots(B->ridx, S, k, b.n_exp);
-        CK(cudaMemcpyAsync(B->hbounds, B->bounds, (b.n_exp + 1) * 4, cudaMemcpyDeviceToHost, stream));
-        CK(cudaEventRecord(B->counted, stream));
+        if (!moe_wmma) {
+            CK(cudaMemcpyAsync(B->hbounds, B->bounds, (b.n_exp + 1) * 4, cudaMemcpyDeviceToHost, stream));
+            CK(cudaEventRecord(B->counted, stream));
+        }
         // the work that does not need the counts goes in before the host waits for them, so the card is not left
         // idle while the host launches the rest (a stream sync here cost ~0.25 ms of idle card a layer)
         mmq_dense(b.fc1, 8, B->n, B->lat, T, kLatent, kHidden);
-        mq::quantize(B->lat, B->src, B->xq, kIQ2_XXS, kLatent, kLatent, S, stream);
+        if (!moe_wmma) mq::quantize(B->lat, B->src, B->xq, kIQ2_XXS, kLatent, kLatent, S, stream);
         if (sh_mmq) {
             mmq_dense(b.sh_up, kIQ2_XXS, B->n, B->tmp, T, kShared, kHidden);
             k_relu2<<<1024, 256, 0, stream>>>(B->tmp, size_t(T) * kShared);
@@ -1061,6 +1178,19 @@ struct Model {
             k_relu2_to_bf16<<<1024, 256, 0, stream>>>(B->tmp, B->xb, size_t(T) * kShared);
             strata::kernels::iq_dequant_bf16(kIQ2_XXS, b.sh_down, int64_t(kHidden) * kShared, B->gemm.scratch(), stream);
             B->gemm.bf16(B->xb, B->gemm.scratch(), B->tmp2, T, kHidden, kShared);
+        }
+        if (moe_wmma) {
+            // the routed experts on the matrix cores, their work list built on the card (no host wait at all)
+            // (inputs in a scaled FP16 form: the latent rows once, the up outputs written in it with relu^2 applied)
+            strata::kernels::moe_x16_rows(B->lat, int64_t(T) * kLatent, B->lat16, B->lats, stream);
+            strata::kernels::moe_wmma_iq2xxs(b.up_all, b.up_bytes, b.n_exp, W, kLatent, B->lat16, B->lats, B->src, B->bounds, S,
+                                             B->mtiles, B->mtiles_n, true, nullptr, B->exh, B->exs, W, stream);
+            strata::kernels::moe_wmma_iq2xxs(b.down_all, b.down_bytes, b.n_exp, kLatent, W, B->exh, B->exs, nullptr, B->bounds, S,
+                                             B->mtiles, B->mtiles_n, false, B->exd, nullptr, nullptr, kLatent, stream);
+            if (std::getenv("NEMO_MW_CHECK")) mw_check(b, T, S, W);   // debug: against the MMQ path, then on with MMQ's
+            k_wsum_sorted<<<dim3(4, T), 256, 0, stream>>>(B->eo, B->exd, B->rowof, B->rw, k, kLatent);
+            mmq_dense(b.fc2, 8, B->eo, B->d, T, kHidden, kLatent);
+            return;
         }
         CK(cudaEventSynchronize(B->counted));
         int maxr = 1;
@@ -1080,6 +1210,11 @@ struct Model {
         k_wsum_sorted<<<dim3(4, T), 256, 0, stream>>>(B->eo, B->exd, B->rowof, B->rw, k, kLatent);
         mmq_dense(b.fc2, 8, B->eo, B->d, T, kHidden, kLatent);
     }
+
+    // --ppl: the text's ids on the card, their count, and the sums (negative log-likelihood, rows, top-1 hits)
+    const int32_t* ppl_ids = nullptr;
+    int ppl_n = 0;
+    double* ppl_acc = nullptr;
 
     // T (<= kTBig) prompt positions at pos, the state stored after them; returns the last position's logits
     std::vector<float> forward_big(const std::vector<int>& toks, std::vector<float>* dump = nullptr) {
@@ -1106,6 +1241,13 @@ struct Model {
                 CK(cudaMemcpyAsync(rows.data(), B->h, rows.size() * 4, cudaMemcpyDeviceToHost, stream));
                 CK(cudaStreamSynchronize(stream));
                 dump->insert(dump->end(), rows.begin(), rows.end());
+            }
+        }
+        if (ppl_ids) {   // quality measure: every row's log-probability of the text's next token (chunks of 8 rows)
+            for (int t0 = 0; t0 < T; t0 += 8) {
+                const int nt = std::min(8, T - t0);
+                q8_0(head, B->n + size_t(t0) * kHidden, logits, kHidden, kVocab, nt);
+                k_nll_rows<<<nt, 1024, 0, stream>>>(logits, kVocab, ppl_ids + pos + t0 + 1, ppl_n - (pos + t0 + 1), ppl_acc);
             }
         }
         std::vector<float> out;
@@ -1420,6 +1562,7 @@ static int argmax(const float* p, int n) { return int(std::max_element(p, p + n)
 
 int main(int argc, char** argv) {
     std::string dir, ids_s, dump_path, mode = "plain", draft_dir;
+    bool ppl = false;
     int n_new = 0, ctx = 4096;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1431,7 +1574,8 @@ int main(int argc, char** argv) {
         else if (a == "--max-ctx") ctx = std::stoi(next());
         else if (a == "--mode") mode = next();
         else if (a == "--draft") draft_dir = next();
-        else { std::fprintf(stderr, "usage: strata-nemo --model DIR --ids 1,2,3 [--new N] [--dump FILE] [--max-ctx N] [--mode plain|small|onebyone|spec] [--draft DIR]\n"); return 2; }
+        else if (a == "--ppl") ppl = true;
+        else { std::fprintf(stderr, "usage: strata-nemo --model DIR --ids 1,2,3 [--new N] [--dump FILE] [--max-ctx N] [--mode plain|small|onebyone|spec] [--draft DIR] [--ppl]\n"); return 2; }
     }
     if (dir.empty() || ids_s.empty()) { std::fprintf(stderr, "strata-nemo: --model and --ids are needed\n"); return 2; }
     std::vector<int> ids;
@@ -1444,6 +1588,24 @@ int main(int argc, char** argv) {
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "strata-nemo: %.1f GB on the card in %.1f s\n", m.st.loaded / 1e9, load_s);
 
+    if (ppl) {   // how well the prompt path predicts each next token of the text (quality checks of numeric changes)
+        int32_t* d_ids = nullptr;
+        double* d_acc = nullptr;
+        CK(cudaMalloc(&d_ids, ids.size() * 4)); CK(cudaMalloc(&d_acc, 3 * 8));
+        CK(cudaMemcpy(d_ids, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemset(d_acc, 0, 3 * 8));
+        m.ppl_ids = d_ids; m.ppl_n = int(ids.size()); m.ppl_acc = d_acc;
+        for (size_t i = 0; i < ids.size(); i += kTBig) {
+            const std::vector<int> c(ids.begin() + i, ids.begin() + std::min(ids.size(), i + kTBig));
+            if (c.size() <= size_t(kTMax)) break;          // (the last few tokens: the small path has no scoring)
+            m.forward_big(c);
+            m.pos += int(c.size());
+        }
+        double acc[3];
+        CK(cudaMemcpy(acc, d_acc, sizeof(acc), cudaMemcpyDeviceToHost));
+        std::printf("ppl: %.0f tokens, mean NLL %.5f, perplexity %.4f, top-1 %.4f\n", acc[1], acc[0] / acc[1], std::exp(acc[0] / acc[1]), acc[2] / acc[1]);
+        return 0;
+    }
     // dump: positions in order, each the 88 block outputs then the logits (the reference's layout)
     const bool dumping = !dump_path.empty();
     std::vector<float> blocks_rows, logit_rows;

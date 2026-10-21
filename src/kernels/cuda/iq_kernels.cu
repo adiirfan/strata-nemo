@@ -3818,4 +3818,287 @@ void iq_mmvq_rows(int ggml_type, const void* w, const void* x_q8_1, float* y, in
     else mmvq_rows_kernel<16, 4, 8, true><<<(n_out + 15) / 16, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
 }
 
+// ---------------------------------------------------------------- IQ2_XXS experts on the matrix cores (gfx12)
+// Y[r][o] = sum_k W_e[o][k] X[r][k] for the rows r of each expert e (rows sorted by expert: bounds[e] .. bounds[e+1]),
+// one block per (128 outputs, 64 rows of one expert) from a tile list (moe_tiles), so no block is launched for rows
+// an expert does not have. Weights: an IQ2_XXS 32-value sub-block is a scale d (0.5 + ls) / 4 times integers in
+// {8, 25, 43} with signs; times 2^8 they are rounded to FP16 (11 bits) as they are unpacked into LDS. Activations: a
+// scaled FP16 form, one power-of-two scale per 128 values (exact) and the values rounded to 11 bits. The FP16 matrix
+// cores sum each 128-value chunk in fp32, which is then multiplied by its activation scale (and 2^-8) into the
+// result. (llama.cpp's MMQ rounds the activations to 8-bit integers per 32; scaling each 32-value sub-block's partial
+// product instead of rounding the weights cost twice the time - the scaling ran on the same units as the products.)
+// MODE: X rows are x[src[r]] when src is given.
+namespace {
+constexpr int kMwBM = 128, kMwBN = 64, kMwBK = 64, kMwLD = kMwBK + 8;   // outputs, rows, k a step, LDS row (fp16; 128 a step measured slower)
+constexpr int kMwXC = 128;                                         // activation values per scale
+typedef _Float16 mw_v8h __attribute__((ext_vector_type(8)));
+typedef float mw_v8f __attribute__((ext_vector_type(8)));
+typedef _Float16 mw_v2h __attribute__((ext_vector_type(2)));
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define STRATA_MW_GFX12 1
+#else
+#define STRATA_MW_GFX12 0
+#endif
+__device__ __forceinline__ mw_v8f mw_wmma(const mw_v8h& a, const mw_v8h& b, const mw_v8f& c) {
+#if STRATA_MW_GFX12
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#else
+    __trap();
+    return c;
+#endif
+}
+__device__ __forceinline__ uint32_t mw_h(float f) { return __half_as_ushort(__float2half_rn(f)); }
+// a block barrier ordering LDS only: __syncthreads' workgroup fence also covers global memory, which on gfx12 (a work
+// group spans two compute units) invalidates the vector caches at every step
+__device__ __forceinline__ void mw_sync() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+// two FP16 lanes times one FP16 scale (packed)
+__device__ __forceinline__ uint32_t mw_mul2(uint32_t v, mw_v2h s) {
+    const mw_v2h r = __builtin_bit_cast(mw_v2h, v) * s;
+    return __builtin_bit_cast(uint32_t, r);
+}
+// the power of two at or below m (1 for 0) and its inverse: x * inv is exact and below 2 in magnitude
+__device__ __forceinline__ void mw_pow2(float m, float& sc, float& inv) {
+    const uint32_t eb = __float_as_uint(m) & 0x7f800000u;
+    sc = eb ? __uint_as_float(eb) : 1.f;
+    inv = eb ? __uint_as_float((254u << 23) - eb) : 1.f;
+}
+
+// X: FP16 rows (xh, row stride K) with one scale per 128 values (xs, row stride K / 128), the rows x[src[r]] when src
+// is given. OUT 0: y fp32 (row stride ldy); OUT 1: relu(y)^2 in the same scaled FP16 form (yh, ys; row stride ldy).
+// NT threads; NWM x NWN warps, each TA x TB WMMA tiles (outputs x rows); kMwBM = NWM * TA * 16, kMwBN = NWN * TB * 16
+template <int OUT, int NT, int NWM, int TA, int TB>
+__global__ void __launch_bounds__(NT) moe_wmma_iq2xxs_kernel(const uint8_t* __restrict__ w_all, size_t expert_bytes,
+                                                                int n_out, int K, const uint16_t* __restrict__ xh,
+                                                                const float* __restrict__ xs,
+                                                                const int32_t* __restrict__ src,
+                                                                const int32_t* __restrict__ bounds,
+                                                                const int32_t* __restrict__ tiles,
+                                                                const int32_t* __restrict__ n_tiles, float* __restrict__ y,
+                                                                uint16_t* __restrict__ yh, float* __restrict__ ys, int ldy) {
+    __shared__ __align__(16) uint16_t sw[kMwBM][kMwLD];           // the weights times 2^8, FP16
+    __shared__ __align__(16) uint16_t sx[kMwBN][kMwLD];           // activations / their scale, FP16
+    __shared__ float sxs[kMwBN];                                  // the current chunk's activation scales
+    __shared__ __align__(16) uint16_t sg[256][8];                 // iq2xxs_grid as FP16
+    __shared__ uint8_t ssn[128];                                  // ksigns_iq2xs
+    __shared__ int srow[kMwBN];                                   // the X row of each tile row
+    __shared__ float smax[4][kMwBN];                              // OUT 1: each warp row's largest output per row
+    static_assert(NWM * TA * 16 == kMwBM && (NT / 32 / NWM) * TB * 16 == kMwBN, "the warps cover the tile");
+    const int tile = blockIdx.y;
+    if (tile >= *n_tiles) return;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, l16 = lane & 15, g = lane >> 4;
+    const int e = tiles[2 * tile], j0 = tiles[2 * tile + 1];
+    const int r0 = bounds[e] + j0, rn = min(kMwBN, bounds[e + 1] - r0);
+    const int o0 = blockIdx.x * kMwBM;
+    for (int i = tid; i < 256 * 8; i += NT) sg[i / 8][i % 8] = (uint16_t) mw_h((float) ((const uint8_t*) iq2xxs_grid)[i]);
+    if (tid < 128) ssn[tid] = ksigns_iq2xs[tid];
+    if (tid < kMwBN) srow[tid] = tid < rn ? (src ? src[r0 + tid] : r0 + tid) : -1;
+    const size_t row_bytes = (size_t) (K / QK_K) * sizeof(block_iq2_xxs);
+    const uint8_t* we = w_all + (size_t) e * expert_bytes;
+    const int wm = warp % NWM, wn = warp / NWM;                   // warp: outputs wm * TA * 16 .., rows wn * TB * 16 ..
+    mw_v8f acc[TA][TB], ch[TA][TB];                               // the result; this 128-value chunk's sums
+#pragma unroll
+    for (int a = 0; a < TA; ++a)
+#pragma unroll
+        for (int b = 0; b < TB; ++b) acc[a][b] = mw_v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    // a step's global reads go to registers first, all issued before any is used, and the next step's are issued
+    // before this step's products, so the memory waits overlap the matrix work
+    constexpr int XI = kMwBN * (kMwBK / 8) / NT;                  // 16-byte activation loads per thread
+    constexpr int WI = kMwBM * (kMwBK / 32) / NT;                 // weight sub-blocks per thread
+    static_assert(kMwXC % kMwBK == 0, "a chunk is whole steps");
+    struct Regs { uint4 px[XI]; uint32_t pw0[WI], pw1[WI]; float pd[WI], pxs; };
+    Regs cur;
+    mw_sync();                                                    // srow
+    auto fetch = [&](int k0, Regs& r) {
+        if (k0 >= K) return;
+#pragma unroll
+        for (int j = 0; j < XI; ++j) {
+            const int i = tid + j * NT, t = i / (kMwBK / 8), c8 = i % (kMwBK / 8), row = srow[t];
+            r.px[j] = row >= 0 ? *reinterpret_cast<const uint4*>(xh + (int64_t) row * K + k0 + c8 * 8) : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int j = 0; j < WI; ++j) {
+            const int u = tid + j * NT, wrow = u / (kMwBK / 32), wsb = u % (kMwBK / 32);
+            const block_iq2_xxs* blk = (const block_iq2_xxs*) (we + (size_t) (o0 + wrow) * row_bytes) + k0 / QK_K;
+            const uint2 q = *reinterpret_cast<const uint2*>(blk->qs + 4 * ((k0 % QK_K) / 32 + wsb));
+            r.pw0[j] = q.x;
+            r.pw1[j] = q.y;
+            r.pd[j] = __half2float(blk->d);
+        }
+        r.pxs = 0.f;
+        if (tid < kMwBN && k0 % kMwXC == 0) {
+            const int xr = srow[tid];
+            r.pxs = xr >= 0 ? xs[(int64_t) xr * (K / kMwXC) + k0 / kMwXC] : 0.f;
+        }
+    };
+    fetch(0, cur);
+    for (int k0 = 0; k0 < K; k0 += kMwBK) {
+        mw_sync();                                                // (the tables, then the last step's reads)
+#pragma unroll
+        for (int j = 0; j < WI; ++j) {
+            const int u = tid + j * NT, wrow = u / (kMwBK / 32), wsb = u % (kMwBK / 32);
+            const uint32_t a0 = cur.pw0[j], a1 = cur.pw1[j];
+            const _Float16 sc = (_Float16) (cur.pd[j] * (0.5f + (float) (a1 >> 28)) * 64.f);   // * 0.25 * 2^8
+            const mw_v2h s2 = {sc, sc};
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const uint32_t sn = ssn[(a1 >> (7 * l)) & 127];
+                uint4 v = *reinterpret_cast<const uint4*>(sg[(a0 >> (8 * l)) & 255]);
+                v.x = mw_mul2(v.x ^ (((sn & 1u) << 15) | ((sn & 2u) << 30)), s2);
+                v.y = mw_mul2(v.y ^ (((sn & 4u) << 13) | ((sn & 8u) << 28)), s2);
+                v.z = mw_mul2(v.z ^ (((sn & 16u) << 11) | ((sn & 32u) << 26)), s2);
+                v.w = mw_mul2(v.w ^ (((sn & 64u) << 9) | ((sn & 128u) << 24)), s2);
+                *reinterpret_cast<uint4*>(&sw[wrow][wsb * 32 + l * 8]) = v;
+            }
+        }
+        if (tid < kMwBN && k0 % kMwXC == 0) sxs[tid] = cur.pxs;
+#pragma unroll
+        for (int j = 0; j < XI; ++j) {
+            const int i = tid + j * NT, t = i / (kMwBK / 8), c8 = i % (kMwBK / 8);
+            *reinterpret_cast<uint4*>(&sx[t][c8 * 8]) = cur.px[j];
+        }
+        mw_sync();
+        fetch(k0 + kMwBK, cur);
+        const bool first = k0 % kMwXC == 0, last = (k0 + kMwBK) % kMwXC == 0;
+#pragma unroll
+        for (int kk16 = 0; kk16 < kMwBK / 16; ++kk16) {
+            const int kk = kk16 * 16 + g * 8;
+            mw_v8h fa[TA], fb[TB];
+#pragma unroll
+            for (int a = 0; a < TA; ++a) fa[a] = *reinterpret_cast<const mw_v8h*>(&sw[(wm * TA + a) * 16 + l16][kk]);
+#pragma unroll
+            for (int b = 0; b < TB; ++b) fb[b] = *reinterpret_cast<const mw_v8h*>(&sx[(wn * TB + b) * 16 + l16][kk]);
+#pragma unroll
+            for (int a = 0; a < TA; ++a)
+#pragma unroll
+                for (int b = 0; b < TB; ++b)
+                    ch[a][b] = mw_wmma(fa[a], fb[b], (first && kk16 == 0) ? mw_v8f{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f} : ch[a][b]);
+        }
+        if (last) {
+#pragma unroll
+            for (int b = 0; b < TB; ++b) {
+                const float xsc = sxs[(wn * TB + b) * 16 + l16];
+#pragma unroll
+                for (int a = 0; a < TA; ++a) acc[a][b] += xsc * ch[a][b];
+            }
+        }
+    }
+    // this lane: outputs o0 + (wm * TA + a) * 16 + g * 8 + i, row r0 + (wn * TB + b) * 16 + l16 (results * 2^-8)
+    if (OUT == 0) {
+#pragma unroll
+        for (int b = 0; b < TB; ++b) {
+            const int t = (wn * TB + b) * 16 + l16;
+            if (t >= rn) continue;
+#pragma unroll
+            for (int a = 0; a < TA; ++a) {
+                const mw_v8f v = acc[a][b] * (1.f / 256.f);
+                float* yr = y + (int64_t) (r0 + t) * ldy + o0 + (wm * TA + a) * 16 + g * 8;
+                *reinterpret_cast<float4*>(yr) = make_float4(v[0], v[1], v[2], v[3]);
+                *reinterpret_cast<float4*>(yr + 4) = make_float4(v[4], v[5], v[6], v[7]);
+            }
+        }
+    } else {
+        // relu^2; the block's 128 outputs of a row are one scaled chunk: each warp's largest (its lane and lane ^ 16),
+        // then the largest of the NWM warps through LDS
+        float m[TB];
+#pragma unroll
+        for (int b = 0; b < TB; ++b) {
+            m[b] = 0.f;
+#pragma unroll
+            for (int a = 0; a < TA; ++a)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float v = fmaxf(acc[a][b][i] * (1.f / 256.f), 0.f);
+                    acc[a][b][i] = v * v;
+                    m[b] = fmaxf(m[b], acc[a][b][i]);
+                }
+            m[b] = fmaxf(m[b], __shfl_xor_sync(0xffffffffu, m[b], 16, 32));
+            if (g == 0) smax[wm][(wn * TB + b) * 16 + l16] = m[b];
+        }
+        mw_sync();
+#pragma unroll
+        for (int b = 0; b < TB; ++b) {
+            const int t = (wn * TB + b) * 16 + l16;
+            float mx = smax[0][t];
+#pragma unroll
+            for (int w = 1; w < NWM; ++w) mx = fmaxf(mx, smax[w][t]);
+            float sc, inv;
+            mw_pow2(mx, sc, inv);
+            if (t >= rn) continue;
+            const int64_t r = r0 + t;
+#pragma unroll
+            for (int a = 0; a < TA; ++a) {
+                uint32_t p[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) p[i] = mw_h(acc[a][b][2 * i] * inv) | (mw_h(acc[a][b][2 * i + 1] * inv) << 16);
+                *reinterpret_cast<uint4*>(yh + r * ldy + o0 + (wm * TA + a) * 16 + g * 8) = make_uint4(p[0], p[1], p[2], p[3]);
+            }
+            if (wm == 0 && g == 0) ys[r * (ldy / kMwXC) + o0 / kMwXC] = sc;
+        }
+    }
+}
+
+// fp32 rows to the scaled FP16 form (one power-of-two scale per 128 values); a lane takes 4 values, a warp a scale
+__global__ void moe_x16_kernel(const float* __restrict__ x, int64_t n4, uint16_t* __restrict__ xh, float* __restrict__ xs) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i - (threadIdx.x & 31) < n4; i += (int64_t) gridDim.x * blockDim.x) {
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (i < n4) v = reinterpret_cast<const float4*>(x)[i];
+        float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o, 32));
+        float sc, inv;
+        mw_pow2(m, sc, inv);
+        if (i < n4) {
+            reinterpret_cast<uint2*>(xh)[i] = make_uint2(mw_h(v.x * inv) | (mw_h(v.y * inv) << 16), mw_h(v.z * inv) | (mw_h(v.w * inv) << 16));
+            if ((i & 31) == 0) xs[i >> 5] = sc;
+        }
+    }
+}
+
+// the (expert, first row) of every 64 rows of every expert (n_exp <= 512); *n_tiles = their count
+__global__ void __launch_bounds__(512) moe_tiles_kernel(const int32_t* __restrict__ bounds, int n_exp, int32_t* __restrict__ tiles,
+                                                        int32_t* __restrict__ n_tiles) {
+    __shared__ int sc[512];
+    const int e = threadIdx.x;
+    const int cnt = e < n_exp ? bounds[e + 1] - bounds[e] : 0, nt = (cnt + kMwBN - 1) / kMwBN;
+    sc[e] = nt;
+    __syncthreads();
+    for (int off = 1; off < 512; off <<= 1) {
+        const int v = e >= off ? sc[e - off] : 0;
+        __syncthreads();
+        sc[e] += v;
+        __syncthreads();
+    }
+    const int base = sc[e] - nt;
+    for (int i = 0; i < nt; ++i) { tiles[2 * (base + i)] = e; tiles[2 * (base + i) + 1] = i * kMwBN; }
+    if (e == 511) *n_tiles = sc[511];
+}
+}  // namespace
+
+int moe_wmma_max_tiles(int64_t rows, int n_exp) { return (int) ((rows + kMwBN - 1) / kMwBN) + n_exp; }
+
+void moe_x16_rows(const float* x, int64_t n, uint16_t* xh, float* xs, void* stream) {
+    if (n % kMwXC) { std::fprintf(stderr, "moe_x16_rows: n %% 128\n"); std::exit(1); }
+    const int64_t n4 = n / 4;
+    moe_x16_kernel<<<(unsigned) std::min<int64_t>((n4 + 255) / 256, 8192), 256, 0, (cudaStream_t) stream>>>(x, n4, xh, xs);
+    check("moe_x16_rows");
+}
+
+void moe_wmma_iq2xxs(const void* w_all, size_t expert_bytes, int n_exp, int n_out, int K, const uint16_t* xh, const float* xs,
+                     const int32_t* src, const int32_t* bounds, int64_t rows, int32_t* tiles, int32_t* n_tiles, bool make_tiles,
+                     float* y, uint16_t* yh, float* ys, int ldy, void* stream) {
+    if (n_out % kMwBM || K % QK_K || n_exp > 512 || (ys && ldy % kMwXC)) { std::fprintf(stderr, "moe_wmma_iq2xxs: bad shape\n"); std::exit(1); }
+    auto s = static_cast<cudaStream_t>(stream);
+    if (make_tiles) moe_tiles_kernel<<<1, 512, 0, s>>>(bounds, n_exp, tiles, n_tiles);
+    const dim3 grid(n_out / kMwBM, moe_wmma_max_tiles(rows, n_exp));
+    const auto* W = static_cast<const uint8_t*>(w_all);
+    // 8 warps of 2 x 2 tiles (4 warps of 4 x 2 measured slightly slower: 3.31 vs 3.28 ms a down call)
+    if (yh) moe_wmma_iq2xxs_kernel<1, 256, 4, 2, 2><<<grid, 256, 0, s>>>(W, expert_bytes, n_out, K, xh, xs, src, bounds, tiles, n_tiles, nullptr, yh, ys, ldy);
+    else moe_wmma_iq2xxs_kernel<0, 256, 4, 2, 2><<<grid, 256, 0, s>>>(W, expert_bytes, n_out, K, xh, xs, src, bounds, tiles, n_tiles, y, nullptr, nullptr, ldy);
+    check("moe_wmma_iq2xxs");
+}
+
 }  // namespace strata::kernels

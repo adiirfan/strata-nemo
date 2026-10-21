@@ -106,4 +106,15 @@ void relu2_quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, vo
 void iq_mmvq_rows(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, int rows_per_warp,
                   void* stream);
 
+/// Grouped IQ2_XXS expert products on the FP16 matrix cores (gfx12 only). X is in the scaled FP16 form of
+/// moe_x16_rows (xh: FP16 values / their scale, K a row; xs: one power-of-two scale per 128 values); for each expert e,
+/// rows bounds[e] .. bounds[e+1] of X (row src[r] if src) times its [n_out, K] matrix (at w_all + e * expert_bytes)
+/// into y (fp32, row stride ldy), or, with yh, relu(.)^2 of it into the same scaled FP16 form (yh, ys; row stride ldy).
+/// tiles (2 * moe_wmma_max_tiles ints) and n_tiles are the call's work list, built from bounds when make_tiles.
+int moe_wmma_max_tiles(int64_t rows, int n_exp);
+void moe_x16_rows(const float* x, int64_t n, uint16_t* xh, float* xs, void* stream);
+void moe_wmma_iq2xxs(const void* w_all, size_t expert_bytes, int n_exp, int n_out, int K, const uint16_t* xh, const float* xs,
+                     const int32_t* src, const int32_t* bounds, int64_t rows, int32_t* tiles, int32_t* n_tiles, bool make_tiles,
+                     float* y, uint16_t* yh, float* ys, int ldy, void* stream);
+
 }  // namespace strata::kernels
