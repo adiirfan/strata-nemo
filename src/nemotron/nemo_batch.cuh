@@ -719,6 +719,82 @@ __global__ void __launch_bounds__(512) k_sort_slots_par(const int32_t* idx, int 
     }
 }
 
+// The same sort (stable, so bitwise the same bounds / src / rowof) in three parallel steps; k_sort_slots_par walked
+// every slot once per expert thread, 1.8 ms on a 4,096-token chunk. Per 512-slot chunk the experts' counts; per
+// expert the running offsets over the chunks and the bounds; each slot's place = its expert's offset in its chunk +
+// the earlier slots of its chunk with the same expert.
+constexpr int kSortChunk = 512;
+__global__ void __launch_bounds__(512) k_sort_count(const int32_t* idx, int S, int n_exp, int32_t* ccnt) {
+    __shared__ int cnt[512];
+    const int tid = threadIdx.x, j = blockIdx.x * kSortChunk + tid;
+    cnt[tid] = 0;
+    __syncthreads();
+    if (j < S) atomicAdd(&cnt[idx[j]], 1);
+    __syncthreads();
+    if (tid < n_exp) ccnt[size_t(blockIdx.x) * 512 + tid] = cnt[tid];
+}
+__global__ void __launch_bounds__(512) k_sort_offsets(int32_t* ccnt, int nch, int n_exp, int32_t* bounds) {
+    __shared__ int sc[512];
+    const int e = threadIdx.x;
+    int tot = 0;
+    if (e < n_exp) for (int c = 0; c < nch; ++c) tot += ccnt[size_t(c) * 512 + e];
+    sc[e] = tot;
+    __syncthreads();
+    for (int off = 1; off < 512; off <<= 1) {                        // inclusive scan over the experts
+        const int v = e >= off ? sc[e - off] : 0;
+        __syncthreads();
+        sc[e] += v;
+        __syncthreads();
+    }
+    if (e < n_exp) {
+        int run = sc[e] - tot;
+        bounds[e] = run;
+        for (int c = 0; c < nch; ++c) { const int v = ccnt[size_t(c) * 512 + e]; ccnt[size_t(c) * 512 + e] = run; run += v; }
+    }
+    if (e == n_exp - 1) bounds[n_exp] = sc[e];
+}
+__global__ void __launch_bounds__(512) k_sort_place(const int32_t* idx, int S, int k, const int32_t* ccnt, int32_t* src, int32_t* rowof) {
+    __shared__ int sidx[kSortChunk];
+    const int tid = threadIdx.x, j = blockIdx.x * kSortChunk + tid;
+    sidx[tid] = j < S ? idx[j] : -1;
+    __syncthreads();
+    if (j >= S) return;
+    const int e = sidx[tid];
+    int r = ccnt[size_t(blockIdx.x) * 512 + e];
+    for (int i = 0; i < tid; ++i) r += sidx[i] == e;
+    src[r] = j / k;
+    rowof[j] = r;
+}
+
+// k_mamba_conv_many for a prompt chunk, kConvTile positions per thread (the serial one walked all T positions of a
+// channel on one thread: 0.94 ms at T = 4,096). Each tile starts from the three inputs before it (the stored state
+// for the first). The same sums, so the same outputs; the state after T is written by k_conv_state_set (after this
+// kernel: the first tile reads the old state).
+constexpr int kConvTile = 64;
+__global__ void k_mamba_conv_tiles(const float* proj, const float* state, const uint16_t* cw, const uint16_t* cb, float* out, int T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= kConvDim) return;
+    const int t0 = blockIdx.y * kConvTile, t1 = min(T, t0 + kConvTile);
+    const float* st = state + size_t(c) * (kConvK - 1);
+    auto in = [&](int t) { return t < 0 ? st[t + 3] : proj[size_t(t) * kInProj + kMInter + c]; };
+    float v0 = in(t0 - 3), v1 = in(t0 - 2), v2 = in(t0 - 1);
+    const float w0 = bf16f(cw[c * kConvK]), w1 = bf16f(cw[c * kConvK + 1]), w2 = bf16f(cw[c * kConvK + 2]), w3 = bf16f(cw[c * kConvK + 3]);
+    const float b = bf16f(cb[c]);
+    for (int t = t0; t < t1; ++t) {
+        const float x = proj[size_t(t) * kInProj + kMInter + c];
+        const float a = b + w0 * v0 + w1 * v1 + w2 * v2 + w3 * x;
+        out[size_t(t) * kConvDim + c] = a / (1.f + expf(-a));
+        v0 = v1; v1 = v2; v2 = x;
+    }
+}
+// the conv state after T >= 3 positions: their last three inputs
+__global__ void k_conv_state_set(const float* proj, float* state, int T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= kConvDim) return;
+    float* st = state + size_t(c) * (kConvK - 1);
+    for (int i = 0; i < 3; ++i) st[i] = proj[size_t(T - 3 + i) * kInProj + kMInter + c];
+}
+
 // ---- attention v2 ----------------------------------------------------------------------------------------------
 // Writing / small steps: query head h, split z. The keys go in runs of kDecRun at fixed positions, run c to split
 // c % splits, so every split has work at any context length (256-key splits left most blocks empty and the rest

@@ -896,6 +896,8 @@ struct Model {
         float *ssd_dt, *ssd_acs, *ssd_ea, *ssd_cb, *ssd_S;   // the SSD Mamba path
         int32_t *ridx, *bounds, *src, *rowof, *ident, *one_bounds, *toks;
         int32_t* hbounds;             // pinned host copy of bounds
+        int32_t* ccnt;                // the sort's per-chunk expert counts / offsets
+        cudaEvent_t counted;          // bounds copied to hbounds
         int32_t* small_bounds;        // {0, T} for T <= kTMax, at 2 T
         void *xq, *xq2;
         strata::prefill::Gemm gemm;
@@ -926,6 +928,8 @@ struct Model {
         CK(cudaMalloc(&B->rowof, S * 4)); CK(cudaMalloc(&B->ident, S * 4)); CK(cudaMalloc(&B->one_bounds, 2 * 4));
         CK(cudaMalloc(&B->toks, kTBig * 4));
         CK(cudaMallocHost(&B->hbounds, 513 * 4));
+        CK(cudaMalloc(&B->ccnt, (S / kSortChunk + 1) * 512 * 4));
+        CK(cudaEventCreateWithFlags(&B->counted, cudaEventDisableTiming));
         {
             std::vector<int32_t> sb(2 * (kTMax + 1));
             for (int t = 0; t <= kTMax; ++t) { sb[2 * t] = 0; sb[2 * t + 1] = t; }
@@ -938,7 +942,16 @@ struct Model {
         std::string err;
         if (!B->gemm.init(stream, std::max<int64_t>(int64_t(kInProj) * kHidden, int64_t(kHidden) * kAux), err)) { std::fprintf(stderr, "strata-nemo: %s\n", err.c_str()); std::exit(1); }
         if (!strata::prefill::mmq::built()) { std::fprintf(stderr, "strata-nemo: this build has no MMQ\n"); std::exit(1); }
+        // one product now, so the library's first-use set-up (~0.4 s) is not paid inside the first prompt
+        B->gemm.bf16(B->xb, B->gemm.scratch(), B->proj, kTBig, kInProj, kHidden, 0, 0.0f, 0, 1.0f);
         CK(cudaStreamSynchronize(stream));
+    }
+    // the chunk's slots sorted by expert into B->bounds / src / rowof (see k_sort_count)
+    void sort_slots(const int32_t* idx, int S, int k, int n_exp) {
+        const int nch = (S + kSortChunk - 1) / kSortChunk;
+        k_sort_count<<<nch, 512, 0, stream>>>(idx, S, n_exp, B->ccnt);
+        k_sort_offsets<<<1, 512, 0, stream>>>(B->ccnt, nch, n_exp, B->bounds);
+        k_sort_place<<<nch, 512, 0, stream>>>(idx, S, k, B->ccnt, B->src, B->rowof);
     }
 
     // Y[T, N] = X[T, K] . W^T through MMQ, W one matrix of `type` (dense: one "expert" with all T rows)
@@ -957,18 +970,19 @@ struct Model {
         p.dst = Y; p.ld_dst = N;
         B->mmq.run(p, stream);
     }
-    // NVFP4 projection: unpacked to BF16 (exact) in the GEMM scratch, X to BF16, hipBLASLt, then times scale_2
+    // NVFP4 projection: unpacked to BF16 (exact) in the GEMM scratch, X to BF16, hipBLASLt times scale_2 (its alpha:
+    // the same bits as scaling the fp32 product after, without the extra pass)
     void nvfp4_big(const uint8_t* w, const uint8_t* sc, float s2, const float* X, float* Y, int T, int rows, int K) {
         const size_t nb = size_t(rows) * K / 2;
         k_nvfp4_to_bf16<<<2048, 256, 0, stream>>>(w, sc, B->gemm.scratch(), nb);
         k_to_bf16<<<1024, 256, 0, stream>>>(X, B->xb, size_t(T) * K);
-        B->gemm.bf16(B->xb, B->gemm.scratch(), Y, T, rows, K);
-        k_scale<<<1024, 256, 0, stream>>>(Y, s2, size_t(T) * rows);
+        B->gemm.bf16(B->xb, B->gemm.scratch(), Y, T, rows, K, 0, 0.0f, 0, s2);   // scale_2 as the product's alpha
     }
 
     void mamba_big(Block& b, int T) {
         nvfp4_big(b.in_w, b.in_s, b.in_s2, B->n, B->proj, T, kInProj, kHidden);
-        k_mamba_conv_many<<<(kConvDim + 255) / 256, 256, 0, stream>>>(B->proj, b.conv_state, b.conv_w, b.conv_b, B->xbc, T, T);
+        k_mamba_conv_tiles<<<dim3((kConvDim + 255) / 256, (T + kConvTile - 1) / kConvTile), 256, 0, stream>>>(B->proj, b.conv_state, b.conv_w, b.conv_b, B->xbc, T);
+        k_conv_state_set<<<(kConvDim + 255) / 256, 256, 0, stream>>>(B->proj, b.conv_state, T);
         // the step-by-step scan measured faster than this first SSD kernel (1,499 vs 1,065 a second on a 4K prompt)
         if (std::getenv("NEMO_SSD1")) k_mamba_ssd<<<dim3(kMHeads, kMHeadDim / 16), 256, 0, stream>>>(B->xbc, B->proj, b.A_log, b.D, b.dt_bias, b.ssm, B->y, T);
         else if (!std::getenv("NEMO_SEQ_SCAN") && T > 64) {
@@ -1019,13 +1033,19 @@ struct Model {
         // the router through hipBLASLt (its weights are BF16 already)
         B->gemm.bf16(B->xb, b.router, B->scores, T, b.n_exp, kHidden);
         k_route_many<<<T, 512, 0, stream>>>(B->scores, b.bias_dev, b.n_exp, k, B->ridx, B->rw);
-        k_sort_slots_par<<<1, 512, 0, stream>>>(B->ridx, S, k, b.n_exp, B->bounds, B->src, B->rowof);
+        sort_slots(B->ridx, S, k, b.n_exp);
         CK(cudaMemcpyAsync(B->hbounds, B->bounds, (b.n_exp + 1) * 4, cudaMemcpyDeviceToHost, stream));
-        CK(cudaStreamSynchronize(stream));
-        int maxr = 1;
-        for (int e = 0; e < b.n_exp; ++e) maxr = std::max(maxr, B->hbounds[e + 1] - B->hbounds[e]);
+        CK(cudaEventRecord(B->counted, stream));
+        // the work that does not need the counts goes in before the host waits for them, so the card is not left
+        // idle while the host launches the rest (a stream sync here cost ~0.25 ms of idle card a layer)
         mmq_dense(b.fc1, 8, B->n, B->lat, T, kLatent, kHidden);
         mq::quantize(B->lat, B->src, B->xq, kIQ2_XXS, kLatent, kLatent, S, stream);
+        mmq_dense(b.sh_up, kIQ2_XXS, B->n, B->tmp, T, kShared, kHidden);
+        k_relu2<<<1024, 256, 0, stream>>>(B->tmp, size_t(T) * kShared);
+        mmq_dense(b.sh_down, kIQ2_XXS, B->tmp, B->tmp2, T, kHidden, kShared);
+        CK(cudaEventSynchronize(B->counted));
+        int maxr = 1;
+        for (int e = 0; e < b.n_exp; ++e) maxr = std::max(maxr, B->hbounds[e + 1] - B->hbounds[e]);
         mq::Product up;
         up.w = b.up_all; up.type = kIQ2_XXS; up.w_rows = W; up.w_cols = kLatent; up.expert_bytes = b.up_bytes;
         up.n = b.n_exp; up.xq = B->xq; up.bounds = B->bounds; up.ids = B->ident; up.total_rows = S; up.max_rows = maxr;
@@ -1040,9 +1060,6 @@ struct Model {
         B->mmq.run(dn, stream);
         k_wsum_sorted<<<dim3(4, T), 256, 0, stream>>>(B->eo, B->exd, B->rowof, B->rw, k, kLatent);
         mmq_dense(b.fc2, 8, B->eo, B->d, T, kHidden, kLatent);
-        mmq_dense(b.sh_up, kIQ2_XXS, B->n, B->tmp, T, kShared, kHidden);
-        k_relu2<<<1024, 256, 0, stream>>>(B->tmp, size_t(T) * kShared);
-        mmq_dense(b.sh_down, kIQ2_XXS, B->tmp, B->tmp2, T, kHidden, kShared);
     }
 
     // T (<= kTBig) prompt positions at pos, the state stored after them; returns the last position's logits
@@ -1404,6 +1421,7 @@ int main(int argc, char** argv) {
 
     const auto t0 = std::chrono::steady_clock::now();
     Model m(dir, ctx);
+    m.init_big();                              // the prompt path's buffers and library, before any prompt is timed
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "strata-nemo: %.1f GB on the card in %.1f s\n", m.st.loaded / 1e9, load_s);
 

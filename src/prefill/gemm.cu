@@ -295,7 +295,7 @@ int hipblaslt_solution_for(void* opaque_state, strata::prefill::hipblaslt::Input
 
 bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType type, const uint16_t* x,
                    const uint16_t* w, float* y, int64_t t, int64_t n, int64_t k, int64_t ldy, float beta,
-                   void* stream, int64_t ldx = 0) {
+                   void* stream, int64_t ldx = 0, float alpha = 1.0f) {
     auto* state = static_cast<HipLtState*>(opaque_state);
     if (!state || t <= 0 || n <= 0 || k <= 0 || t > INT_MAX || n > INT_MAX || k > INT_MAX || ldy > INT_MAX ||
         ldy < n) {
@@ -320,7 +320,6 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
     HipLtDescriptors desc;
     const hipDataType input_type = type == strata::prefill::hipblaslt::InputType::bf16 ? HIP_R_16BF : HIP_R_16F;
     if (!desc.init(input_type, (int) t, (int) n, (int) k, (int) ldy, (int) ldx)) return false;
-    const float alpha = 1.0f;
     const hipblasStatus_t status = hipblasLtMatmul(state->handle, desc.op, &alpha, w, desc.a, x, desc.b, &beta, y,
                                                    desc.c, y, desc.c, &resolved.algo, state->workspace,
                                                    state->workspace_bytes, (hipStream_t) stream);
@@ -714,22 +713,24 @@ bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, flo
 }
 
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
-                float beta, int64_t ldx) {
+                float beta, int64_t ldx, float scale) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+    // scale is the GEMM's alpha; the WMMA and FP16-image paths do not take one (they are skipped when scaled)
+    const bool scaled = scale != 1.0f;
     if (ldx <= K) ldx = 0;
 #ifdef STRATA_USE_HIP
     // #313 (opt-in STRATA_WMMA_GEMM=1; STRATA_WMMA_BF16=0 excludes bf16): RDNA3 / RDNA3.5 WMMA dense GEMM, before
     // hipBLASLt; it returns false for shapes it does not take (and off gfx11) and this falls through
     static const bool wmma_on = [] { const char* v = std::getenv("STRATA_WMMA_GEMM"); return v && v[0] != 0 && v[0] != '0'; }();
     static const bool bf16_on = [] { const char* v = std::getenv("STRATA_WMMA_BF16"); return !v || (v[0] != 0 && v[0] != '0'); }();
-    if (wmma_on && bf16_on && ldx == 0 && T >= 16 && (beta == 0.0f || beta == 1.0f) &&
+    if (!scaled && wmma_on && bf16_on && ldx == 0 && T >= 16 && (beta == 0.0f || beta == 1.0f) &&
         strata_wmma_gemm_bf16(X, W, Y, T, N, K, ldy, beta, stream_)) {
         return;
     }
 #endif
 #if defined(__HIPCC__)
-    if (f16_io_) {   // X is the FP16 image (set_act_f16); W goes through the dequantization scratch as FP16
+    if (f16_io_ && !scaled) {   // X is the FP16 image (set_act_f16); W goes through the dequantization scratch as FP16
         // the only accumulating BF16 product is the BF16X2 low part, which bf16x2_mode() turns off with this path
         if (beta != 0.0f) { std::fprintf(stderr, "prefill gemm: an accumulating BF16 GEMM on the FP16 prompt path\n"); std::exit(1); }
         const int64_t rows = std::min<int64_t>(N, scratch_elems_ / K);
@@ -742,10 +743,10 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         return;
     }
 #endif
-    const float alpha = 1.0f;
+    const float alpha = scale;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::bf16, X, W, Y, T, N, K, ldy,
-                      beta, stream_, ldx)) {
+                      beta, stream_, ldx, scale)) {
         STRATA_ABSORB_HIPBLAS_STICKY("hipBLASLt bf16");
         return;
     }
