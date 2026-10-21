@@ -547,6 +547,9 @@ struct Model {
     int32_t* route_idx;
     int32_t *g_n, *g_exp, *g_cnt, *g_tok, *g_slot;   // the step's expert groups
     void *q8, *q8b;
+    void* q8s = nullptr;                   // the shared expert's packed inputs (its own: it runs beside the routed path)
+    cudaStream_t stream2 = nullptr;         // the shared expert's stream in a small step
+    cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
     cudaStream_t stream = nullptr;
     int *d_toks = nullptr, *d_pos = nullptr, *h_tp = nullptr;   // [kTMax tokens, position of the first]
     // per Mamba layer: the window's projections and conv outputs, kept until the accepted count is known
@@ -655,6 +658,9 @@ struct Model {
         CK(cudaMalloc(&g_tok, T * 16 * 16 * 4)); CK(cudaMalloc(&g_slot, T * 16 * 16 * 4));
         CK(cudaMalloc(&q8, std::max(strata::kernels::native_q8_1_bytes(8192, 8), size_t(kTMax) * (kAux / 32) * 36)));   // up to 16 rows of 24,576 (the drafter's fc)
         CK(cudaMalloc(&q8b, size_t(T) * 16 * (2560 / 32) * 36));
+        CK(cudaMalloc(&q8s, size_t(kTMax) * (kShared / 32) * 36));
+        CK(cudaStreamCreateWithFlags(&stream2, cudaStreamNonBlocking));
+        CK(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming));
         reset();
     }
 
@@ -680,6 +686,11 @@ struct Model {
     void iq2(const void* w, const float* x, float* out, int n_in, int n_out, int T) {
         strata::kernels::quantize_q8_1_rows(x, T, n_in, q8, stream);
         iq2_q(w, q8, out, n_in, n_out, T);
+    }
+    bool sh_par = !std::getenv("NEMO_SH_PAR") || std::atoi(std::getenv("NEMO_SH_PAR")) != 0;   // shared expert on stream2
+    void iq2_q_on(const void* w, const void* xq, float* out, int n_in, int n_out, int T, cudaStream_t s) {
+        if (T > 1 && sh_nr) strata::kernels::iq_mmvq_rows(kIQ2_XXS, w, xq, out, n_in, n_out, T, sh_nr, s);
+        else strata::kernels::iq_mmvq(kIQ2_XXS, w, xq, out, n_in, n_out, T, s);
     }
     // the same from inputs already in q8_1
     void iq2_q(const void* w, const void* xq, float* out, int n_in, int n_out, int T) {
@@ -775,6 +786,17 @@ struct Model {
         if (T == 1) k_bf16_cols<<<(b.n_exp + 7) / 8, 256, 0, stream>>>(b.router, n, scores, kHidden, b.n_exp, T);
         else if (use_skinny) skinny(0, b.router, nullptr, 1.f, n, scores, kHidden, b.n_exp, T);
         else k_bf16_rows<<<(b.n_exp + 7) / 8, 256, 0, stream>>>(b.router, n, scores, kHidden, b.n_exp, T);
+        // the shared expert on the second stream, beside the routed path (they meet in the residual add): at these
+        // sizes each product is a few us of ramp around a few us of reading, and two chains overlap those
+        if (sh_par) {
+            CK(cudaEventRecord(ev_fork, stream));
+            CK(cudaStreamWaitEvent(stream2, ev_fork, 0));
+            strata::kernels::quantize_q8_1_rows(n, T, kHidden, q8s, stream2);
+            iq2_q_on(b.sh_up, q8s, tmp, kHidden, kShared, T, stream2);
+            strata::kernels::relu2_quantize_q8_1_rows(tmp, T, kShared, q8s, stream2);
+            iq2_q_on(b.sh_down, q8s, tmp2, kShared, kHidden, T, stream2);
+            CK(cudaEventRecord(ev_join, stream2));
+        }
         k_route_many<<<T, 512, 0, stream>>>(scores, b.bias_dev, b.n_exp, k, route_idx, route_w);
         q8_0(b.fc1, n, lat, kHidden, kLatent, T);
         strata::kernels::quantize_q8_1_rows(lat, T, kLatent, q8, stream);
@@ -794,9 +816,12 @@ struct Model {
         k_wsum_many<<<dim3(4, T), 256, 0, stream>>>(eo, ex_down, route_w, k, kLatent);
         q8_0(b.fc2, eo, d, kLatent, kHidden, T);
         // (llama.cpp's MMQ for these two at T = 8 measured slower: 46 vs 34 us a call)
-        iq2(b.sh_up, n, tmp, kHidden, kShared, T);
-        strata::kernels::relu2_quantize_q8_1_rows(tmp, T, kShared, q8, stream);
-        iq2_q(b.sh_down, q8, tmp2, kShared, kHidden, T);
+        if (sh_par) CK(cudaStreamWaitEvent(stream, ev_join, 0));
+        else {
+            iq2(b.sh_up, n, tmp, kHidden, kShared, T);
+            strata::kernels::relu2_quantize_q8_1_rows(tmp, T, kShared, q8, stream);
+            iq2_q(b.sh_down, q8, tmp2, kShared, kHidden, T);
+        }
         extra = tmp2;
     }
 
