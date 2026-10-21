@@ -10,7 +10,7 @@
 
 namespace strata::prefill::hipblaslt {
 
-enum class InputType : uint8_t { f16, bf16 };
+enum class InputType : uint8_t { f16, bf16, f8 };   // f8: E4M3 inputs, fp32 output (Gemm::fp8)
 
 struct TuningRow {
     InputType type = InputType::bf16;
@@ -79,13 +79,13 @@ public:
             int n = 0, k = 0, ldy = 0, t_bucket = 0, solution_id = -1;
             std::string extra;
             if (!(row >> type_name >> n >> k >> ldy >> t_bucket >> solution_id) || (row >> extra) ||
-                (type_name != "f16" && type_name != "bf16") || n <= 0 || k <= 0 || ldy < n || t_bucket <= 0 ||
+                (type_name != "f16" && type_name != "bf16" && type_name != "f8") || n <= 0 || k <= 0 || ldy < n || t_bucket <= 0 ||
                 solution_id < 0) {
                 err = "invalid tuning row at line " + std::to_string(line_number);
                 return false;
             }
             TuningRow parsed;
-            parsed.type = type_name == "f16" ? InputType::f16 : InputType::bf16;
+            parsed.type = type_name == "f16" ? InputType::f16 : type_name == "f8" ? InputType::f8 : InputType::bf16;
             parsed.n = n;
             parsed.k = k;
             parsed.ldy = ldy;

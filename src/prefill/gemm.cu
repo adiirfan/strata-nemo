@@ -477,6 +477,37 @@ const Fp8Plan& fp8_plan(Fp8Cache& cache, HipLtState& st, int t, int n, int k, in
     const int bucket = (t + 1023) / 1024 * 1024;
     Fp8Algo& fa = cache.algos[Fp8Key{bucket, n, k, ldy, bb}];
     if (!fa.ok) {
+        // the tuning table's solution for this shape first (f8 rows: measured fastest of all the library's FP8
+        // solutions at that bucket), checked for this t below like the heuristic's
+        // debug: STRATA_FP8_SOL="n:k:solution,..." overrides the table
+        int forced = -1;
+        if (const char* e = std::getenv("STRATA_FP8_SOL")) {
+            for (const char* q = e; *q;) {
+                int fn = 0, fk = 0, fs = 0;
+                if (std::sscanf(q, "%d:%d:%d", &fn, &fk, &fs) == 3 && fn == n && fk == k) forced = fs;
+                const char* c = std::strchr(q, ',');
+                if (!c) break;
+                q = c + 1;
+            }
+        }
+        const auto* row = st.table.closest(strata::prefill::hipblaslt::InputType::f8, n, k, ldy, bucket);
+        if (forced >= 0 || row) {
+            std::vector<int> ids{forced >= 0 ? forced : row->solution_id};
+            std::vector<hipblasLtMatmulHeuristicResult_t> cand;
+            if (hipblaslt_ext::getAlgosFromIndex(st.handle, ids, cand) == HIPBLAS_STATUS_SUCCESS && !cand.empty() &&
+                cand.front().state == HIPBLAS_STATUS_SUCCESS && hipblaslt_ext::getIndexFromAlgo(cand.front().algo) == ids[0]) {
+                size_t need = 0;
+                const float one = 1.0f;
+                hipblasLtMatmulAlgo_t algo = cand.front().algo;
+                if (hipblaslt_ext::matmulIsAlgoSupported(st.handle, p.op, &one, p.a, p.b, &beta, p.c, p.c, algo, need) ==
+                        HIPBLAS_STATUS_SUCCESS && need <= st.workspace_bytes) {
+                    fa.algo = algo;
+                    fa.ok = true;
+                }
+            }
+        }
+    }
+    if (!fa.ok) {
         // asked at the bucket's own size (layouts of `bucket` columns), then checked for this t below
         hipblasLtMatrixLayout_t bb_l = nullptr, bc_l = nullptr;
         hipblasLtMatmulPreference_t pref = nullptr;
