@@ -1261,7 +1261,7 @@ __global__ void __launch_bounds__(256) k_ssd_out(const float* xbc, const float* 
 
 // group-level versions: block = (group, Q-block); B (or C) is loaded once and the group's 16 heads go in turn
 __global__ void __launch_bounds__(256) k_ssd_intra2(const float* xbc, const float* CB, const float* dtv, const float* acs,
-                                                    const uint16_t* D, float* S, float* y, int T, int nc) {
+                                                    const uint16_t* D, float* S, float* y, int T, int nc, bool write_S = true) {
     __shared__ float Bs[kSq][kMState + 1], xs[kSq][kMHeadDim + 1], M[kSq][kSq + 1], w[kSq], at[kSq], cbt[kSq][kSq + 1];
     const int g = blockIdx.x, c = blockIdx.y, tid = threadIdx.x, c0 = c * kSq, nq = min(kSq, T - c0);
     for (int i = tid; i < kSq * kMState; i += 256) {
@@ -1303,6 +1303,7 @@ __global__ void __launch_bounds__(256) k_ssd_intra2(const float* xbc, const floa
                 for (int j = 0; j < 4; ++j) y[size_t(c0 + t) * kMInter + hd * kMHeadDim + pp + j] = a[i][j] + Dh * xs[t][pp + j];
             }
         }
+        if (!write_S) continue;                                       // (k_ssd_state does it)
         float* Sc = S + (size_t(hd) * nc + c) * kMState * kMHeadDim;
         {   // S (128 x 64) = sum_s w_s B_s x_s: thread = 4 states x 8 rows
             const int n0 = (tid / 8) * 4, pp = (tid % 8) * 8;
@@ -1358,6 +1359,75 @@ __global__ void __launch_bounds__(256) k_ssd_out2(const float* xbc, const float*
             }
         }
     }
+}
+
+// k_ssd_intra2's state part, k_ssd_pass and k_ssd_out2 in one: per (head, kSsdP rows of the head) a block walks the
+// Q-blocks in order with its slice of the state H (128 x kSsdP) in registers: each Q-block's outputs
+// y_t += e^(A_t) C_t . H, then H = e^(A_Q) H + S_c, S_c = sum_s w_s B_s x_s. The same sums in the same order as those
+// three kernels, so the same bits, without writing and re-reading every Q-block's state (0.5 GB a layer per 4,096
+// positions, ~7 ms).
+// P rows of a head per block, NT threads: NT / 128 threads per state column, each P * 128 / NT rows
+template <int P, int NT>
+__global__ void __launch_bounds__(NT) k_ssd_state(const float* xbc, const float* dtv, const float* acs, const float* ea,
+                                                   float* ssm, float* y, int T, int nc) {
+    constexpr int TPN = NT / kMState, PT = P / TPN;                   // threads per state column, rows per thread
+    __shared__ float Cs[kSq][kMState + 1], Hs[kMState][P + 1], xs[kSq][P], w[kSq], et[kSq];
+    const int hd = blockIdx.x, p0 = blockIdx.y * P, tid = threadIdx.x;
+    const int g = hd / (kMHeads / kMGroups);
+    const int n = tid / TPN, pp = (tid % TPN) * PT;                   // thread: state column n, rows pp .. pp + PT - 1
+    float* hp = ssm + size_t(hd) * kMHeadDim * kMState;               // ssm layout [p][n]
+    float H[PT];
+#pragma unroll
+    for (int j = 0; j < PT; ++j) H[j] = hp[size_t(p0 + pp + j) * kMState + n];
+    for (int c = 0; c < nc; ++c) {
+        const int c0 = c * kSq, nq = min(kSq, T - c0);
+        __syncthreads();                                              // the last Q-block's LDS reads are done
+#pragma unroll
+        for (int j = 0; j < PT; ++j) Hs[n][pp + j] = H[j];
+        for (int i = tid; i < kSq * kMState; i += NT) {
+            const int t = i / kMState, m = i % kMState;
+            Cs[t][m] = t < nq ? xbc[size_t(c0 + t) * kConvDim + kMInter + kMGroups * kMState + g * kMState + m] : 0.f;
+        }
+        for (int i = tid; i < kSq * P; i += NT) {
+            const int t = i / P, q = i % P;
+            xs[t][q] = t < nq ? xbc[size_t(c0 + t) * kConvDim + hd * kMHeadDim + p0 + q] : 0.f;
+        }
+        if (tid < kSq) {
+            const float at = tid < nq ? acs[size_t(c0 + tid) * kMHeads + hd] : 0.f;
+            const float aq = acs[size_t(c0 + nq - 1) * kMHeads + hd];
+            w[tid] = tid < nq ? expf(aq - at) * dtv[size_t(c0 + tid) * kMHeads + hd] : 0.f;
+            et[tid] = expf(at);
+        }
+        float bn[kSq];                                                // B_s[n] for this thread's column
+#pragma unroll
+        for (int t = 0; t < kSq; ++t) bn[t] = t < nq ? xbc[size_t(c0 + t) * kConvDim + kMInter + g * kMState + n] : 0.f;
+        __syncthreads();
+        static_assert(kSq * P == NT * 4, "outputs: 4 per thread");
+        {   // outputs (kSq x P) = C (kSq x 128) . H (128 x P): thread = 1 position x 4 rows
+            const int t = tid / (P / 4), q0 = (tid % (P / 4)) * 4;
+            float a[4] = {};
+            for (int m = 0; m < kMState; ++m) {
+                const float cv = Cs[t][m];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) a[j] += cv * Hs[m][q0 + j];
+            }
+            if (t < nq)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) y[size_t(c0 + t) * kMInter + hd * kMHeadDim + p0 + q0 + j] += et[t] * a[j];
+        }
+        float sc[PT] = {};
+#pragma unroll
+        for (int t = 0; t < kSq; ++t) {
+            const float bv = w[t] * bn[t];
+#pragma unroll
+            for (int j = 0; j < PT; ++j) sc[j] += bv * xs[t][pp + j];
+        }
+        const float e = ea[size_t(c) * kMHeads + hd];
+#pragma unroll
+        for (int j = 0; j < PT; ++j) H[j] = e * H[j] + sc[j];
+    }
+#pragma unroll
+    for (int j = 0; j < PT; ++j) hp[size_t(p0 + pp + j) * kMState + n] = H[j];
 }
 
 // commit: move the Mamba state forward over the first m <= kScanTile positions of a checked window (no outputs).

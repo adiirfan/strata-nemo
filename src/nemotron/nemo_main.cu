@@ -979,6 +979,7 @@ struct Model {
         B->gemm.bf16(B->xb, B->gemm.scratch(), Y, T, rows, K, 0, 0.0f, 0, s2);   // scale_2 as the product's alpha
     }
 
+    bool ssd_old = std::getenv("NEMO_SSD_OLD") != nullptr;   // the three-kernel state hand-off, for comparison
     void mamba_big(Block& b, int T) {
         nvfp4_big(b.in_w, b.in_s, b.in_s2, B->n, B->proj, T, kInProj, kHidden);
         k_mamba_conv_tiles<<<dim3((kConvDim + 255) / 256, (T + kConvTile - 1) / kConvTile), 256, 0, stream>>>(B->proj, b.conv_state, b.conv_w, b.conv_b, B->xbc, T);
@@ -990,9 +991,16 @@ struct Model {
             const int nc = (T + kSq - 1) / kSq;
             k_ssd_dt<<<dim3(kMHeads, nc), kSq, 0, stream>>>(B->proj, b.A_log, b.dt_bias, B->ssd_dt, B->ssd_acs, B->ssd_ea, T);
             k_ssd_cb<<<dim3(kMGroups, nc), 256, 0, stream>>>(B->xbc, B->ssd_cb, T);
-            k_ssd_intra2<<<dim3(kMGroups, nc), 256, 0, stream>>>(B->xbc, B->ssd_cb, B->ssd_dt, B->ssd_acs, b.D, B->ssd_S, B->y, T, nc);
-            k_ssd_pass<<<dim3(kMHeads, kMState * kMHeadDim / 256), 256, 0, stream>>>(B->ssd_S, B->ssd_ea, b.ssm, nc);
-            k_ssd_out2<<<dim3(kMGroups, nc), 256, 0, stream>>>(B->xbc, B->ssd_acs, B->ssd_S, B->y, T, nc);
+            if (ssd_old) {
+                k_ssd_intra2<<<dim3(kMGroups, nc), 256, 0, stream>>>(B->xbc, B->ssd_cb, B->ssd_dt, B->ssd_acs, b.D, B->ssd_S, B->y, T, nc);
+                k_ssd_pass<<<dim3(kMHeads, kMState * kMHeadDim / 256), 256, 0, stream>>>(B->ssd_S, B->ssd_ea, b.ssm, nc);
+                k_ssd_out2<<<dim3(kMGroups, nc), 256, 0, stream>>>(B->xbc, B->ssd_acs, B->ssd_S, B->y, T, nc);
+            } else {
+                // the outputs' own part, then the state walk adding the carried-in part (k_ssd_state)
+                k_ssd_intra2<<<dim3(kMGroups, nc), 256, 0, stream>>>(B->xbc, B->ssd_cb, B->ssd_dt, B->ssd_acs, b.D, B->ssd_S, B->y, T, nc, false);
+                // half a head per block (a whole head at 512 threads measured slower: 2,305 vs 2,380 a second on 8K)
+                k_ssd_state<32, 256><<<dim3(kMHeads, 2), 256, 0, stream>>>(B->xbc, B->ssd_dt, B->ssd_acs, B->ssd_ea, b.ssm, B->y, T, nc);
+            }
         }
         else k_mamba_scan<<<dim3(kMHeads, kScanSlices), kMState, 0, stream>>>(B->xbc, B->proj, b.A_log, b.D, b.dt_bias, b.ssm, B->y, T, T);
         k_gated_norm_many<<<dim3(kMGroups, T), 256, 0, stream>>>(B->y, B->proj, b.gnorm);
