@@ -177,9 +177,17 @@ def _image_source(part: dict) -> str:
     return url or ""
 
 
+def _image_detail(part: dict) -> str:
+    """OpenAI's image_url.detail ("low", "high", "auto"); "" when the part says nothing (Anthropic has no such field)."""
+    url = part.get("image_url")
+    detail = url.get("detail") if isinstance(url, dict) else part.get("detail")
+    return detail.strip().lower() if isinstance(detail, str) else ""
+
+
 def _parts_of(content):
     """Message content for the template: a string when there is no image (unchanged behaviour), otherwise the
-    template's list form - text items and image items, in order - whose image items carry their source."""
+    template's list form - text items and image items, in order - whose image items carry their source (and the
+    part's detail, when it gave one)."""
     if not _has_image(content):
         return _text_of(content)
     items = []
@@ -187,7 +195,11 @@ def _parts_of(content):
         if not isinstance(part, dict):
             continue
         if part.get("type") in IMAGE_PARTS:
-            items.append({"type": "image", "source": _image_source(part)})
+            item = {"type": "image", "source": _image_source(part)}
+            detail = _image_detail(part)
+            if detail:
+                item["detail"] = detail
+            items.append(item)
         elif part.get("type") in TEXT_PARTS and "text" in part:
             items.append({"type": "text", "text": part.get("text", "")})
     return items
@@ -229,6 +241,12 @@ def images_of(messages: list[dict]) -> list[str]:
     """The image sources of the rendered conversation, in prompt order (the template renders one
     <|vision_start|><|image_pad|><|vision_end|> per image item, message by message)."""
     return [item["source"] for m in messages if isinstance(m.get("content"), list)
+            for item in m["content"] if item.get("type") == "image"]
+
+
+def image_details_of(messages: list[dict]) -> list[str]:
+    """images_of()'s detail for each image, in the same order: "high", "low", "auto" or "" (none given)."""
+    return [item.get("detail", "") for m in messages if isinstance(m.get("content"), list)
             for item in m["content"] if item.get("type") == "image"]
 
 

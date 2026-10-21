@@ -2162,6 +2162,36 @@ void peer_scatter_add(float* sum, const float* rows, const float* wk, const int3
     peer_scatter_add_kernel<<<blocks_for(n * N), 256, 0, (cudaStream_t) stream>>>(sum, rows, wk, pair, n);
     check("peer_scatter_add");
 }
+// STRATA_PF_DM16: moe_combine4_kernel with the down rows in BF16 (four columns per thread, 8 bytes a slot)
+__global__ void moe_combine4_bf16_kernel(const uint16_t* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                         const float* __restrict__ w, const float4* __restrict__ shared,
+                                         const float* __restrict__ sg, float4* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * (N / 4)) return;
+    const int64_t t = i / (N / 4), d = (i % (N / 4)) * 4;
+    float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    uint2 v[10];
+    float ww[10];
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        ww[k] = w[t * 10 + k];
+        v[k] = *reinterpret_cast<const uint2*>(Dm + (int64_t) slot[t * 10 + k] * N + d);
+    }
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        s.x = fmaf(ww[k], __uint_as_float(v[k].x << 16), s.x); s.y = fmaf(ww[k], __uint_as_float(v[k].x & 0xFFFF0000u), s.y);
+        s.z = fmaf(ww[k], __uint_as_float(v[k].y << 16), s.z); s.w = fmaf(ww[k], __uint_as_float(v[k].y & 0xFFFF0000u), s.w);
+    }
+    const float g = sigm(sg[t]);
+    const float4 sh = shared[i];
+    bo[i] = make_float4(s.x + sh.x * g, s.y + sh.y * g, s.z + sh.z * g, s.w + sh.w * g);
+}
+void moe_combine_bf16(const void* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
+                      int64_t T, void* stream) {
+    moe_combine4_bf16_kernel<<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(
+        (const uint16_t*) Dm, slot, w, reinterpret_cast<const float4*>(shared), sg, reinterpret_cast<float4*>(bo), T);
+    check("moe_combine_bf16");
+}
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {
 #ifndef STRATA_W_NO_COMB

@@ -17,6 +17,7 @@
 #include "ggml-common.h"
 
 #include <cstdio>
+#include <stdexcept>
 #include <utility>
 #include <cstdlib>
 #include <type_traits>
@@ -3613,6 +3614,89 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");
+}
+
+// ---------------------------------------------------------------- gathered experts (src/nemotron)
+// y[j][row] = W_{e_j}[row] . x_j for the n_slots experts e_j = idx[j], whose weight pointers are table[e_j]: one
+// launch for all of a step's routed experts (Nemotron Bolt: 9 per token per layer), with the expert list read on
+// the card so the router needs no trip to the host.  Slot j reads x + (j / x_div) * x_stride blocks: x_div = 9 gives
+// the 9 slots of one token the same input, x_div = 1 each slot its own.
+// Same row dot as mmvq_multi_kernel, so each output is bitwise equal to iq_mmvq on that expert alone.
+template<int TY, bool STAGE_GRID>
+__global__ void __launch_bounds__(128) mmvq_gather_kernel(const unsigned long long* __restrict__ table,
+                                                          const int32_t* __restrict__ idx, size_t row_bytes,
+                                                          const block_q8_1* __restrict__ x, int x_stride, int x_div,
+                                                          float* __restrict__ y, int n_in, int n_out) {
+    STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TY, STAGE_GRID>::value);
+    const uint32_t* s_grid = stage_iq_grid<TY, STAGE_GRID>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
+    const int row = blockIdx.x * 4 + threadIdx.y;
+    if (row >= n_out) return;
+    const int j = blockIdx.y;
+    const uint8_t* wr = reinterpret_cast<const uint8_t*>(table[idx[j]]) + (size_t) row * row_bytes;
+    const int nb = n_in / Fmt<TY>::qk;
+    int off[1] = {(j / x_div) * x_stride};
+    float sum[1];
+    row_dot_multi<TY, 1, true, STAGE_GRID>(wr, x, off, 1, nb, threadIdx.x, sum, s_grid);
+    if (threadIdx.x == 0) y[(size_t) j * n_out + row] = sum[0];
+}
+
+void iq_mmvq_gather(int ggml_type, const unsigned long long* table, const int32_t* idx, int n_slots,
+                    const void* x_q8_1, int x_stride_blocks, int x_div, float* y, int n_in, int n_out, void* stream) {
+    if (ggml_type != 16) throw std::invalid_argument("iq_mmvq_gather: only IQ2_XXS (16) so far");
+    const size_t rb = iq_row_bytes(ggml_type, n_in);
+    const dim3 grid((n_out + 3) / 4, n_slots), block(32, 4);
+    auto s = static_cast<cudaStream_t>(stream);
+    const auto* X = static_cast<const block_q8_1*>(x_q8_1);
+    if (g_stage_grid) mmvq_gather_kernel<16, true><<<grid, block, 0, s>>>(table, idx, rb, X, x_stride_blocks, x_div, y, n_in, n_out);
+    else mmvq_gather_kernel<16, false><<<grid, block, 0, s>>>(table, idx, rb, X, x_stride_blocks, x_div, y, n_in, n_out);
+}
+
+// Grouped routed experts: group g is expert g_exp[g] with g_cnt[g] members (at most 16); member m reads input
+// x + g_xi[g][m] * x_stride blocks and writes row `row` of y[g_slot[g][m]].  Each expert's weights are read once for
+// all its members (row_dot_multi), so a step of many positions that share experts reads each expert once.  Every
+// output is the same row dot as iq_mmvq on that expert and input alone.
+template<int TY, bool STAGE_GRID>
+__global__ void __launch_bounds__(128) mmvq_grouped_kernel(const unsigned long long* __restrict__ table,
+                                                           const int32_t* __restrict__ n_groups,
+                                                           const int32_t* __restrict__ g_exp, const int32_t* __restrict__ g_cnt,
+                                                           const int32_t* __restrict__ g_xi, const int32_t* __restrict__ g_slot,
+                                                           size_t row_bytes, const block_q8_1* __restrict__ x, int x_stride,
+                                                           float* __restrict__ y, int n_in, int n_out) {
+    STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TY, STAGE_GRID>::value);
+    const uint32_t* s_grid = stage_iq_grid<TY, STAGE_GRID>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
+    const int lane = threadIdx.x, nb = n_in / Fmt<TY>::qk, ng = *n_groups;
+    // 4 rows per warp (16 per block): a group's expert is a few hundred KB, so one row per warp left most of the
+    // launch in block start-up
+    for (int g = blockIdx.y; g < ng; g += gridDim.y)
+    for (int rr = 0; rr < 4; ++rr) {
+        const int row = (blockIdx.x * 4 + threadIdx.y) * 4 + rr;
+        if (row >= n_out) break;
+        const uint8_t* wr = reinterpret_cast<const uint8_t*>(table[g_exp[g]]) + (size_t) row * row_bytes;
+        const int cnt = g_cnt[g];
+        for (int m0 = 0; m0 < cnt; m0 += 8) {
+            const int n = min(8, cnt - m0);
+            int off[8];
+#pragma unroll
+            for (int c = 0; c < 8; ++c) off[c] = g_xi[g * 16 + m0 + min(c, n - 1)] * x_stride;
+            float sum[8];
+            row_dot_multi<TY, 8, false, STAGE_GRID>(wr, x, off, n, nb, lane, sum, s_grid);
+#pragma unroll
+            for (int c = 0; c < 8; ++c)
+                if (c < n && lane == c) y[(size_t) g_slot[g * 16 + m0 + c] * n_out + row] = sum[c];
+        }
+    }
+}
+
+void iq_mmvq_grouped(int ggml_type, const unsigned long long* table, const int32_t* n_groups, int max_groups,
+                     const int32_t* g_exp, const int32_t* g_cnt, const int32_t* g_xi, const int32_t* g_slot,
+                     const void* x_q8_1, int x_stride_blocks, float* y, int n_in, int n_out, void* stream) {
+    if (ggml_type != 16) throw std::invalid_argument("iq_mmvq_grouped: only IQ2_XXS (16) so far");
+    const size_t rb = iq_row_bytes(ggml_type, n_in);
+    const dim3 grid((n_out + 15) / 16, max_groups), block(32, 4);
+    auto s = static_cast<cudaStream_t>(stream);
+    const auto* X = static_cast<const block_q8_1*>(x_q8_1);
+    if (g_stage_grid) mmvq_grouped_kernel<16, true><<<grid, block, 0, s>>>(table, n_groups, g_exp, g_cnt, g_xi, g_slot, rb, X, x_stride_blocks, y, n_in, n_out);
+    else mmvq_grouped_kernel<16, false><<<grid, block, 0, s>>>(table, n_groups, g_exp, g_cnt, g_xi, g_slot, rb, X, x_stride_blocks, y, n_in, n_out);
 }
 
 }  // namespace strata::kernels

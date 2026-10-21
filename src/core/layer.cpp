@@ -1,6 +1,7 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
+#include <sys/mman.h>
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -517,6 +518,120 @@ namespace {
 int64_t g_kv_resident = 0;
 uint64_t g_kv_host_bytes = 0;
 
+// ---- the lazy host copy (STRATA_KV_HOST_LAZY, on by default; qsa_kv_host_ensure): every streamed state's host copy is
+// reserved address space, pinned only as far as the longest live conversation reaches.  Pinned up front it was the full
+// context for every layer of every session, used or not: 65 x 132 MiB = 8.6 GiB of a 32 GiB machine at 131K and
+// --batch 4 (the main session and four slots, 13 attention layers each), RAM the expert tier then did not have.
+// Each array starts on its own 2 MiB boundary, so the pieces registered for one array never share a page with another's;
+// the kernels address the copy through the host pointer (ROCm and CUDA map registered memory at the same address,
+// checked once below - where they do not, the state falls back to one pinned allocation).
+struct HostLazy {
+    uint8_t* base = nullptr;
+    uint64_t span = 0;
+    int64_t pages = 0, page_cells = 0, done = 0;   // logical pages, cells per page, pages pinned so far
+    int64_t cells = 0;                             // the cells it was last grown to
+    std::vector<uint64_t> off, per_page, end;      // per array: start, bytes per page, registered end (page aligned)
+};
+std::vector<HostLazy> g_host_lazy;
+int64_t g_kv_host_step = 8192;
+int g_kv_host_lazy = -1;        // -1: read STRATA_KV_HOST_LAZY once
+bool host_lazy_on() {
+    if (g_kv_host_lazy < 0) {
+        const char* v = std::getenv("STRATA_KV_HOST_LAZY");
+        g_kv_host_lazy = v != nullptr && v[0] == '0' ? 0 : 1;
+        if (const char* st = std::getenv("STRATA_KV_HOST_STEP"); st != nullptr && std::atoll(st) > 0)
+            g_kv_host_step = std::atoll(st);
+    }
+    return g_kv_host_lazy == 1;
+}
+uint64_t page_up(uint64_t n) { return (n + 4095) & ~(uint64_t) 4095; }
+// Under a memory limit (the engine's cgroup memory.max, else STRATA_MEMORY_LIMIT_MIB): whether `more` bytes can be pinned
+// and still leave STRATA_KV_HOST_FLOOR_MIB (1024) free.  Pinning past the limit does not fail: the kernel kills the
+// engine.  So a conversation that would take it there is refused or ended at its length instead.
+bool host_room(uint64_t more) {
+    uint64_t limit = 0, current = 0;
+    if (const char* v = std::getenv("STRATA_MEMORY_LIMIT_MIB"); v != nullptr && std::atoll(v) > 0) limit = (uint64_t) std::atoll(v) << 20;
+    std::string path;
+    if (FILE* f = std::fopen("/proc/self/cgroup", "r")) {
+        char line[4096];
+        while (std::fgets(line, sizeof line, f))
+            if (std::strncmp(line, "0::", 3) == 0) { path = line + 3; while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) path.pop_back(); }
+        std::fclose(f);
+    }
+    auto read_u64 = [](const std::string& p, uint64_t& out) -> bool {
+        FILE* f = std::fopen(p.c_str(), "r");
+        if (f == nullptr) return false;
+        char buf[64] = {};
+        const bool ok = std::fgets(buf, sizeof buf, f) != nullptr && buf[0] >= '0' && buf[0] <= '9';
+        std::fclose(f);
+        if (ok) out = std::strtoull(buf, nullptr, 10);
+        return ok;
+    };
+    if (!path.empty()) {
+        uint64_t m = 0;
+        if (read_u64("/sys/fs/cgroup" + path + "/memory.max", m) && (limit == 0 || m < limit)) limit = m;
+        read_u64("/sys/fs/cgroup" + path + "/memory.current", current);
+        // the file cache in it is not in use: the kernel drops it as memory is needed (shmem, the pinned copies, is
+        // swap-backed and counted with anon, so it is not in these two)
+        if (FILE* f = std::fopen(("/sys/fs/cgroup" + path + "/memory.stat").c_str(), "r")) {
+            char key[64];
+            unsigned long long v = 0;
+            uint64_t cache = 0;
+            while (std::fscanf(f, "%63s %llu", key, &v) == 2)
+                if (std::strcmp(key, "active_file") == 0 || std::strcmp(key, "inactive_file") == 0) cache += v;
+            std::fclose(f);
+            current = current > cache ? current - cache : 0;
+        }
+    }
+    if (limit == 0) return true;
+    uint64_t floor = 1024ull << 20;
+    if (const char* v = std::getenv("STRATA_KV_HOST_FLOOR_MIB"); v != nullptr && std::atoll(v) >= 0) floor = (uint64_t) std::atoll(v) << 20;
+    if (current + more + floor <= limit) return true;
+    std::fprintf(stderr, "strata: KV streaming: %.0f MiB more for a conversation copy would leave less than %.0f MiB of the "
+                         "%.1f GiB limit (%.1f GiB in use): refused\n", (double) more / 1048576.0, (double) floor / 1048576.0,
+                 (double) limit / 1073741824.0, (double) current / 1073741824.0);
+    return false;
+}
+// pin `L` up to `cells` (whole pages, never past its context).  Each array stays ONE registration: a copy
+// (hipMemcpyAsync: the ring restore, a conversation's restore, the prompt staging) whose range spans two separate
+// registrations is refused with "invalid argument" on ROCm, though the kernels read across them.  So a growth
+// re-registers the array's whole prefix, on a quiet device (`quiet` once, before the first change), and the
+// caller grows in big steps (qsa_kv_host_ensure) so that happens a handful of times in a process's life.
+bool host_lazy_grow(HostLazy& L, int64_t cells, bool& quiet) {
+    const int64_t need = std::min<int64_t>(L.pages, (cells + L.page_cells - 1) / L.page_cells);
+    if (need <= L.done) return true;
+    for (size_t a = 0; a < L.off.size(); ++a) {
+        // (+256: a whole-block copy may read a little past its last cell, as the pinned copy's padding allowed)
+        const uint64_t want = std::min<uint64_t>(page_up(L.off[a] + (uint64_t) need * L.per_page[a] + 256),
+                                                 a + 1 < L.off.size() ? L.off[a + 1] : L.span);
+        if (want <= L.end[a]) continue;
+        if (L.end[a] > L.off[a]) {
+            if (!quiet) {
+                if (cudaDeviceSynchronize() != cudaSuccess) return false;
+                quiet = true;
+            }
+            if (cudaHostUnregister(L.base + L.off[a]) != cudaSuccess) {
+                std::fprintf(stderr, "strata: KV streaming: cannot unpin a layer's KV copy to grow it: %s\n",
+                             cudaGetErrorString(cudaGetLastError()));
+                return false;
+            }
+            g_kv_host_bytes -= L.end[a] - L.off[a];
+            L.end[a] = L.off[a];
+        }
+        if (cudaHostRegister(L.base + L.off[a], (size_t) (want - L.off[a]), cudaHostRegisterMapped | cudaHostRegisterPortable) !=
+            cudaSuccess) {
+            std::fprintf(stderr, "strata: KV streaming: cannot pin %.1f MiB of RAM for a layer's KV copy (%.2f GiB pinned "
+                                 "so far): %s\n", (double) (want - L.off[a]) / 1048576.0, (double) g_kv_host_bytes / 1073741824.0,
+                         cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
+        g_kv_host_bytes += want - L.off[a];
+        L.end[a] = want;
+    }
+    L.done = need;
+    return true;
+}
+
 // ---- the elastic K/V (--kv-grow): one VMM range per state, each pool array at a chunk boundary in it
 bool g_kv_elastic = false;
 int64_t g_kv_elastic_init = 16384;
@@ -666,6 +781,30 @@ void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0;
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
+bool qsa_kv_host_ensure(const QsaState& st, int64_t cells) {
+    if (st.host_lazy < 0) return true;
+    HostLazy& L = g_host_lazy[(size_t) st.host_lazy];
+    if (cells <= L.cells || L.done >= L.pages) return true;
+    // half as much again each time (whole steps): a few re-registrations in a state's life, at most a third unused
+    int64_t target = L.cells;
+    while (target < cells) target = (std::max(target * 3 / 2, target + g_kv_host_step) + g_kv_host_step - 1) / g_kv_host_step * g_kv_host_step;
+    {   // what the growth pins anew: each array from its current end to its new one
+        const int64_t need = std::min<int64_t>(L.pages, (target + L.page_cells - 1) / L.page_cells);
+        uint64_t more = 0;
+        for (size_t a = 0; a < L.off.size(); ++a) {
+            const uint64_t want = page_up(L.off[a] + (uint64_t) need * L.per_page[a] + 256);
+            if (want > L.end[a]) more += want - L.end[a];
+        }
+        if (!host_room(more)) return false;
+    }
+    bool quiet = false;
+    if (!host_lazy_grow(L, target, quiet)) return false;
+    L.cells = target;
+    if (std::getenv("STRATA_KV_HOST_LOG") != nullptr)
+        std::fprintf(stderr, "strata: KV host copy %d grown to %lld cells (%.2f GiB pinned in all)\n", st.host_lazy,
+                     (long long) target, (double) g_kv_host_bytes / 1073741824.0);
+    return true;
+}
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
@@ -803,7 +942,60 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
-        if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+        // the lazy copy: the arrays' sizes per logical page, in the order the cursor below takes them
+        std::vector<uint64_t> per;
+        const uint64_t ksb = (uint64_t) s.n_head_kv * s.page_size;   // rows per page
+        if (st.kv_hybrid) per = {ksb * s.head_dim, ksb * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, ksb * q4_row};
+        else if (st.kv_q4) per = {ksb * q4_row, ksb * q4_row};
+        else if (st.kv_int8) per = {ksb * s.head_dim, ksb * s.head_dim, ksb * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2,
+                                    ksb * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2};
+        else per = {ksb * s.head_dim * 2, ksb * s.head_dim * 2};
+        if (host_lazy_on()) {
+            HostLazy L;
+            L.pages = pages;
+            L.page_cells = s.page_size;
+            const uint64_t G = 2ull << 20;
+            for (const uint64_t b : per) {
+                L.off.push_back(L.span);
+                L.per_page.push_back(b);
+                L.end.push_back(L.span);
+                L.span += (b * (uint64_t) pages + 256 + G - 1) / G * G;
+            }
+            void* m = mmap(nullptr, (size_t) L.span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            if (m != MAP_FAILED) {
+                L.base = (uint8_t*) m;
+                void* dp = nullptr;
+                bool quiet = false;
+                L.cells = std::max<int64_t>(g_kv_host_step, s.page_size);
+                bool same = host_lazy_grow(L, L.cells, quiet) &&
+                            cudaHostGetDevicePointer(&dp, L.base, 0) == cudaSuccess && dp == (void*) L.base;
+                if (same) {
+                    st.host = strata::kernels::KvHostPools{};
+                    uint8_t* a[4] = {};
+                    for (size_t i = 0; i < per.size(); ++i) a[i] = L.base + L.off[i];
+                    if (st.kv_hybrid) { st.host.k_q = (int8_t*) a[0]; st.host.k_scale = (uint16_t*) a[1]; st.host.v_q4 = a[2]; }
+                    else if (st.kv_q4) { st.host.k_q4 = a[0]; st.host.v_q4 = a[1]; }
+                    else if (st.kv_int8) {
+                        st.host.k_q = (int8_t*) a[0]; st.host.v_q = (int8_t*) a[1];
+                        st.host.k_scale = (uint16_t*) a[2]; st.host.v_scale = (uint16_t*) a[3];
+                    } else { st.host.k_pool = (uint16_t*) a[0]; st.host.v_pool = (uint16_t*) a[1]; }
+                    st.host_lazy = (int) g_host_lazy.size();
+                    g_host_lazy.push_back(std::move(L));
+                    per.clear();   // done: skip the pinned allocation below
+                } else {
+                    (void) cudaGetLastError();
+                    std::fprintf(stderr, "strata: KV streaming: the lazy host copy is not mapped at its own address "
+                                         "here; pinning the whole copy (STRATA_KV_HOST_LAZY=0 does so always)\n");
+                    for (size_t i = 0; i < L.off.size(); ++i)
+                        if (L.end[i] > L.off[i]) { cudaHostUnregister(L.base + L.off[i]); g_kv_host_bytes -= L.end[i] - L.off[i]; }
+                    munmap(L.base, (size_t) L.span);
+                    g_kv_host_lazy = 0;
+                }
+            }
+        }
+        if (per.empty()) {
+            // the lazy copy is in place
+        } else if (cudaHostAlloc((void**) &h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
             cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
             // under WSL the NVIDIA driver pins only ~1 GiB in all, which is less than 128K of 8-bit KV needs
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
@@ -812,6 +1004,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                                  (double) g_kv_host_bytes / 1073741824.0);
             return 0;
         }
+        if (!per.empty()) {
         g_kv_host_bytes += bytes;
         Cursor hc{d};
         if (st.kv_hybrid) {
@@ -829,6 +1022,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         } else {
             st.host.k_pool = hc.take<uint16_t>(hrows * s.head_dim);
             st.host.v_pool = hc.take<uint16_t>(hrows * s.head_dim);
+        }
         }
     }
     // THE ROPE TABLE IS BUILT ON THE HOST IN FLOAT64 and uploaded once, because the reference computes its

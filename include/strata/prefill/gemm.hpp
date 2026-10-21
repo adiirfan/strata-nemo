@@ -85,6 +85,17 @@ private:
     void* mmq_ctx_ = nullptr;
     void* mmq_buf_ = nullptr;
     bool mmq_failed_ = false;
+    /// STRATA_PF_FP8=1 (HIP, hipBLASLt): native() as an FP8 (E4M3) product - the weight per row, the activations per
+    /// slice, both scales applied by hipBLASLt's alpha vector; false (nothing launched) where it does not apply.
+    bool native_fp8(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
+                    int64_t ldy, float beta);
+    uint8_t* fp8_w_ = nullptr;      // the weight in E4M3
+    int64_t fp8_w_bytes_ = 0;
+    float* fp8_vec_ = nullptr;      // per weight row: its scale, then the product's alpha (row scale x activation scale)
+    int64_t fp8_vec_rows_ = 0;
+    uint32_t* fp8_amax_ = nullptr;  // the activation slice's largest |x| (float bits)
+    bool fp8_failed_ = false;
+    void* fp8_cache_ = nullptr;     // descriptors and algorithm per shape
     /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
     void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
 };

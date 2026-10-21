@@ -85,4 +85,15 @@ void native_expert_set_mode(int mode, int phase);
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
 
+/// Routed experts in one launch: y[j] = W_{idx[j]} . x_j for j < n_slots, W_e = table[e] (device arrays),
+/// x_j = x_q8_1 + (j / x_div) * x_stride_blocks q8_1 blocks. IQ2_XXS only so far.
+void iq_mmvq_gather(int ggml_type, const unsigned long long* table, const int32_t* idx, int n_slots,
+                    const void* x_q8_1, int x_stride_blocks, int x_div, float* y, int n_in, int n_out, void* stream);
+
+/// Grouped routed experts: group g (g < *n_groups, at most max_groups launched) is expert g_exp[g] applied to
+/// g_cnt[g] <= 16 inputs x_q8_1 + g_xi[g*16+m] * x_stride_blocks, writing y row block g_slot[g*16+m]. IQ2_XXS only.
+void iq_mmvq_grouped(int ggml_type, const unsigned long long* table, const int32_t* n_groups, int max_groups,
+                     const int32_t* g_exp, const int32_t* g_cnt, const int32_t* g_xi, const int32_t* g_slot,
+                     const void* x_q8_1, int x_stride_blocks, float* y, int n_in, int n_out, void* stream);
+
 }  // namespace strata::kernels

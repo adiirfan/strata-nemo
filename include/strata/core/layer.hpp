@@ -271,6 +271,7 @@ struct QsaState {
     /// copy and give back the overlap the doorbell protocol exists for.
     int32_t* host_step = nullptr;    ///< (kStepCount + 1,) pinned; final element is attention status
     int32_t* host_pos = nullptr;     ///< (n_head,) pinned
+    int host_lazy = -1;              ///< its lazy host copy (qsa_kv_host_ensure), -1: none or pinned whole
 };
 
 /// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
@@ -306,6 +307,10 @@ int64_t qsa_kv_resident();
 int64_t qsa_kv_resident_min();
 /// Pinned host bytes the streamed states hold (their host copies).
 uint64_t qsa_kv_host_bytes();
+/// The lazy host copy (STRATA_KV_HOST_LAZY, default on): pin this state's host copy up to `cells` cells (growing half as
+/// much again at a time, in STRATA_KV_HOST_STEP steps, 8192), before anything writes or copies cells up to there.  A
+/// state without one: true.  False when RAM cannot be pinned.
+bool qsa_kv_host_ensure(const QsaState& st, int64_t cells);
 /// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);

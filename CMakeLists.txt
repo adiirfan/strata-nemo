@@ -308,6 +308,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata-load src/core/load_main.cpp)
   target_link_libraries(strata-load PRIVATE strata_core strata_kernels)
 
+  # NVIDIA Nemotron 3.5 Bolt's language model (src/nemotron): its own program, sharing the kernels
+  add_executable(strata-nemo src/nemotron/nemo_main.cu)
+  target_include_directories(strata-nemo PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata-nemo PRIVATE strata_kernels strata_prefill ${_strata_gpu_runtime_target})
+
   add_executable(strata-concurrent src/core/concurrent_main.cpp)
   target_include_directories(strata-concurrent PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata-concurrent PRIVATE strata_core strata_kernels ${_strata_gpu_runtime_target})

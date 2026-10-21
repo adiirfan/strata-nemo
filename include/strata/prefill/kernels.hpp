@@ -86,6 +86,9 @@ void copy_f32_wide(float* dst, const float* src, int64_t n, void* stream);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
+/// STRATA_PF_DM16: the same with D's rows in BF16 (fused::dm16_on()); shared and bo 16-byte aligned.
+void moe_combine_bf16(const void* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
+                      int64_t T, void* stream);
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
 /// --peer-device's prompt share as sums: bo[t, :] = (sum over the k with slot[t, k] < rows_local of w[t, k] *

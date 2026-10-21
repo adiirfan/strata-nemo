@@ -354,6 +354,222 @@ bool refill_batched(strata::core::ExpertSource& src, strata::core::ExpertCache& 
     return ok;
 }
 
+// STRATA_REFILL_ASYNC=1 (opt-in): a prompt's lent slots are refilled while the answer is
+// written instead of before its first token.  Reader threads read the lent experts (hottest first) into four pinned
+// buffers of STRATA_REFILL_BATCH/2 experts - the memory the blocking refill's two buffers take - and the host thread,
+// between two windows (`poll`), queues each read batch's copies on a stream of its own and marks the batch's experts
+// resident once its event has passed.  Until then an expert of the loan is missing, as a slot's windows see it beside a
+// prompt read with --batch: the CPU computes it.  The tokens can differ from the blocking refill's (an expert on the CPU
+// rounds differently), and from run to run, as with the adaptive tier's timing (#463).  Every place that lends or
+// gives up slots calls `finish` first, so a slot is never refilled under a prompt buffer or a KV page.
+class AsyncRefill {
+public:
+    ~AsyncRefill() { stop(); }
+    bool active() const { return !lent_.empty(); }
+    // `lent` in the order to refill (the hottest first); false (nothing started) when the buffers cannot be pinned
+    bool start(strata::core::ExpertSource& src, strata::core::ExpertCache& cache,
+               std::vector<std::pair<int32_t, int32_t>> lent, int64_t n_expert, std::string& err) {
+        if (lent.empty()) return true;
+        src_ = &src;
+        cache_ = &cache;
+        n_expert_ = n_expert;
+        // without STRATA_REFILL_BATCH the experts are copied straight from where the source keeps them (the RAM arena, page-
+        // locked: a DMA each, as the blocking refill does), STRATA_REFILL_ASYNC_DIRECT experts a batch (default 256)
+        direct_ = refill_batch() <= 0;
+        if (direct_) {
+            static const int db = [] { const char* e = std::getenv("STRATA_REFILL_ASYNC_DIRECT"); return e ? std::max(16, std::atoi(e)) : 256; }();
+            B_ = (size_t) db;
+        } else {
+            B_ = (size_t) std::max(8, refill_batch() / 2);
+        }
+        maxb_ = 0;
+        for (const auto& pr : lent)
+            maxb_ = std::max(maxb_, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first / n_expert));
+        maxb_ = (maxb_ + 4095) / 4096 * 4096;
+        for (Buf& b : buf_) {
+            if ((!direct_ && cudaMallocHost((void**) &b.mem, B_ * maxb_) != cudaSuccess) || cudaEventCreateWithFlags(&b.ev, cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                release();
+                err = "refill: cannot pin the background refill's buffers";
+                return false;
+            }
+        }
+        if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) != cudaSuccess) {
+            (void) cudaGetLastError();
+            release();
+            err = "refill: cannot create the background refill's stream";
+            return false;
+        }
+        lent_ = std::move(lent);
+        n_batches_ = (lent_.size() + B_ - 1) / B_;
+        next_batch_ = 0;
+        committed_ = 0;
+        failed_ = false;
+        quit_ = false;
+        t0_ = std::chrono::steady_clock::now();
+        if (!direct_)
+            for (int t = 0; t < kBufs; ++t) readers_.emplace_back([this] { read_loop(); });
+        return true;
+    }
+    // Between two windows: queues the copies of the batches read so far and marks the experts of the batches whose
+    // copies have landed resident.  `wait`: until everything is in.  Returns how many experts became resident (the
+    // caller uploads the table when that is not 0), or -1 when a read or a copy failed.
+    int64_t poll(std::vector<int32_t>& host_res, bool wait, std::string& err) {
+        if (!active()) return 0;
+        int64_t made = 0;
+        for (;;) {
+            std::unique_lock<std::mutex> lk(mu_);
+            if (failed_) { err = "refill: reading a lent expert failed"; return -1; }
+            bool progress = false;
+            if (direct_)   // the free batches take the next experts, straight from the source's memory
+                for (Buf& b : buf_) {
+                    if (b.state != kFree || next_batch_ >= n_batches_) continue;
+                    b.at = next_batch_ * B_;
+                    b.n = std::min(B_, lent_.size() - b.at);
+                    ++next_batch_;
+                    for (size_t j = 0; j < b.n; ++j) {
+                        const auto& pr = lent_[b.at + j];
+                        const int64_t layer = pr.first / n_expert_, nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
+                        const uint8_t* blob = src_->blob_stable(layer, pr.first % n_expert_);
+                        if (blob == nullptr) { err = "refill: a lent expert is not in memory"; return -1; }
+                        if (!cache_->fill_slot(pr.second, blob, stream_, err, nb)) return -1;
+                    }
+                    if (cudaEventRecord(b.ev, stream_) != cudaSuccess) {
+                        err = std::string("refill: ") + cudaGetErrorString(cudaGetLastError());
+                        return -1;
+                    }
+                    b.state = kIssued;
+                }
+            for (Buf& b : buf_) {
+                if (b.state == kReady) {
+                    for (size_t j = 0; j < b.n; ++j) {
+                        const auto& pr = lent_[b.at + j];
+                        const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(pr.first / n_expert_);
+                        if (!cache_->fill_slot(pr.second, b.mem + j * maxb_, stream_, err, nb)) return -1;
+                    }
+                    if (cudaEventRecord(b.ev, stream_) != cudaSuccess) {
+                        err = std::string("refill: ") + cudaGetErrorString(cudaGetLastError());
+                        return -1;
+                    }
+                    b.state = kIssued;
+                }
+                if (b.state == kIssued) {
+                    const cudaError_t q = wait ? cudaEventSynchronize(b.ev) : cudaEventQuery(b.ev);
+                    if (q == cudaErrorNotReady) { (void) cudaGetLastError(); continue; }
+                    if (q != cudaSuccess) {
+                        err = std::string("refill: ") + cudaGetErrorString(q);
+                        return -1;
+                    }
+                    for (size_t j = 0; j < b.n; ++j) {
+                        const auto& [i, slot] = lent_[b.at + j];
+                        // (an expert the table placed elsewhere meanwhile keeps that place; its old slot stays empty)
+                        if (host_res[(size_t) i] == strata::core::kNotResident) {
+                            host_res[(size_t) i] = slot;
+                            ++made;
+                        }
+                    }
+                    committed_ += b.n;
+                    b.state = kFree;
+                    progress = true;
+                }
+            }
+            if (progress) cv_.notify_all();
+            if (committed_ == lent_.size()) {
+                lk.unlock();
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0_).count();
+                if (std::getenv("STRATA_TRACE") != nullptr)
+                    std::fprintf(stderr, "strata trace: background refill of %zu slots done in %.1f ms\n", lent_.size(), ms);
+                stop();
+                return made;
+            }
+            if (!wait) return made;
+            if (!progress) cv_.wait_for(lk, std::chrono::milliseconds(2));
+        }
+    }
+    bool finish(std::vector<int32_t>& host_res, std::string& err) { return poll(host_res, true, err) >= 0; }
+
+private:
+    enum { kFree = 0, kReading, kReady, kIssued };
+    static constexpr int kBufs = 4;
+    struct Buf { uint8_t* mem = nullptr; cudaEvent_t ev = nullptr; int state = kFree; size_t at = 0, n = 0; };
+    void read_loop() {
+        for (;;) {
+            Buf* b = nullptr;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] {
+                    if (quit_ || failed_ || next_batch_ >= n_batches_) return true;
+                    for (Buf& x : buf_) if (x.state == kFree) return true;
+                    return false;
+                });
+                if (quit_ || failed_ || next_batch_ >= n_batches_) return;
+                for (Buf& x : buf_) if (x.state == kFree) { b = &x; break; }
+                b->state = kReading;
+                b->at = next_batch_ * B_;
+                b->n = std::min(B_, lent_.size() - b->at);
+                ++next_batch_;
+            }
+            constexpr size_t R = 8;   // a run per call: copy_blobs reads it as one batch (unbuffered: one io_submit)
+            int32_t rl[R], re[R];
+            uint8_t* rd[R];
+            bool ok = true;
+            for (size_t j0 = 0; ok && j0 < b->n; j0 += R) {
+                const size_t m = std::min(R, b->n - j0);
+                for (size_t q = 0; q < m; ++q) {
+                    const auto& pr = lent_[b->at + j0 + q];
+                    rl[q] = (int32_t) (pr.first / n_expert_);
+                    re[q] = (int32_t) (pr.first % n_expert_);
+                    rd[q] = b->mem + (j0 + q) * maxb_;
+                }
+                ok = src_->copy_blobs(rl, re, rd, m);
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (!ok) failed_ = true;
+                else b->state = kReady;
+            }
+            cv_.notify_all();
+        }
+    }
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            quit_ = true;
+        }
+        cv_.notify_all();
+        for (auto& t : readers_) t.join();
+        readers_.clear();
+        if (stream_ != nullptr) (void) cudaStreamSynchronize(stream_);
+        release();
+        lent_.clear();
+    }
+    void release() {
+        for (Buf& b : buf_) {
+            if (b.ev != nullptr) cudaEventDestroy(b.ev);
+            if (b.mem != nullptr) cudaFreeHost(b.mem);
+            b = Buf{};
+        }
+        if (stream_ != nullptr) cudaStreamDestroy(stream_);
+        stream_ = nullptr;
+    }
+    strata::core::ExpertSource* src_ = nullptr;
+    strata::core::ExpertCache* cache_ = nullptr;
+    int64_t n_expert_ = 0;
+    size_t B_ = 0, maxb_ = 0, n_batches_ = 0, next_batch_ = 0, committed_ = 0;
+    std::vector<std::pair<int32_t, int32_t>> lent_;
+    Buf buf_[kBufs];
+    cudaStream_t stream_ = nullptr;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool failed_ = false, quit_ = false, direct_ = false;
+    std::vector<std::thread> readers_;
+    std::chrono::steady_clock::time_point t0_;
+};
+bool refill_async_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_REFILL_ASYNC"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+
 using Clock = std::chrono::steady_clock;
 
 // --pipeline-windows: every STRATA_PIPELINE_* test and tuning variable (THETA, FORCE_MISS, SWITCH, LOG, TRACE, DOOM_SKIP,
@@ -4541,6 +4757,19 @@ int main(int argc, char** argv) {
     // slots' draft-KV copies use this one too
     static const strata::core::ModelGeometry draft_geometry{};
     std::vector<std::unique_ptr<strata::core::MtpDrafter>> slot_mtp;
+    // the lazy host copies (qsa_kv_host_ensure): the main sessions and their drafter, or batch slot b's, pinned up to
+    // `cells` before anything writes or copies cells up to there
+    auto host_main = [&](int64_t cells) -> bool {
+        bool ok = strata::core::session_kv_host_ensure(ss, cells) && strata::core::qsa_kv_host_ensure(mtp.kv_state(), cells);
+        for (const auto& st : stages) ok = ok && strata::core::session_kv_host_ensure(st->ss, cells);
+        return ok;
+    };
+    auto host_slot = [&](int b, int64_t cells) -> bool {
+        bool ok = true;
+        for (const auto& v : bslot_ss) if ((size_t) b < v.size()) ok = ok && strata::core::session_kv_host_ensure(*v[(size_t) b], cells);
+        if ((size_t) b < slot_mtp.size() && slot_mtp[(size_t) b]) ok = ok && strata::core::qsa_kv_host_ensure(slot_mtp[(size_t) b]->kv_state(), cells);
+        return ok;
+    };
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
@@ -7860,6 +8089,11 @@ int main(int argc, char** argv) {
         bool live_ok = false;
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
+        // requests in a row that met non-finite logits.  The second one has read its prompt from token 0 with every
+        // cached state dropped, so the damage is in the weights the engine holds, not in a conversation: seen with the
+        // Q4_K_XL pack on the R9700 at about one start in ten (2026-10-16, cause not found; every request after it
+        // was non-finite until a restart).  The engine then stops, and the server starts it afresh.
+        int nf_streak = 0;
         std::vector<ConvCheckpoint> checks;
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
@@ -8132,6 +8366,15 @@ int main(int argc, char** argv) {
             std::fflush(stderr);
             nf_hit = true;
             nan_flush = true;
+            if (++nf_streak >= 2) {
+                std::fprintf(stderr, "strata serve: non-finite logits again after reading from token 0 (#879): the weights "
+                                     "in memory look damaged; the engine stops so that the server starts it afresh\n");
+                std::printf("ERR the model's weights in memory look damaged (non-finite logits twice in a row); the engine "
+                            "restarts\n");
+                std::fflush(stdout);
+                std::fflush(stderr);
+                std::_Exit(3);
+            }
             return true;
         };
         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
@@ -8469,6 +8712,18 @@ int main(int argc, char** argv) {
             agate.active.store(false, std::memory_order_release);   // 0.1.43: the copies have landed (STRATA_ADAPT_OVERLAP)
             aflipped = false;
             res_upload();
+        };
+        // STRATA_REFILL_ASYNC: the last prompt's loan, refilled while the answer is written (see AsyncRefill)
+        AsyncRefill arefill;
+        auto arefill_finish = [&]() -> bool {
+            if (!arefill.active()) return true;
+            std::string ae;
+            if (!arefill.finish(host_res, ae)) {
+                std::fprintf(stderr, "strata serve: %s\n", ae.c_str());
+                return false;
+            }
+            res_upload();
+            return true;
         };
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
@@ -9241,6 +9496,7 @@ int main(int argc, char** argv) {
                 return false;
             }
             if (peer.valid()) { e = "VRAM: not with --peer-device"; return false; }
+            if (!arefill_finish()) { e = "VRAM: the background refill failed"; return false; }
             for (const PfPart& p : pf_parts)
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
             if (!ver.wait_commit(e)) return false;
@@ -9379,6 +9635,7 @@ int main(int argc, char** argv) {
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
+            if (!host_slot(b, upto + 256)) { e = "batch admission: the slot's KV copy cannot grow (no RAM can be pinned)"; return false; }
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
                 strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
@@ -9420,6 +9677,7 @@ int main(int argc, char** argv) {
         // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
+            if (!host_main(upto + 256)) { e = "batch slot restore: the KV copy cannot grow (no RAM can be pinned)"; return false; }
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
@@ -9470,6 +9728,18 @@ int main(int argc, char** argv) {
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
             int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
             static size_t next_slot = 0;
+            // the lazy host copies: each active slot's window cells and its drafter's beyond them; a slot whose
+            // conversation cannot grow (no RAM left under the limit) ends its reply here, at its length
+            for (size_t b = 0; b < bs.size(); ++b) {
+                BSlot& sl = bs[b];
+                if (!sl.active || host_slot((int) b, sl.p + strata::kernels::kVerifyMaxT + 64)) continue;
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                std::fprintf(stderr, "strata batch: slot %d ends at %lld tokens: no RAM is left for a longer conversation\n",
+                             (int) b, (long long) sl.p);
+                std::printf("BDONE %d %lld length %.1f\n", (int) b, (long long) sl.produced, ms);
+                sl.active = false;
+                sl.cached = false;
+            }
             // Each MTP slot uses two rows; rotate slots when more than four are active.
             int A = 0;
             for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= strata::kernels::kVerifyMaxT; ++offset) {
@@ -9495,6 +9765,7 @@ int main(int argc, char** argv) {
             }
             if (batch_mtp && A > 0) next_slot = ((size_t) active[A - 1] + 1) % bs.size();
             if (S == 0) return true;
+
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
             drive.d.layers = 0;
@@ -9710,6 +9981,11 @@ int main(int argc, char** argv) {
         // one turn: serve every running stage, hand finished groups on, start what can start
         auto pump = [&](bool may_start) -> bool {
             ++pipe_tick;
+            for (size_t b = 0; b < bs.size(); ++b)   // the lazy host copies: each active slot's next window
+                if (bs[b].active && !host_slot((int) b, bs[b].p + strata::kernels::kVerifyMaxT + 64)) {
+                    err = "the KV copy cannot grow: no RAM can be pinned";
+                    return false;
+                }
             if (bt_windows == 0 && !pipe_inflight()) {
                 bt_start = Clock::now();
                 bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
@@ -10088,8 +10364,13 @@ int main(int argc, char** argv) {
                         refuse(err);
                         continue;
                     }
+                    if (!host_main((int64_t) image.live.ids.size() + 256)) {
+                        refuse("the KV copy cannot grow to the saved conversation: no RAM can be pinned",
+                               strata::core::SessionError::memory);
+                        continue;
+                    }
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
-                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
+                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, [&] { arefill_finish(); cudaDeviceSynchronize(); apply_pending(true); })) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
                         continue;
                     }
@@ -10346,7 +10627,14 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
-            auto kv_quiesce = [&] { cudaDeviceSynchronize(); apply_pending(true); };
+            auto kv_quiesce = [&] { arefill_finish(); cudaDeviceSynchronize(); apply_pending(true); };
+            // the lazy host copy (qsa_kv_host_ensure): this prompt's cells, before a checkpoint, a slot or the prompt
+            // writes them
+            if (!host_main(n + 256)) {
+                std::printf("ERR the KV copy cannot grow to this prompt: no RAM can be pinned\n");
+                std::fflush(stdout);
+                continue;
+            }
             if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
                 // a failed growth may leave the tier half-changed: the engine stops (as for any CUDA failure)
                 if (!kvg_ensure(n + 256, kv_quiesce)) {
@@ -10494,7 +10782,12 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
             }
-            // the elastic K/V: a parked conversation is restored whole, and it may be longer than this prompt
+            // the elastic K/V and the lazy host copy: a parked conversation is restored whole, and it may be longer
+            // than this prompt
+            if (incoming && !host_main((int64_t) incoming->live.ids.size() + 256)) {
+                std::printf("ERR the KV copy cannot grow to the parked conversation: no RAM can be pinned\n");
+                return 1;
+            }
             if (incoming && !kvg_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce)) {
                 std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
                 return 1;
@@ -10850,7 +11143,17 @@ int main(int argc, char** argv) {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
                 if (refill_batch() > 0) {   // STRATA_REFILL_BATCH: batched, parallel reads (see refill_batched)
-                    if (!refill_batched(*srcp, *p.cache, p.lent, g.n_expert, e)) return false;
+                    // the experts the RAM copy holds (STRATA_BUDGET_LEND_GIB keeps the loan's there) go back from it by
+                    // DMA; only the rest are read from the drive
+                    std::vector<std::pair<int32_t, int32_t>> rest;
+                    rest.reserve(p.lent.size());
+                    for (const auto& [i, slot] : p.lent) {
+                        const uint8_t* rb = src.complement_ready() ? src.resident_blob(i / g.n_expert, i % g.n_expert) : nullptr;
+                        if (rb == nullptr) { rest.emplace_back(i, slot); continue; }
+                        const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                        if (!p.cache->fill_slot_queued(slot, rb, e, nb)) return false;
+                    }
+                    if (!rest.empty() && !refill_batched(*srcp, *p.cache, rest, g.n_expert, e)) return false;
                     for (const auto& [i, slot] : p.lent) host_res[(size_t) i] = slot;
                     return true;
                 }
@@ -10908,11 +11211,40 @@ int main(int argc, char** argv) {
                 }
                 return true;
             };
+            // STRATA_REFILL_ASYNC: the loan goes back while the answer is written (one card, no --batch slots, no peer
+            // or helper GPU); the hottest experts first, by the adaptive tier's counts and then the profile's rank
+            auto refill_or_async = [&](std::string& e) -> bool {
+                if (!refill_async_on() || pf_parts.size() != 1 || !stages.empty() || o.batch > 0 || peer.valid() ||
+                    pf_parts[0].lent.empty())
+                    return refill(e);
+                PfPart& p = pf_parts[0];
+                std::vector<int32_t> rank(host_res.size(), (int32_t) profile.size());
+                for (size_t r = 0; r < profile.size(); ++r)
+                    rank[(size_t) profile[r].first * (size_t) g.n_expert + (size_t) profile[r].second] = (int32_t) r;
+                auto heat = [&](int32_t i) -> double {
+                    const double u = drive.d.usage.empty() ? 0.0 : (double) drive.d.usage[(size_t) i];
+                    return u * 1048576.0 - (double) rank[(size_t) i];
+                };
+                std::vector<std::pair<int32_t, int32_t>> order = p.lent;
+                std::stable_sort(order.begin(), order.end(), [&](const auto& a, const auto& b) { return heat(a.first) > heat(b.first); });
+                const strata::core::OnDevice on(p.dev);
+                std::string ae;
+                if (!arefill.start(*srcp, *p.cache, std::move(order), g.n_expert, ae)) {
+                    std::fprintf(stderr, "strata serve: %s; refilling now\n", ae.c_str());
+                    return refill(e);
+                }
+                tr("refill in the background", (long long) p.lent.size());
+                p.lent.clear();
+                p.lent_chunk = 0;
+                return true;
+            };
             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
+                // the last prompt's loan, still going back in the background, lands first: those slots are lent again
+                if (!arefill_finish()) { e = "prefill: the background refill failed"; return false; }
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
@@ -11180,7 +11512,7 @@ int main(int argc, char** argv) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
-                if (win && !refill(err)) {
+                if (win && !refill_or_async(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
@@ -11230,7 +11562,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
-            if (!refill(err)) {
+            if (!refill_or_async(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
             }
@@ -11993,6 +12325,16 @@ int main(int argc, char** argv) {
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
+                // STRATA_REFILL_ASYNC: the loan's batches whose copies have landed are resident from this window on
+                if (arefill.active()) {
+                    std::string ae;
+                    const int64_t made = arefill.poll(host_res, false, ae);
+                    if (made < 0) {
+                        std::printf("ERR the background refill failed: %s\n", ae.c_str());
+                        return 1;
+                    }
+                    if (made > 0) res_upload();
+                }
                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
@@ -12028,9 +12370,15 @@ int main(int argc, char** argv) {
                     cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
                                cudaMemcpyHostToDevice);
                 }
-                // the elastic K/V: the window's cells and the drafter's beyond them
+                // the lazy host copy and the elastic K/V: the window's cells and the drafter's beyond them
+                if (!host_main(p + T + 64)) {   // no RAM for more of this conversation: it ends here, at its length
+                    std::fprintf(stderr, "strata serve: the answer ends at %lld tokens: no RAM is left for a longer "
+                                         "conversation\n", (long long) p);
+                    finish = "length";
+                    break;
+                }
                 if (kvg.on && p + T + 64 > kvg.cells &&
-                    !kvg_ensure(p + T + 64, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
+                    !kvg_ensure(p + T + 64, [&] { arefill_finish(); cudaDeviceSynchronize(); apply_pending(true); })) {
                     std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                     return 1;
                 }
@@ -12342,6 +12690,7 @@ int main(int argc, char** argv) {
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
+            if (!nf_hit) nf_streak = 0;
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s\n",
                         (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
@@ -12350,6 +12699,10 @@ int main(int argc, char** argv) {
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload, chain_txt);
             std::fflush(stdout);
+            if (!arefill_finish()) {   // the answer is out: what is left of the loan goes back before the next request
+                std::printf("ERR the background refill failed\n");
+                return 1;
+            }
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
@@ -12583,7 +12936,8 @@ int main(int argc, char** argv) {
                 // the elastic K/V first: its hot experts move into slots of the loan, which are refilled after it
                 kvg_started = true;
                 kvg_start(first);
-                if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+                if (!host_main(n_prompt + o.max_new + 64) ||
+                    !kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
                         lent.emplace_back((int32_t) i, host_res[i]);
@@ -12622,7 +12976,8 @@ int main(int argc, char** argv) {
         if (!kvg_started) {   // the elastic K/V: every cell this run can reach (no loan)
             kvg_started = true;
             kvg_start(xcache.slots());
-            if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+            if (!host_main(n_prompt + o.max_new + 64) ||
+                    !kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
         }
         const Clock::time_point tp0 = Clock::now();
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
@@ -12681,7 +13036,8 @@ int main(int argc, char** argv) {
     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches
         kvg_started = true;
         kvg_start(xcache.slots());
-        if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+        if (!host_main(n_prompt + o.max_new + 64) ||
+                    !kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
     }
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)

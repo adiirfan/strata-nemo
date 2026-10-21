@@ -32,6 +32,13 @@ bool native_supported(int gu_type, int d_type);
 /// x [rows][cols] FP32 -> `xa` (act_bytes(rows, cols)): int8 per 32 values in natural order, the native kernels' form.
 void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, void* stream);
 
+/// STRATA_PF_FUSED_F8=1 on gfx12: this gate/up type's product runs on the FP8 matrix cores (its activations must then come
+/// from quantize_act_f8, E4M3 at one scale per token, in the same layout).
+bool native_f8_gu(int gu_type);
+/// STRATA_PF_DM16=1 on gfx12: experts_native stores the down rows as BF16 (2 bytes per value in `dm`); moe_combine_bf16 reads them.
+bool dm16_on();
+void quantize_act_f8(const float* x, int64_t rows, int64_t cols, void* xa, void* stream);
+
 /// experts() for native blobs: b.blob[e - e0] is the native blob of expert e (gate at 0, up at g.up_off, down at
 /// g.down_off; 2-byte aligned).  `xa` from quantize_act_native; H in `ha` (act_bytes(n, 640)); down into `dm` at the
 /// rows of `group`.  `dm` 16-byte aligned (gfx12 stores float4; checked there - the prompt path's buffers are 256-aligned

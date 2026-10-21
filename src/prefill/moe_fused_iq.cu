@@ -716,7 +716,14 @@ __device__ __forceinline__ nw_i8 nw_wmma(nw_ab a, nw_ab b, nw_i8 c) {
 
 // W (X1): ALIAS = the H tile lives on the weight buffers (one extra barrier); LB > 0 = amdgpu_waves_per_eu(LB) (VGPR cap).
 // Disable both with -DSTRATA_W_NO_OCC (the launch sites then use <WT, GU, false, 0> and grid factor wgp_blocks).
-template <int WT, bool GU, bool ALIAS = false, int LB = 0>
+__device__ __forceinline__ uint32_t bf16x2_rn(float a, float b) {   // round to nearest even, a in the low half
+    uint32_t ua = __float_as_uint(a), ub = __float_as_uint(b);
+    ua += 0x7FFFu + ((ua >> 16) & 1u);
+    ub += 0x7FFFu + ((ub >> 16) & 1u);
+    return (ua >> 16) | (ub & 0xFFFF0000u);
+}
+// D16 (STRATA_PF_DM16=1, gfx12): the down rows are stored as BF16 (moe_combine_bf16 reads them), half the bytes
+template <int WT, bool GU, bool ALIAS = false, int LB = 0, bool D16 = false>
 __global__ void __launch_bounds__(NW_THREADS) __attribute__((amdgpu_waves_per_eu(LB > 0 ? LB : 1)))
 native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* __restrict__ act,
                   const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm) {
@@ -938,9 +945,16 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
                         if (r < nrows) {
 #if STRATA_NAT_W12
                             // columns rbase + 32 wm + 16 mt + 8 hi .. + 7: contiguous, 32-byte aligned (dm: 16, checked in experts_native)
-                            float4* d = reinterpret_cast<float4*>(dm + (size_t) (row0 + r) * 2560 + rbase + 32 * wm + 16 * mt + 8 * hi);
-                            d[0] = make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
-                            d[1] = make_float4(acc[mt][nt][4], acc[mt][nt][5], acc[mt][nt][6], acc[mt][nt][7]);
+                            if constexpr (D16) {
+                                uint4* d = reinterpret_cast<uint4*>(reinterpret_cast<uint16_t*>(dm) + (size_t) (row0 + r) * 2560 + rbase +
+                                                                    32 * wm + 16 * mt + 8 * hi);
+                                *d = make_uint4(bf16x2_rn(acc[mt][nt][0], acc[mt][nt][1]), bf16x2_rn(acc[mt][nt][2], acc[mt][nt][3]),
+                                                bf16x2_rn(acc[mt][nt][4], acc[mt][nt][5]), bf16x2_rn(acc[mt][nt][6], acc[mt][nt][7]));
+                            } else {
+                                float4* d = reinterpret_cast<float4*>(dm + (size_t) (row0 + r) * 2560 + rbase + 32 * wm + 16 * mt + 8 * hi);
+                                d[0] = make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
+                                d[1] = make_float4(acc[mt][nt][4], acc[mt][nt][5], acc[mt][nt][6], acc[mt][nt][7]);
+                            }
 #else
                             float* d = dm + (size_t) (row0 + r) * 2560 + rbase + 32 * wm + 16 * mt + hi;
 #pragma unroll
@@ -951,6 +965,415 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
             }
         }
     }
+#else
+    __builtin_trap();
+#endif
+}
+
+// ---- STRATA_PF_FUSED_F8=1 (gfx12): the gate/up product on the FP8 matrix cores, v_wmma_f32_16x16x16_fp8_fp8.  A weight is
+// decoded as for native_w11_kernel (int8 code q and its scale per 16 / 32 values), then stored as E4M3 at one scale for the
+// whole row (the row's largest block d x f8_bound, / 448: no value can pass E4M3's 448); the activations are E4M3 at one scale
+// per token (quant_act_f8_kernel).  The products accumulate in FP32 inside the WMMA - no per-block scaling between them - and
+// the two scales multiply once, before the SwiGLU.  H leaves as int8 per 32 values, as before (the down kernel is unchanged).
+// The numbers differ from the int8 path's: E4M3 keeps 3 mantissa bits of each weight and activation.
+#if STRATA_NAT_W12
+typedef float nw_f8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ nw_f8 nw_wmma_f8(nw_ab a, nw_ab b, nw_f8 c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c);
+}
+#endif
+// the largest |w| of a block, per unit of its d: the largest scale multiplier x the largest code
+template <int T> __host__ __device__ constexpr float f8_bound() {
+    return (T == T_IQ2_XXS || T == T_IQ2_XS || T == T_IQ2_S) ? 3.875f * 43.0f : T == T_IQ3_XXS ? 7.75f * 62.0f
+         : T == T_IQ3_S ? 31.0f * 15.0f : 32.0f * 127.0f;   // IQ4_XS: |ls - 32| <= 32, |kvalue| <= 127
+}
+__host__ __device__ constexpr bool f8_gu_type(int t) {
+    return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS;
+}
+
+// H8: H leaves as E4M3 per 64 features at one scale (the float at byte 64 of its 80) - native_w12f8_d_kernel's input
+template <int WT, bool ALIAS, int LB, bool H8 = false>
+__global__ void __launch_bounds__(NW_THREADS) __attribute__((amdgpu_waves_per_eu(LB > 0 ? LB : 1)))
+native_w12f8_gu_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* __restrict__ act,
+                       const int32_t* __restrict__ src, uint8_t* __restrict__ out) {
+#if STRATA_NAT_W12
+    constexpr int NS = GU_ROWS_K / 64;
+    constexpr int NFB = 1280 / NW_ROWS;
+    constexpr int ACT_LD = NS * AB;
+    constexpr int BS = block_bytes(WT);
+    constexpr int NB = GU_ROWS_K / 256;   // the row's 256-value blocks
+    constexpr int GB = grid_bytes(WT) > 0 ? grid_bytes(WT) : 16;
+    __shared__ __align__(16) uint8_t wtbuf[2 * NW_ROWS * WLD];
+    uint8_t(*wt)[NW_ROWS][WLD] = reinterpret_cast<uint8_t(*)[NW_ROWS][WLD]>(wtbuf);
+    __shared__ float rsc[NW_ROWS];                                // the rows' scales
+    __shared__ __align__(16) uint8_t sgrid[GB];
+    constexpr int SGN = (WT == T_IQ2_XXS || WT == T_IQ2_XS || WT == T_IQ2_S || WT == T_IQ3_XXS || WT == T_IQ3_S)
+                            ? sign_entries(WT) : 1;
+    __shared__ __align__(16) uint4 ssign[SGN];
+    __shared__ int srow[kTileRows];
+    __shared__ float hs_sep[ALIAS ? 1 : kTileRows][65];
+    static_assert(!ALIAS || (size_t) kTileRows * 65 * 4 <= (size_t) 2 * NW_ROWS * WLD, "H tile must fit the weight buffers");
+    float(*hs)[65] = ALIAS ? reinterpret_cast<float(*)[65]>(wtbuf) : hs_sep;
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int wm = wave & 3, wn = wave >> 2, l16 = lane & 15, hi = lane >> 4;
+    (void) lane;
+    if constexpr (grid_bytes(WT) > 0) {
+        const uint32_t* gs = (const uint32_t*) grid_src<WT>();
+        for (int i = tid; i < grid_bytes(WT) / 4; i += NW_THREADS) ((uint32_t*) sgrid)[i] = gs[i];
+    }
+    if constexpr (SGN > 1) {
+        for (int i = tid; i < SGN; i += NW_THREADS) ssign[i] = sign_entry(i, SGN == 128);
+    }
+    uint32_t kv[4] = {0, 0, 0, 0};
+    if constexpr (WT == T_IQ4_XS) {
+#pragma unroll
+        for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
+    }
+    const int ur = tid >> 1, uj = tid & 1;
+    const int t0 = tb.ts[b.e0], nwork = (tb.ts[b.e1] - t0) * NFB;
+    for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
+        const int2 tl = tb.tiles[t0 + w / NFB];
+        const int fb = w % NFB, e = tl.x, row0 = tl.y, nrows = min(kTileRows, tb.off[e + 1] - row0);
+        const uint8_t* blob = b.blob[e - b.e0];
+        const uint8_t* wrow = blob + ((ur & 1) ? geo.up_off : 0) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row;
+        auto unit = [&](int s) -> const uint8_t* { return wrow + (s >> 2) * BS; };
+        auto sub = [&](int s) { return 2 * (s & 3) + uj; };
+        float dm = 0.0f;
+#pragma unroll
+        for (int k = 0; k < NB; ++k) dm = fmaxf(dm, fabsf(half_at(ld16(wrow + k * BS))));
+        const float rs = dm > 0.0f ? dm * (f8_bound<WT>() / 448.0f) : 1.0f, inv = 1.0f / rs;
+        auto put = [&](const uint32_t (&raw)[raw_words(WT)], int buf) {
+            uint32_t q[8];
+            float s0, s1;
+            convert<WT>(raw, sgrid, kv, q, s0, s1, ssign);
+            const float f0 = s0 * inv, f1 = s1 * inv;
+            uint32_t o[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {   // signed byte c: (c + 128) as an unsigned byte, times f, minus 128 f
+                const float f = k < 4 ? f0 : f1, nf = -128.0f * f;
+                const uint32_t u = q[k] ^ 0x80808080u;
+                const float v0 = fmaf((float) (u & 255u), f, nf), v1 = fmaf((float) ((u >> 8) & 255u), f, nf);
+                const float v2 = fmaf((float) ((u >> 16) & 255u), f, nf), v3 = fmaf((float) (u >> 24), f, nf);
+                int pk = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, 0, false);
+                pk = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, pk, true);
+                o[k] = (uint32_t) pk;
+            }
+            uint4* d = (uint4*) &wt[buf][ur][32 * uj];
+            d[0] = make_uint4(o[0], o[1], o[2], o[3]);
+            d[1] = make_uint4(o[4], o[5], o[6], o[7]);
+        };
+        __syncthreads();                                          // the previous item is done with the buffers
+        if (tid < kTileRows) srow[tid] = src[row0 + min(tid, nrows - 1)];
+        if (uj == 0) rsc[ur] = rs;
+        uint32_t raw[raw_words(WT)] = {};
+        load_unit<WT>(unit(0), sub(0), raw);
+        put(raw, 0);
+        if (NS > 1) load_unit<WT>(unit(1), sub(1), raw);
+        __syncthreads();                                          // srow, rsc
+        const bool on = 32 * wn < nrows;
+        const uint8_t* brow[2];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) brow[nt] = act + (size_t) srow[32 * wn + 16 * nt + l16] * ACT_LD;
+        nw_f8 acc[2][2];
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) acc[mt][nt] = nw_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        nw_frag bq[2][4];
+        auto fetch_b = [&](int s, nw_frag (&q)[2][4]) {
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const uint2* p = reinterpret_cast<const uint2*>(brow[nt] + s * AB + 8 * hi);
+                q[nt][0] = p[0]; q[nt][1] = p[2]; q[nt][2] = p[4]; q[nt][3] = p[6];
+            }
+        };
+        if (on) fetch_b(0, bq);
+        for (int s = 0; s < NS; ++s) {
+            __syncthreads();                                      // stage s's weights are in buffer s & 1
+            nw_frag nbq[2][4];
+            if (on && s + 1 < NS) fetch_b(s + 1, nbq);
+            if (on) {
+                const int bf = s & 1;
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+#pragma unroll
+                    for (int mt = 0; mt < 2; ++mt) {
+                        const int rb = 32 * wm + 16 * mt;
+                        const uint2* ap = reinterpret_cast<const uint2*>(&wt[bf][rb + l16][32 * h + 8 * hi]);
+                        const nw_ab A0 = nw_v(ap[0]), A1 = nw_v(ap[2]);
+#pragma unroll
+                        for (int nt = 0; nt < 2; ++nt)
+                            acc[mt][nt] = nw_wmma_f8(A1, nw_v(bq[nt][2 * h + 1]), nw_wmma_f8(A0, nw_v(bq[nt][2 * h]), acc[mt][nt]));
+                    }
+                }
+            }
+            if (s + 1 < NS) {
+                put(raw, (s + 1) & 1);
+                __syncthreads();
+                if (s + 2 < NS) load_unit<WT>(unit(s + 2), sub(s + 2), raw);
+                if (on) {
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) bq[nt][j] = nbq[nt][j];
+                }
+            }
+        }
+        if constexpr (ALIAS) __syncthreads();                     // every wave is done reading the weight buffers
+        if (on) {
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const float ts = *reinterpret_cast<const float*>(brow[nt] + 64);   // the token's activation scale
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+                    const int rb = 32 * wm + 16 * mt + 8 * hi;
+                    // lane l: local rows rb + i = features 16 wm + 8 mt + 4 hi + j, gate (i = 2j) and up (2j + 1)
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float gt = acc[mt][nt][2 * j] * (rsc[rb + 2 * j] * ts);
+                        const float up = acc[mt][nt][2 * j + 1] * (rsc[rb + 2 * j + 1] * ts);
+                        hs[32 * wn + 16 * nt + l16][16 * wm + 8 * mt + 4 * hi + j] = gt / (1.0f + __expf(-gt)) * up;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if constexpr (H8) {   // H block fb as E4M3: the pair of threads of a row share the 64 features' largest |h|
+            if (tid < 2 * kTileRows) {
+                const int r = tid >> 1, hh = tid & 1;
+                if (r < nrows) {
+                    float am = 0.0f;
+#pragma unroll 8
+                    for (int j = 0; j < 32; ++j) am = fmaxf(am, fabsf(hs[r][32 * hh + j]));
+                    am = fmaxf(am, __shfl_xor(am, 1));
+                    const float iv = am > 0.0f ? 448.0f / am : 0.0f;
+                    uint8_t* o = out + (size_t) (row0 + r) * (10 * AB) + (size_t) fb * AB;
+                    uint32_t wd[8];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        int pk = __builtin_amdgcn_cvt_pk_fp8_f32(hs[r][32 * hh + 4 * j] * iv, hs[r][32 * hh + 4 * j + 1] * iv, 0, false);
+                        pk = __builtin_amdgcn_cvt_pk_fp8_f32(hs[r][32 * hh + 4 * j + 2] * iv, hs[r][32 * hh + 4 * j + 3] * iv, pk, true);
+                        wd[j] = (uint32_t) pk;
+                    }
+                    uint4* o4 = reinterpret_cast<uint4*>(o + 32 * hh);
+                    o4[0] = make_uint4(wd[0], wd[1], wd[2], wd[3]);
+                    o4[1] = make_uint4(wd[4], wd[5], wd[6], wd[7]);
+                    if (hh == 0) *reinterpret_cast<float*>(o + 64) = am / 448.0f;
+                }
+            }
+            continue;
+        }
+        // H block fb (features 64 fb ..) to int8 per 32, natural order (as native_w11_kernel)
+        if (tid < 2 * kTileRows) {
+            const int r = tid >> 1, hh = tid & 1;
+            if (r < nrows) {
+                float am = 0.0f;
+#pragma unroll 8
+                for (int j = 0; j < 32; ++j) am = fmaxf(am, fabsf(hs[r][32 * hh + j]));
+                const float iv = am > 0.0f ? 127.0f / am : 0.0f;
+                uint8_t* o = out + (size_t) (row0 + r) * (10 * AB) + (size_t) fb * AB;
+                uint32_t wd[8] = {};
+                int csum = 0;
+#pragma unroll
+                for (int j = 0; j < 32; ++j) {
+                    const int c = __float2int_rn(hs[r][32 * hh + j] * iv);
+                    csum += c;
+                    wd[j >> 2] |= (uint32_t) (uint8_t) (int8_t) c << (8 * (j & 3));
+                }
+                uint4* o4 = reinterpret_cast<uint4*>(o + 32 * hh);
+                o4[0] = make_uint4(wd[0], wd[1], wd[2], wd[3]);
+                o4[1] = make_uint4(wd[4], wd[5], wd[6], wd[7]);
+                *reinterpret_cast<float*>(o + 64 + 4 * hh) = am / 127.0f;
+                *reinterpret_cast<float*>(o + 72 + 4 * hh) = (float) csum;
+            }
+        }
+    }
+#else
+    __builtin_trap();
+#endif
+}
+
+// STRATA_PF_FUSED_F8 down: H (E4M3 per 64 features, native_w12f8_gu_kernel<.., H8>) . W_down (decoded to E4M3 at one scale
+// per row: the largest block d x f8_bound_d / 448).  Per 64 values of K (one H block) the four WMMAs accumulate from 0 and
+// the block's H scale multiplies them in once; the row scale once at the end.  Down rows into `dm` (BF16 with D16).
+template <int T> __host__ __device__ constexpr float f8_bound_d() { return T == T_IQ4_NL ? 127.0f : 2.0f; }   // Q2_0: code - 1 <= 2
+__host__ __device__ constexpr bool f8_d_type(int t) { return t == T_IQ4_NL || t == T_Q2_0; }
+template <int WT, int LB, bool D16>
+__global__ void __launch_bounds__(NW_THREADS) __attribute__((amdgpu_waves_per_eu(LB > 0 ? LB : 1)))
+native_w12f8_d_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* __restrict__ act,
+                      float* __restrict__ dm) {
+#if STRATA_NAT_W12
+    constexpr int NS = D_ROWS_K / 64;
+    constexpr int NFB = 2560 / NW_ROWS;
+    constexpr int ACT_LD = NS * AB;
+    constexpr int BS = block_bytes(WT);
+    constexpr int BV = WT == T_IQ4_NL ? 32 : 64;   // values per block
+    constexpr int NB = D_ROWS_K / BV;
+    __shared__ __align__(16) uint8_t wtbuf[2 * NW_ROWS * WLD];
+    uint8_t(*wt)[NW_ROWS][WLD] = reinterpret_cast<uint8_t(*)[NW_ROWS][WLD]>(wtbuf);
+    __shared__ float rsc[NW_ROWS];
+    __shared__ int srow[kTileRows];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int wm = wave & 3, wn = wave >> 2, l16 = lane & 15, hi = lane >> 4;
+    (void) lane;
+    uint32_t kv[4] = {0, 0, 0, 0};
+    if constexpr (WT == T_IQ4_NL) {
+#pragma unroll
+        for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
+    }
+    const int ur = tid >> 1, uj = tid & 1;
+    const int t0 = tb.ts[b.e0], nwork = (tb.ts[b.e1] - t0) * NFB;
+    for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
+        const int2 tl = tb.tiles[t0 + w / NFB];
+        const int fb = w % NFB, e = tl.x, row0 = tl.y, nrows = min(kTileRows, tb.off[e + 1] - row0);
+        const uint8_t* blob = b.blob[e - b.e0];
+        const int rbase = fb * NW_ROWS;
+        const uint8_t* wrow = blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
+        auto unit = [&](int s) -> const uint8_t* { return WT == T_IQ4_NL ? wrow + (2 * s + uj) * BS : wrow + s * BS; };
+        float dmax = 0.0f;
+#pragma unroll
+        for (int k = 0; k < NB; ++k) dmax = fmaxf(dmax, fabsf(half_at(ld16(wrow + k * BS))));
+        const float rs = dmax > 0.0f ? dmax * (f8_bound_d<WT>() / 448.0f) : 1.0f, inv = 1.0f / rs;
+        auto put = [&](const uint32_t (&raw)[raw_words(WT)], int buf) {
+            uint32_t q[8];
+            float s0, s1;
+            convert<WT>(raw, nullptr, kv, q, s0, s1);
+            const float f0 = s0 * inv, f1 = s1 * inv;
+            uint32_t o[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const float f = k < 4 ? f0 : f1, nf = -128.0f * f;
+                const uint32_t u = q[k] ^ 0x80808080u;
+                const float v0 = fmaf((float) (u & 255u), f, nf), v1 = fmaf((float) ((u >> 8) & 255u), f, nf);
+                const float v2 = fmaf((float) ((u >> 16) & 255u), f, nf), v3 = fmaf((float) (u >> 24), f, nf);
+                int pk = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, 0, false);
+                pk = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, pk, true);
+                o[k] = (uint32_t) pk;
+            }
+            uint4* d = (uint4*) &wt[buf][ur][32 * uj];
+            d[0] = make_uint4(o[0], o[1], o[2], o[3]);
+            d[1] = make_uint4(o[4], o[5], o[6], o[7]);
+        };
+        __syncthreads();
+        if (tid < kTileRows) srow[tid] = row0 + min(tid, nrows - 1);
+        if (uj == 0) rsc[ur] = rs;
+        uint32_t raw[raw_words(WT)] = {};
+        load_unit<WT>(unit(0), uj, raw);
+        put(raw, 0);
+        if (NS > 1) load_unit<WT>(unit(1), uj, raw);
+        __syncthreads();
+        const bool on = 32 * wn < nrows;
+        const uint8_t* brow[2];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) brow[nt] = act + (size_t) srow[32 * wn + 16 * nt + l16] * ACT_LD;
+        float acc[2][2][8];
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[mt][nt][i] = 0.0f;
+        nw_frag bq[2][4];
+        float bx[2];
+        auto fetch_b = [&](int s, nw_frag (&q)[2][4], float (&x)[2]) {
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const uint2* p = reinterpret_cast<const uint2*>(brow[nt] + s * AB + 8 * hi);
+                q[nt][0] = p[0]; q[nt][1] = p[2]; q[nt][2] = p[4]; q[nt][3] = p[6];
+                x[nt] = *reinterpret_cast<const float*>(brow[nt] + s * AB + 64);
+            }
+        };
+        if (on) fetch_b(0, bq, bx);
+        for (int s = 0; s < NS; ++s) {
+            __syncthreads();
+            nw_frag nbq[2][4];
+            float nbx[2];
+            if (on && s + 1 < NS) fetch_b(s + 1, nbq, nbx);
+            if (on) {
+                const int bf = s & 1;
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt) {
+                    const int rb = 32 * wm + 16 * mt;
+                    nw_f8 t[2] = {nw_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}, nw_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f}};
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const uint2* ap = reinterpret_cast<const uint2*>(&wt[bf][rb + l16][32 * h + 8 * hi]);
+                        const nw_ab A0 = nw_v(ap[0]), A1 = nw_v(ap[2]);
+#pragma unroll
+                        for (int nt = 0; nt < 2; ++nt)
+                            t[nt] = nw_wmma_f8(A1, nw_v(bq[nt][2 * h + 1]), nw_wmma_f8(A0, nw_v(bq[nt][2 * h]), t[nt]));
+                    }
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) acc[mt][nt][i] = fmaf(t[nt][i], bx[nt], acc[mt][nt][i]);
+                }
+            }
+            if (s + 1 < NS) {
+                put(raw, (s + 1) & 1);
+                __syncthreads();
+                if (s + 2 < NS) load_unit<WT>(unit(s + 2), uj, raw);
+                if (on) {
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt) {
+                        bx[nt] = nbx[nt];
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) bq[nt][j] = nbq[nt][j];
+                    }
+                }
+            }
+        }
+        if (on) {
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    const int r = 32 * wn + 16 * nt + l16, f0 = 32 * wm + 16 * mt + 8 * hi;
+                    if (r < nrows) {
+                        float v[8];
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) v[i] = acc[mt][nt][i] * rsc[f0 + i];
+                        if constexpr (D16) {
+                            uint4* d = reinterpret_cast<uint4*>(reinterpret_cast<uint16_t*>(dm) + (size_t) (row0 + r) * 2560 + rbase + f0);
+                            *d = make_uint4(bf16x2_rn(v[0], v[1]), bf16x2_rn(v[2], v[3]), bf16x2_rn(v[4], v[5]), bf16x2_rn(v[6], v[7]));
+                        } else {
+                            float4* d = reinterpret_cast<float4*>(dm + (size_t) (row0 + r) * 2560 + rbase + f0);
+                            d[0] = make_float4(v[0], v[1], v[2], v[3]);
+                            d[1] = make_float4(v[4], v[5], v[6], v[7]);
+                        }
+                    }
+                }
+        }
+    }
+#else
+    __builtin_trap();
+#endif
+}
+
+// one block per token: its largest |x| -> ts = max / 448, the row's 2560 values in E4M3 at that scale, in the native
+// activation layout (80 bytes per 64 values: 64 codes, then ts in the block's first scale slot)
+__global__ void __launch_bounds__(256) quant_act_f8_kernel(const float* __restrict__ x, int cols, uint8_t* __restrict__ xa) {
+#if STRATA_NAT_W12
+    const int64_t r = blockIdx.x;
+    const float* xr = x + r * cols;
+    __shared__ float red[256];
+    float m = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += 256) m = fmaxf(m, fabsf(xr[i]));
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) {
+        if ((int) threadIdx.x < o) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
+        __syncthreads();
+    }
+    const float ts = red[0] > 0.0f ? red[0] / 448.0f : 1.0f, inv = 1.0f / ts;
+    uint8_t* o = xa + r * (int64_t) (cols / 64) * AB;
+    for (int i = 4 * threadIdx.x; i < cols; i += 4 * 256) {   // four values a store
+        const float4 v = *reinterpret_cast<const float4*>(xr + i);
+        int pk = __builtin_amdgcn_cvt_pk_fp8_f32(v.x * inv, v.y * inv, 0, false);
+        pk = __builtin_amdgcn_cvt_pk_fp8_f32(v.z * inv, v.w * inv, pk, true);
+        *reinterpret_cast<int*>(o + (i / 64) * AB + (i % 64)) = pk;
+    }
+    for (int k = threadIdx.x; k < cols / 64; k += 256) *reinterpret_cast<float*>(o + k * AB + 64) = ts;
 #else
     __builtin_trap();
 #endif
@@ -1145,6 +1568,40 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
     ck(cudaGetLastError(), "quantize_act_native");
 }
 
+bool dm16_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_DM16"); return v != nullptr && v[0] == '1'; }();
+    if (!on) return false;
+    const DevInfo& d = dev_info();
+    return d.ok && d.w12;
+}
+
+bool native_f8_gu(int gu_type) {
+#if defined(__HIPCC__)
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_F8"); return v != nullptr && v[0] == '1'; }();
+    if (!on || !f8_gu_type(gu_type)) return false;
+    const DevInfo& d = dev_info();
+    return d.ok && d.w12;
+#else
+    (void) gu_type;  // the FP8 matrix-core experts are a gfx12 (R9700) path; CUDA keeps its own kernels
+    return false;
+#endif
+}
+
+void quantize_act_f8(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) {
+    if (rows <= 0) return;
+#if defined(__HIPCC__)
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "strata: prompt gate/up experts on the FP8 matrix cores (STRATA_PF_FUSED_F8=1)\n");
+    }
+    quant_act_f8_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(x, (int) cols, (uint8_t*) xa);
+    ck(cudaGetLastError(), "quantize_act_f8");
+#else
+    (void) x; (void) cols; (void) xa; (void) stream;
+#endif
+}
+
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
                     const int32_t* src, void* ha, float* dm, void* stream) {
     if (b.e1 <= b.e0 || n <= 0) return;
@@ -1179,6 +1636,19 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         const uint8_t* xa8 = (const uint8_t*) xa;
         uint8_t* ha8 = (uint8_t*) ha;
 #define STRATA_NW_GU(T) do { if (occ_gu) native_w11_kernel<T, true, true, NW_LB><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); else native_w11_kernel<T, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); } while (0)
+        static const bool f8d_env = [] { const char* v = std::getenv("STRATA_PF_FUSED_F8D"); return v == nullptr || v[0] != '0'; }();
+        const bool f8_d = d.w12 && f8d_env && native_f8_gu(g.gu_type) && f8_d_type(g.d_type);
+#define STRATA_NW_GU8(T) do { if (f8_d) native_w12f8_gu_kernel<T, true, NW_LB, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8); else native_w12f8_gu_kernel<T, true, NW_LB><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8); } while (0)
+        if (d.w12 && native_f8_gu(g.gu_type)) {   // STRATA_PF_FUSED_F8: xa came from quantize_act_f8
+            switch (g.gu_type) {
+                case T_IQ2_XXS: STRATA_NW_GU8(T_IQ2_XXS); break;
+                case T_IQ2_XS: STRATA_NW_GU8(T_IQ2_XS); break;
+                case T_IQ2_S: STRATA_NW_GU8(T_IQ2_S); break;
+                case T_IQ3_XXS: STRATA_NW_GU8(T_IQ3_XXS); break;
+                case T_IQ3_S: STRATA_NW_GU8(T_IQ3_S); break;
+                default: STRATA_NW_GU8(T_IQ4_XS); break;
+            }
+        } else
         switch (g.gu_type) {
             case T_IQ2_XXS: STRATA_NW_GU(T_IQ2_XXS); break;
             case T_IQ2_XS: STRATA_NW_GU(T_IQ2_XS); break;
@@ -1190,7 +1660,16 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             default: STRATA_NW_GU(T_IQ4_XS); break;
         }
 #undef STRATA_NW_GU
-#define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); } while (0)
+#undef STRATA_NW_GU8
+#define STRATA_NW_D8(T) do { if (dm16_on()) native_w12f8_d_kernel<T, NW_LB, true><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, dm); else native_w12f8_d_kernel<T, NW_LB, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, dm); } while (0)
+        if (f8_d) {
+            if (g.d_type == T_Q2_0) STRATA_NW_D8(T_Q2_0);
+            else STRATA_NW_D8(T_IQ4_NL);
+            ck(cudaGetLastError(), "experts_native");
+            return;
+        }
+#undef STRATA_NW_D8
+#define STRATA_NW_D(T) do { if (d.w12 && dm16_on()) native_w11_kernel<T, false, true, NW_LB, true><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); } while (0)
         if (g.d_type == T_Q2_0) STRATA_NW_D(T_Q2_0);
         else if (g.d_type == T_Q5_1) STRATA_NW_D(T_Q5_1);
         else if (g.d_type == T_Q8_0) STRATA_NW_D(T_Q8_0);

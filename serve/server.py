@@ -55,7 +55,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
+                            forced_call, image_details_of, images_of, literal_tags, mark_think_literals,
+                            openai_to_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
@@ -2011,6 +2012,15 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
+        # "default_max_tokens" (opt-in, under "max_tokens"): an image whose part does not ask for detail "high" is
+        # shrunk here to what the encoder would make of it at that many tokens, so "max_tokens" becomes the ceiling a
+        # request reaches only by asking.  A redraw judged at 276 tokens was a coin toss on "drawn or photographed
+        # skin" (11 of 36 checks wrong) and right 36 of 36 at 989, but a watcher's 15 frames at the larger size took
+        # 209 s on the CPU instead of 38.  "token_px": the pixels one image token covers along a side (Qwen-VL: a
+        # 16-pixel patch, 2x2 merged = 32).
+        ceiling, default = int(cfg.get("max_tokens") or 0), int(cfg.get("default_max_tokens") or 0)
+        self.default_tokens = default if default > 0 and (ceiling <= 0 or default < ceiling) else 0
+        self.token_px = int(cfg.get("token_px") or 32)
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.proc = None
@@ -2168,19 +2178,67 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
-    def encode_all(self, sources: list) -> list[tuple[Path, int]]:
+    def encode_all(self, sources: list, details: list | None = None) -> list[tuple[Path, int]]:
         """encode() for every image of one request: the files of this request's earlier images are never evicted to
         make room for a later one (#1072: with more than 64 unique images the first was deleted before the request
-        had read it)."""
+        had read it).  `details`: each image's detail ("high" reaches max_tokens), in the same order."""
         out: list[tuple[Path, int]] = []
-        for src in sources:
-            out.append(self.encode(src, keep=[p for p, _ in out]))
+        for i, src in enumerate(sources):
+            high = bool(details) and i < len(details) and details[i] == "high"
+            out.append(self.encode(src, keep=[p for p, _ in out], high=high))
         return out
 
-    def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
+    @staticmethod
+    def fit_size(width: int, height: int, max_tokens: int, px: int = 32) -> tuple[int, int]:
+        """The size mtmd's Qwen-VL preprocessing gives an image at `max_tokens` (mtmd-image.cpp
+        calc_size_preserved_ratio): each side rounded to `px`, then, when that is over the budget, both scaled down
+        by one factor and floored to `px`."""
+        def rnd(x):
+            return int(math.floor(x / px + 0.5)) * px
+        w, h = max(px, rnd(width)), max(px, rnd(height))
+        if w * h > max_tokens * px * px:
+            beta = math.sqrt(height * width / (max_tokens * px * px))
+            h = max(px, int(math.floor(height / beta / px)) * px)
+            w = max(px, int(math.floor(width / beta / px)) * px)
+        return w, h
+
+    def fit_default(self, data: bytes) -> bytes:
+        """An image shrunk to default_max_tokens (see __init__) as a PNG, or `data` itself when it already fits, when
+        there is no default, or without Pillow."""
+        default = getattr(self, "default_tokens", 0)
+        if not default:
+            return data
+        try:
+            import io
+            from PIL import Image
+            im = Image.open(io.BytesIO(data))
+            px = getattr(self, "token_px", 32)
+            w, h = self.fit_size(im.width, im.height, default, px)
+            if (w, h) == self.fit_size(im.width, im.height, 1 << 30, px):
+                return data                                    # already within the default: as it was
+            im.load()
+            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                im = im.convert("RGBA")
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[-1])
+                im = bg
+            elif im.mode != "RGB":
+                im = im.convert("RGB")
+            out = io.BytesIO()
+            im.resize((w, h), Image.BICUBIC).save(out, format="PNG")
+            return out.getvalue()
+        except ImportError:
+            return data
+        except Exception:
+            return data                                        # the encoder says what is wrong with it
+
+    def encode(self, source: str | bytes, keep=(), high: bool = False) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
-        `keep`: files the caller still needs (never evicted by this call)."""
+        `keep`: files the caller still needs (never evicted by this call).  `high`: the part asked for detail "high"
+        (max_tokens); otherwise default_max_tokens, when the config sets one."""
         data = self.normalize(source if isinstance(source, bytes) else self.load(source))
+        if not high:
+            data = self.fit_default(data)
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
@@ -3481,8 +3539,9 @@ class Service:
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
+            details = image_details_of(messages)
             with self.fifo:
-                encoded = (self.vision.encode_all(images) if hasattr(self.vision, "encode_all")
+                encoded = (self.vision.encode_all(images, details) if hasattr(self.vision, "encode_all")
                            else [self.vision.encode(src) for src in images])
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
@@ -6137,6 +6196,37 @@ def check_request_sampling(req) -> None:
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
 
 
+def warmup_prompt(port: int, api_key: str, from_config: str = "") -> None:
+    """STRATA_WARMUP_TOKENS=N: one throwaway prompt of about N tokens (one token answered) before the server says it is
+    ready.  R9700, all experts in RAM: the first long prompt after a start sometimes read at 550-1,750 tok/s (the GPU
+    waiting up to 20 s for its first expert copies) where the next ones read at 3,300; after a 4K first prompt, they did
+    not.  0 or unset: nothing.  The environment wins over the config's "env"."""
+    try:
+        n = int(os.environ.get("STRATA_WARMUP_TOKENS", "") or from_config or 0)
+    except ValueError:
+        n = 0
+    if n <= 0:
+        return
+    import random
+    import urllib.request
+    filler = ("The lighthouse keeper wrote down the weather, the ships that passed and the state of the lamp every "
+              "evening, and on the last page of each month he added up the hours the light had burned. ")
+    text = "Warm-up %d.\n\n" % random.randint(0, 10 ** 9) + filler * max(1, n // 40) + "\nSay OK."
+    body = {"model": "x", "messages": [{"role": "user", "content": text}], "max_tokens": 1, "temperature": 0}
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    t0 = time.monotonic()
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(), headers)
+        with urllib.request.urlopen(req, timeout=600) as r:
+            done = json.load(r).get("timings", {})
+        print(f"[strata] warm-up prompt: {done.get('prompt_n', '?')} tokens in {time.monotonic() - t0:.1f} s "
+              f"(STRATA_WARMUP_TOKENS={n})", flush=True)
+    except Exception as e:   # a failed warm-up costs nothing but the warm-up
+        print(f"[strata] warm-up prompt failed: {e}", flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -6400,6 +6490,7 @@ def main() -> int:
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
+    warmup_prompt(a.port, svc.api_key, str(((cfg or {}).get("env") or {}).get("STRATA_WARMUP_TOKENS", "")))
     svc.start_idle_unload()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "

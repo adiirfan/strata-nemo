@@ -3000,9 +3000,38 @@ bool FileExpertSource::pin_cache_complement(
                              (double) headroom_bytes / 1073741824.0, (double) clamped / 1073741824.0);
             budget_bytes = clamped;
         }
+        // STRATA_BUDGET_LEND_GIB=X: up to X GiB of the budget keep the prompt loan's experts (the tail slots, from the last
+        // one down - a short prompt lends only the last few), as the unbudgeted resident mode does.  A lent expert is then
+        // streamed during the prompt and put back after it from RAM instead of the drive (24 GB setup, R9700: 6.5 GiB at
+        // a 16K prompt, 12.5 GiB at 32K, read back at 3.5 GB/s).  The rest of the budget: the complement by rank, as
+        // before.  Off (0) by default: it is RAM the decode windows' misses no longer find there.
+        static const double lend_gib = [] { const char* v = std::getenv("STRATA_BUDGET_LEND_GIB"); return v ? std::atof(v) : 0.0; }();
+        const uint64_t lend_cap = lend_gib > 0.0 ? std::min<uint64_t>((uint64_t) (lend_gib * 1073741824.0), budget_bytes) : 0;
+        std::vector<char> lent_pick;
+        if (lend_cap > 0 && lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty()) {
+            const int64_t kf = detail::choose_resident_keep_from(slot_bytes, 0, lend_cap, lend_from_slot);
+            if (kf >= 0 && kf < n_slots) {
+                std::vector<std::pair<int32_t, int32_t>> core;
+                core.reserve(primary_gpu_pairs.size());
+                lent_pick.assign(offsets.size(), 0);
+                for (size_t i = 0; i < primary_gpu_pairs.size(); ++i) {
+                    if (pair_slot[i] < kf) core.push_back(primary_gpu_pairs[i]);
+                    else lent_pick[(size_t) primary_gpu_pairs[i].first * (size_t) n_expert_ + (size_t) primary_gpu_pairs[i].second] = 1;
+                }
+                if (!detail::make_cache_complement_plan(n_layers_, n_expert_, layer_blob_bytes_, core,
+                                                        additional_gpu_pairs, offsets, bytes, err)) return false;
+                budget_lend_keep_from_ = kf;
+            }
+        }
         std::vector<uint64_t> ranked(offsets.size(), kNoComplement);
         uint64_t at = 0;
         int64_t held = 0;
+        for (size_t i = 0; i < lent_pick.size(); ++i)   // the loan's experts first
+            if (lent_pick[i] && offsets[i] != kNoComplement) {
+                ranked[i] = at;
+                at += layer_blob_bytes_[i / (size_t) n_expert_];
+                ++held;
+            }
         if (rank != nullptr)
             for (const auto& pr : *rank) {
                 if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;
@@ -3023,7 +3052,10 @@ bool FileExpertSource::pin_cache_complement(
                      (double) budget_bytes / 1073741824.0, (long long) held, (double) bytes / 1073741824.0);
         offsets.swap(ranked);
         bytes = at;
-        lend_from_slot = -1;
+        if (budget_lend_keep_from_ < 0) lend_from_slot = -1;
+        else
+            std::fprintf(stderr, "FileExpertSource: STRATA_BUDGET_LEND_GIB %.1f: the last %lld slots' experts (the prompt loan's) "
+                                 "kept in RAM first\n", lend_gib, (long long) (n_slots - budget_lend_keep_from_));
     }
 
     const bool lend = lend_from_slot >= 0 && lend_from_slot < n_slots && additional_gpu_pairs.empty();
@@ -3061,7 +3093,9 @@ bool FileExpertSource::pin_cache_complement(
     // their slots after it, so the ones that fit are kept here too (from the last slot down: a short prompt lends
     // only the last few).  The rest keep the mapped-file fallback.
     int64_t keep_from = n_slots;
-    if (lend) {
+    if (lend && budget_lend_keep_from_ >= 0) {
+        keep_from = budget_lend_keep_from_;   // the budget branch already planned the loan's share (STRATA_BUDGET_LEND_GIB)
+    } else if (lend) {
         keep_from = detail::choose_resident_keep_from(slot_bytes, bytes, budget, lend_from_slot);
         if (keep_from < 0) keep_from = n_slots;
         if (keep_from < n_slots) {
@@ -5012,6 +5046,16 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         delete a;
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
         return false;
+    }
+    // STRATA_ARENA_MLOCK=1 (Linux): lock the filled arena.  Registered for the GPU it is a KFD userptr, which the kernel
+    // may still MOVE (compaction for another process's large allocation); every move suspends the GPU's queues until
+    // the driver maps the range again (R9700: 2-17 s per run of prompts, 40-70 s at load).  Locked pages are left where
+    // they are when vm.compact_unevictable_allowed = 0.  Needs the memlock limit (ulimit -l / LimitMEMLOCK) for it.
+    if (const char* ml = std::getenv("STRATA_ARENA_MLOCK"); ml != nullptr && ml[0] == '1') {
+        const strata::platform::LockResult lr = strata::platform::lock_resident(a->data(), want + (uint64_t) blob);
+        std::fprintf(stderr, "strata generate: STRATA_ARENA_MLOCK: %s, %.1f GiB%s\n", lr.note.c_str(),
+                     (double) (want + (uint64_t) blob) / 1073741824.0,
+                     lr.ok ? "" : " - not locked: the kernel may move the arena's pages (see vm.compact_unevictable_allowed)");
     }
     if (std::getenv("STRATA_VERIFY_ARENA") != nullptr) {   // tests: the loaded arena's checksum, any loader
         std::fprintf(stderr, "strata generate: expert arena checksum %016llx (%.2f GiB)\n",
