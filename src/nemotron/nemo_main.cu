@@ -998,10 +998,12 @@ struct Model {
         }         // BF16 activations up to kTBig x 24,576 (the drafter's fc)
         // the prompt attention products hold (16 T x max_ctx) scores: this caps the context they serve
         const size_t Lmax = size_t(max_ctx + 64);
-        CK(cudaMalloc(&B->kb, Lmax * kAHeadDim * 2)); CK(cudaMalloc(&B->vtb, Lmax * kAHeadDim * 2));
         CK(cudaMalloc(&B->kb2, kAKv * Lmax * kAHeadDim * 2)); CK(cudaMalloc(&B->vtb2, kAKv * Lmax * kAHeadDim * 2));
-        CK(cudaMalloc(&B->qb, 16 * kAttSub * kAHeadDim * 2)); CK(cudaMalloc(&B->O, 16 * kAttSub * kAHeadDim * 4));
-        CK(cudaMalloc(&B->S, 16 * kAttSub * Lmax * 4)); CK(cudaMalloc(&B->P, 16 * kAttSub * Lmax * 2));
+        if (att_old) {   // the two-GEMM attention's score tables (24 KB a context position) only when it runs
+            CK(cudaMalloc(&B->kb, Lmax * kAHeadDim * 2)); CK(cudaMalloc(&B->vtb, Lmax * kAHeadDim * 2));
+            CK(cudaMalloc(&B->qb, 16 * kAttSub * kAHeadDim * 2)); CK(cudaMalloc(&B->O, 16 * kAttSub * kAHeadDim * 4));
+            CK(cudaMalloc(&B->S, 16 * kAttSub * Lmax * 4)); CK(cudaMalloc(&B->P, 16 * kAttSub * Lmax * 2));
+        }
         CK(cudaMalloc(&B->ridx, S * 4)); CK(cudaMalloc(&B->bounds, 513 * 4)); CK(cudaMalloc(&B->src, S * 4));
         CK(cudaMalloc(&B->rowof, S * 4)); CK(cudaMalloc(&B->ident, S * 4)); CK(cudaMalloc(&B->one_bounds, 2 * 4));
         CK(cudaMalloc(&B->toks, kTBig * 4));
@@ -1158,6 +1160,8 @@ struct Model {
             CK(cudaMalloc(&B->w8, size_t(kInProj) * kHidden)); CK(cudaMalloc(&B->x8, size_t(kTBig) * kMInter));
             CK(cudaMalloc(&B->rscale, 2 * size_t(kInProj) * 4)); CK(cudaMalloc(&B->amax, 4));
         }
+        // (a product past the FP8 buffers - the drafter's fc, 24,576 wide - takes the BF16 path: it overran them)
+        if (rows > kInProj || size_t(rows) * K > size_t(kInProj) * kHidden || size_t(T) * K > size_t(kTBig) * kMInter) return false;
         k_nvfp4_to_e4m3_rows<<<rows, 256, 0, stream>>>(w, sc, K, B->w8, B->rscale);
         if (X) x8_from(X, size_t(T) * K);
         float* alpha = B->rscale + kInProj;
@@ -1818,14 +1822,21 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         auto next = [&]() { if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); } return std::string(argv[++i]); };
         if (a == "--model") dir = next();
-        else if (a == "--ids") ids_s = next();
+        else if (a == "--ids") {   // (--ids @FILE: the comma-separated ids from a file, for prompts past the argument limit)
+            ids_s = next();
+            if (!ids_s.empty() && ids_s[0] == '@') {
+                std::ifstream f(ids_s.substr(1));
+                if (!f) { std::fprintf(stderr, "strata-nemo: cannot read %s\n", ids_s.c_str() + 1); return 1; }
+                ids_s.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            }
+        }
         else if (a == "--new") n_new = std::stoi(next());
         else if (a == "--dump") dump_path = next();
         else if (a == "--max-ctx") ctx = std::stoi(next());
         else if (a == "--mode") mode = next();
         else if (a == "--draft") draft_dir = next();
         else if (a == "--ppl") ppl = true;
-        else { std::fprintf(stderr, "usage: strata-nemo --model DIR --ids 1,2,3 [--new N] [--dump FILE] [--max-ctx N] [--mode plain|small|onebyone|spec] [--draft DIR] [--ppl]\n"); return 2; }
+        else { std::fprintf(stderr, "usage: strata-nemo --model DIR --ids 1,2,3|@FILE [--new N] [--dump FILE] [--max-ctx N] [--mode plain|small|onebyone|spec] [--draft DIR] [--ppl]\n"); return 2; }
     }
     if (dir.empty() || ids_s.empty()) { std::fprintf(stderr, "strata-nemo: --model and --ids are needed\n"); return 2; }
     std::vector<int> ids;
