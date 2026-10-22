@@ -132,12 +132,11 @@ __global__ void __launch_bounds__(1024) k_sample(const float* l, SampleParams sp
 // of a block maximum over the threads' heads), and temperature, top_p and min_p act on those k only. The same cut and
 // draw as k_sample, without its bisection passes over the whole vocabulary (about 1.6 ms a token on the R9700).
 constexpr int kTopKMax = 64;
-__global__ void __launch_bounds__(1024) k_sample_topk(const float* l, SampleParams sp, unsigned long long step, int* state) {
-    __shared__ float cv[kTopKMax];
-    __shared__ int ci[kTopKMax];
+// the k best of a row into cv / ci (sorted, best first), the whole block of 1024
+__device__ void sp_topk(const float* l, int k, float* cv, int* ci) {
     __shared__ float wv[32];
     __shared__ int wi[32], wt[32];
-    const int tid = threadIdx.x, j0 = tid * kSpChunk, j1 = min(kVocabF, j0 + kSpChunk), k = sp.top_k;
+    const int tid = threadIdx.x, j0 = tid * kSpChunk, j1 = min(kVocabF, j0 + kSpChunk);
     // this thread's best k, sorted (k <= 64, kSpChunk values each)
     float bv[kTopKMax];
     int bi[kTopKMax];
@@ -169,9 +168,10 @@ __global__ void __launch_bounds__(1024) k_sample_topk(const float* l, SamplePara
         if (tid == wt[0]) ++head;
         __syncthreads();
     }
-    if (tid != 0) return;
-    // cv is sorted, best first: softmax at the temperature, then the top_p and min_p cuts
-    float p[kTopKMax], z = 0.f;
+}
+// the kept tokens of a sorted top-k row: probabilities at the temperature, and how many survive top_p / min_p
+__device__ inline int sp_keep(const float* cv, int k, const SampleParams& sp, float* p, float& kept) {
+    float z = 0.f;
     for (int r = 0; r < k; ++r) { p[r] = cv[r] == -INFINITY ? 0.f : __expf((cv[r] - cv[0]) * sp.inv_temp); z += p[r]; }
     int keep = k;
     float acc = 0.f;
@@ -180,13 +180,65 @@ __global__ void __launch_bounds__(1024) k_sample_topk(const float* l, SamplePara
         if (sp.top_p < 1.f && acc >= sp.top_p * z) { keep = r + 1; break; }
     }
     if (sp.min_p > 0.f) for (int r = 1; r < keep; ++r) if (p[r] < sp.min_p * p[0]) { keep = r; break; }
-    float kept = 0.f;
+    kept = 0.f;
     for (int r = 0; r < keep; ++r) kept += p[r];
+    return keep;
+}
+__global__ void __launch_bounds__(1024) k_sample_topk(const float* l, SampleParams sp, unsigned long long step, int* state) {
+    __shared__ float cv[kTopKMax];
+    __shared__ int ci[kTopKMax];
+    const int k = sp.top_k;
+    sp_topk(l, k, cv, ci);
+    if (threadIdx.x != 0) return;
+    // cv is sorted, best first: softmax at the temperature, then the top_p and min_p cuts
+    float p[kTopKMax], kept;
+    const int keep = sp_keep(cv, k, sp, p, kept);
     const float target = sp_uniform(sp.seed, step, 1) * kept;
     float run = 0.f;
     int pick = ci[keep - 1];
     for (int r = 0; r < keep; ++r) { run += p[r]; if (run > target) { pick = ci[r]; break; } }
     state[1] = pick;
+}
+
+// Drafted tokens against the checking pass's rows (row r: the distribution after the r-th checked token): draft r is
+// kept with the probability the sampler gives it; the first one refused is replaced by a draw from the kept tokens
+// without it (so every token is still distributed exactly as plain sampling would give), and if all are kept the last
+// row draws one more. out[0] = drafts kept, out[1] = the token after them. top_k in 1..64 only.
+__global__ void __launch_bounds__(1024) k_spec_pick(const float* LG, int nd, const int* drafts, SampleParams sp,
+                                                     unsigned long long step, int* out) {
+    __shared__ float cv[kTopKMax];
+    __shared__ int ci[kTopKMax];
+    __shared__ int done;
+    for (int r = 0; r <= nd; ++r) {
+        sp_topk(LG + size_t(r) * kVocabF, sp.top_k, cv, ci);
+        if (threadIdx.x == 0) {
+            float p[kTopKMax], kept;
+            const int keep = sp_keep(cv, sp.top_k, sp, p, kept);
+            const int d = r < nd ? drafts[r] : -1;
+            float pd = 0.f;
+            int rd = -1;
+            for (int u = 0; u < keep; ++u) if (ci[u] == d) { pd = p[u]; rd = u; }
+            done = 0;
+            if (rd >= 0 && sp_uniform(sp.seed, step + r, 2) * kept < pd) done = 0;   // kept: on to the next row
+            else {
+                const float rest = kept - pd, target = sp_uniform(sp.seed, step + r, 1) * rest;
+                float run = 0.f;
+                int pick = -1;
+                for (int u = 0; u < keep; ++u) {
+                    if (u == rd) continue;
+                    pick = ci[u];
+                    run += p[u];
+                    if (run > target) break;
+                }
+                out[0] = r;
+                out[1] = pick;
+                done = 1;
+            }
+        }
+        __syncthreads();
+        if (done) return;
+        __syncthreads();
+    }
 }
 
 struct LineReader {
@@ -216,10 +268,52 @@ struct LineReader {
     bool poll_line(std::string& line) { if (take(line)) return true; fill(0); return take(line); }
 };
 
+// Word-copy guessing: the latest earlier place the last 3 (else 2) tokens appeared, and the tokens that followed it
+struct NgramIndex {
+    std::unordered_map<uint64_t, int> g3, g2;   // n-gram -> the position just after its latest occurrence
+    size_t upto = 0;                             // seq[0 .. upto) indexed
+    static uint64_t key(const int* t, int n) { uint64_t h = uint64_t(n); for (int i = 0; i < n; ++i) h = h * 0x9E3779B97F4A7C15ull ^ uint64_t(uint32_t(t[i])); return h; }
+    void reset() { g3.clear(); g2.clear(); upto = 0; }
+    // index the n-grams ending before the last token of seq (a match must have a token after it)
+    void add(const std::vector<int>& seq) {
+        for (; upto + 1 < seq.size(); ++upto) {
+            const size_t e = upto + 1;   // n-grams ending at upto, followed by seq[e]
+            if (e >= 2) g2[key(&seq[e - 2], 2)] = int(e);
+            if (e >= 3) g3[key(&seq[e - 3], 3)] = int(e);
+        }
+    }
+    // up to kmax drafted tokens following the latest earlier match of seq's tail; returns the n-gram length used (0: none)
+    int draft(const std::vector<int>& seq, int kmax, std::vector<int>& out) const {
+        out.clear();
+        const size_t n = seq.size();
+        for (int g = 3; g >= 2; --g) {
+            if (n < size_t(g) + 1) continue;
+            const auto& map = g == 3 ? g3 : g2;
+            const auto it = map.find(key(&seq[n - g], g));
+            if (it == map.end()) continue;
+            for (int i = it->second; i < int(n) && int(out.size()) < kmax; ++i) out.push_back(seq[i]);
+            if (!out.empty()) return g;
+        }
+        return 0;
+    }
+};
+
 static int serve(Model& m, const std::vector<int>& eos_ids, int chunk) {
     LineReader in;
     std::vector<int> live;                                         // the tokens whose K/V the cache holds, in order
     unsigned long long step_no = 0;
+    // guessing: FLINT_SPEC=0 turns it off, FLINT_SPEC_K the most drafted tokens a check (1..3)
+    const bool spec_on = !(std::getenv("FLINT_SPEC") && std::atoi(std::getenv("FLINT_SPEC")) == 0);
+    const int spec_k = std::max(1, std::min(3, std::getenv("FLINT_SPEC_K") ? std::atoi(std::getenv("FLINT_SPEC_K")) : 3));
+    NgramIndex ngi;
+    int *sp_out = nullptr, *sp_drafts = nullptr, *sp_host = nullptr;
+    CK(cudaMalloc(&sp_out, 8));
+    CK(cudaMalloc(&sp_drafts, 16 * 4));
+    CK(cudaMallocHost(&sp_host, 32 * 4));
+    // what a plain step and a check of T tokens cost (ms), and how many drafts a check keeps, by n-gram length: running
+    // averages; a check is made only when it should give more tokens a millisecond than plain steps
+    double plain_ms = 0, check_ms[kVMax + 1] = {}, kept_avg[4] = {0, 0, 1.5, 2.0};
+    long spec_checks = 0, spec_kept = 0;
     std::printf("INFO engine=strata-flint\n");
     std::printf("READY %d stop\n", m.max_ctx);
     std::fflush(stdout);
@@ -267,6 +361,7 @@ static int serve(Model& m, const std::vector<int>& eos_ids, int chunk) {
         if (live.size() - reuse + kWindow > size_t(m.ring_rows())) reuse = 0;
         m.set_pos(int(reuse));
         live.resize(reuse);
+        if (ngi.upto > live.size()) ngi.reset();
         std::printf("RESUME %zu\n", reuse);
         std::fflush(stdout);
         bool cancelled = false;
@@ -300,20 +395,77 @@ static int serve(Model& m, const std::vector<int>& eos_ids, int chunk) {
             return m.next_token();
         };
         int tok = pick();
-        for (;;) {
-            std::printf("T %d\n", tok);
+        const bool can_spec = spec_on && (!sample || (sp.top_k > 0 && sp.top_k <= kTopKMax));
+        std::vector<int> seq, drafts;
+        auto emit = [&](int t) {
+            std::printf("T %d\n", t);
             ++produced;
-            if (is_eos(tok)) finish = "stop";
+            if (is_eos(t)) finish = "stop";
             else if (produced >= max_new || m.pos + 2 > m.max_ctx) finish = "length";
+        };
+        for (;;) {
+            emit(tok);
             std::fflush(stdout);
             if (finish) break;
             std::string l2;
             if (in.poll_line(l2) && l2 == "STOP") { finish = "cancel"; break; }
-            m.step(-1);                                            // (state[1] is tok: the step reads it on the card)
+            int g = 0;
+            if (can_spec) {
+                seq = live;
+                seq.push_back(tok);
+                ngi.add(live);
+                const int room = std::min({spec_k, max_new - produced - 1, m.max_ctx - m.pos - 3});
+                g = room > 0 ? ngi.draft(seq, room, drafts) : 0;
+                // check only if expected tokens a millisecond beat a plain step (untimed costs: try it)
+                if (g) {
+                    const int T = 1 + int(drafts.size());
+                    const double c = check_ms[T];
+                    if (plain_ms > 0 && c > 0 && (1.0 + std::min(kept_avg[g], double(drafts.size()))) / c < 1.0 / plain_ms) g = 0;
+                }
+            }
+            const auto s0 = std::chrono::steady_clock::now();
+            if (!g) {
+                m.step(-1);                                        // (state[1] is tok: the step reads it on the card)
+                live.push_back(tok);
+                tok = pick();
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
+                plain_ms = plain_ms > 0 ? 0.9 * plain_ms + 0.1 * ms : ms;
+                continue;
+            }
+            const int nd = int(drafts.size()), T = 1 + nd;
+            int chk[kVMax];
+            chk[0] = tok;
+            for (int i = 0; i < nd; ++i) chk[i + 1] = drafts[i];
+            m.verify(chk, T);
+            int kept = 0, next = 0;
+            if (sample) {
+                std::memcpy(sp_host, drafts.data(), nd * 4);
+                CK(cudaMemcpyAsync(sp_drafts, sp_host, nd * 4, cudaMemcpyHostToDevice, m.st));
+                k_spec_pick<<<1, 1024, 0, m.st>>>(m.vLG, nd, sp_drafts, sp, step_no, sp_out);
+                CK(cudaMemcpyAsync(sp_host + 16, sp_out, 8, cudaMemcpyDeviceToHost, m.st));
+                CK(cudaStreamSynchronize(m.st));
+                kept = sp_host[16];
+                next = sp_host[17];
+            } else {
+                while (kept < nd && m.vBestHost[kept] == drafts[kept]) ++kept;
+                next = m.vBestHost[kept];
+            }
+            step_no += kept + 1;
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
+            check_ms[T] = check_ms[T] > 0 ? 0.9 * check_ms[T] + 0.1 * ms : ms;
+            kept_avg[g] = 0.9 * kept_avg[g] + 0.1 * kept;
+            ++spec_checks;
+            spec_kept += kept;
+            m.v_commit(kept + 1, next);
             live.push_back(tok);
-            tok = pick();
+            for (int i = 0; i < kept && !finish; ++i) { emit(drafts[i]); live.push_back(drafts[i]); }
+            if (finish) { std::fflush(stdout); break; }
+            tok = next;
         }
         const double decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+        if (std::getenv("FLINT_SPEC_LOG"))
+            std::fprintf(stderr, "strata-flint: guessing: %ld checks kept %ld drafts; plain %.2f ms, check 2-4: %.2f %.2f %.2f ms, kept a check by 3/2-gram %.2f %.2f\n",
+                         spec_checks, spec_kept, plain_ms, check_ms[2], check_ms[3], check_ms[4], kept_avg[3], kept_avg[2]);
         std::printf("DONE %d %zu %.1f %.1f %s 0 0 %zu 0 0 0 0 0 %d 0\n", produced, ids.size(), prompt_ms, decode_ms, finish,
                     reuse, read_n);
         std::fflush(stdout);

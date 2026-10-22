@@ -29,6 +29,7 @@
 #include <type_traits>
 #include <memory>
 #include <sstream>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
