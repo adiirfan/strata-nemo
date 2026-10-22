@@ -3117,7 +3117,19 @@ struct Model {
     }
     // (debugging) only the first FLINT_NLAYERS layers, then the head
     static int n_layers() { static const int n = std::getenv("FLINT_NLAYERS") ? std::atoi(std::getenv("FLINT_NLAYERS")) : kLayers; return n; }
-    static bool pf_lo() { static const bool v = !std::getenv("FLINT_PF_HI") ; return v; }
+    // FLINT_PF_HI: the prompt path's inputs without their fp16 remainder - "all", "dense" (attention, shared and dense
+    // FFN products) or "experts" (the routed experts); unset: hi + lo everywhere (exact)
+    static int pf_hi() {
+        static const int v = [] {
+            const char* e = std::getenv("FLINT_PF_HI");
+            if (!e) return 0;
+            const std::string s(e);
+            return s == "dense" ? 1 : s == "experts" ? 2 : 3;
+        }();
+        return v;
+    }
+    static bool pf_lo() { return !(pf_hi() & 1); }        // (the dense products)
+    static bool pf_lo_e() { return !(pf_hi() & 2); }      // (the routed experts)
     // y (T x N, row stride ldy; += when add) = W . x for the split rows (xh, xl, xs) of T tokens
     void pf_gemm(const uint8_t* W, int N, int K, int T, float* Y, int ldy, int add) {
         const dim3 gr((N + 255) / 256, (T + 63) / 64);
@@ -3212,14 +3224,14 @@ struct Model {
             k_pf_bounds<<<1, kExperts, 0, st>>>(pCount, pBounds, pFill, pTiles, pNT);
             k_pf_scatter<<<(S + 255) / 256, 256, 0, st>>>(pIdx, T, pBounds, pFill, pSrc, pSlot);
             // experts' gate/up on the split rows of each routed token
-            if (pf_lo()) k_gemm_q41_grp<true, true><<<dim3(kFfExp / 256, max_tiles), 256, 0, st>>>(l.gate_e, l.up_e, gu_bytes, kFfExp, kHidden, pXH, pXL, pXS, pSrc, pBounds, pTiles, pNT, pACT, kFfExp);
+            if (pf_lo_e()) k_gemm_q41_grp<true, true><<<dim3(kFfExp / 256, max_tiles), 256, 0, st>>>(l.gate_e, l.up_e, gu_bytes, kFfExp, kHidden, pXH, pXL, pXS, pSrc, pBounds, pTiles, pNT, pACT, kFfExp);
             else k_gemm_q41_grp<false, true><<<dim3(kFfExp / 256, max_tiles), 256, 0, st>>>(l.gate_e, l.up_e, gu_bytes, kFfExp, kHidden, pXH, pXL, pXS, pSrc, pBounds, pTiles, pNT, pACT, kFfExp);
             // shared expert's down, added into h
             pf_split(pG, pU, nullptr, kFfShared, T);
             pf_gemm(l.down_s, kHidden, kFfShared, T, pH, kHidden, 1);
             // experts' down on their act rows (grouped order), then the weighted sum into h
             pf_split(pACT, nullptr, nullptr, kFfExp, S);
-            if (pf_lo()) k_gemm_q41_grp<true, false><<<dim3(kHidden / 256, max_tiles), 256, 0, st>>>(l.down_e, nullptr, d_bytes, kHidden, kFfExp, pXH, pXL, pXS, nullptr, pBounds, pTiles, pNT, pY, kHidden);
+            if (pf_lo_e()) k_gemm_q41_grp<true, false><<<dim3(kHidden / 256, max_tiles), 256, 0, st>>>(l.down_e, nullptr, d_bytes, kHidden, kFfExp, pXH, pXL, pXS, nullptr, pBounds, pTiles, pNT, pY, kHidden);
             else k_gemm_q41_grp<false, false><<<dim3(kHidden / 256, max_tiles), 256, 0, st>>>(l.down_e, nullptr, d_bytes, kHidden, kFfExp, pXH, pXL, pXS, nullptr, pBounds, pTiles, pNT, pY, kHidden);
             k_pf_combine<<<T, 256, 0, st>>>(pH, pY, pSlot, pW, T);
             dump_rows(pH, T);
