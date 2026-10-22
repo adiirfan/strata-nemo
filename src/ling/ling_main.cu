@@ -217,9 +217,105 @@ struct Mv {
     bool acc;
 };
 constexpr int kMvRows = 32;
-__global__ void __launch_bounds__(256) k_mv(Mv J) {
-    extern __shared__ float xs[];
+// one 32-value block of an aligned row: its quants loaded (blk_load, ahead of use), then its dot with x's block (xv)
+// with the scale applied once to the block's sum
+struct Blk { uint4 a, b; };
+template <int F>
+__device__ __forceinline__ Blk blk_load(const uint8_t* row, int b) {
+    Blk q;
+    if constexpr (F == AQ8_0) { q.a = *(const uint4*) (row + size_t(b) * 32); q.b = *(const uint4*) (row + size_t(b) * 32 + 16); }
+    else q.a = *(const uint4*) (row + size_t(b) * 16);
+    return q;
+}
+template <int F>
+__device__ __forceinline__ float blk_dot(const Blk& q, const uint8_t* row, int b, int nb, const float* xv) {
+    float s = 0.f;
+    if constexpr (F == AQ8_0) {
+        const uint32_t w[8] = {q.a.x, q.a.y, q.a.z, q.a.w, q.b.x, q.b.y, q.b.z, q.b.w};
+#pragma unroll
+        for (int k = 0; k < 8; ++k)
+#pragma unroll
+            for (int t = 0; t < 4; ++t) s += float(int8_t(w[k] >> (8 * t))) * xv[4 * k + t];
+        return h2f(row + size_t(nb) * 32 + b * 2) * s;
+    } else {
+        const uint32_t w[4] = {q.a.x, q.a.y, q.a.z, q.a.w};
+        const uint8_t* sc = row + size_t(nb) * 16;
+        if constexpr (F == AQ4_0) {
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const uint32_t y = w[k] >> (8 * t);
+                    s += float(int(y & 15) - 8) * xv[4 * k + t] + float(int((y >> 4) & 15) - 8) * xv[16 + 4 * k + t];
+                }
+            return h2f(sc + b * 2) * s;
+        } else if constexpr (F == AQ4_1) {
+            float xs_ = 0.f;
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const uint32_t y = w[k] >> (8 * t);
+                    s += float(y & 15) * xv[4 * k + t] + float((y >> 4) & 15) * xv[16 + 4 * k + t];
+                    xs_ += xv[4 * k + t] + xv[16 + 4 * k + t];
+                }
+            return h2f(sc + b * 4) * s + h2f(sc + b * 4 + 2) * xs_;
+        } else {   // AQ5_0
+            const uint32_t qh = *(const uint32_t*) (sc + b * 4);
+#pragma unroll
+            for (int k = 0; k < 4; ++k)
+#pragma unroll
+                for (int t = 0; t < 4; ++t) {
+                    const uint32_t y = w[k] >> (8 * t);
+                    const int j = 4 * k + t;
+                    s += float(int((y & 15) | (((qh >> j) & 1u) << 4)) - 16) * xv[j] +
+                         float(int(((y >> 4) & 15) | (((qh >> (j + 16)) & 1u) << 4)) - 16) * xv[16 + j];
+                }
+            return h2f(sc + size_t(nb) * 4 + b * 2) * s;
+        }
+    }
+}
+// one lane's blocks of R rows (a lane a block: 16 or 32 bytes of a row in one load, the next block's loads issued before
+// this one's sums; x's block from xt without bank conflicts); q: each row's first block, loaded already
+template <int F, int R>
+__device__ __forceinline__ void blk_rows(const uint8_t* W, size_t rbytes, int nb, int ld, const float* xt, int lane, Blk* q, float* acc) {
+    for (int b = lane; b < nb; b += 32) {
+        Blk n[R];
+        if (b + 32 < nb)
+#pragma unroll
+            for (int r = 0; r < R; ++r) n[r] = blk_load<F>(W + size_t(r) * rbytes, b + 32);
+        float xv[32];
+#pragma unroll
+        for (int i = 0; i < 32; ++i) xv[i] = xt[i * ld + b];
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[r] += blk_dot<F>(q[r], W + size_t(r) * rbytes, b, nb, xv);
+#pragma unroll
+        for (int r = 0; r < R; ++r) q[r] = n[r];
+    }
+}
+// k_mvt: up to 6 matrices of any formats on one input (x, or rmsnorm(x) * nw), 4 rows a warp, 8 warps a block; each
+// warp decodes its own matrix's format (the 32-value block formats a block a lane, the others 8 values a lane)
+__global__ void __launch_bounds__(256) k_mvt(Mv J) {
+    constexpr int R = 4;
+    extern __shared__ float xs[];                 // x (normed), then x by block: xt[i * ld + b] = x[32 b + i]
     __shared__ float red[8];
+    const int nb = J.K / 32, ld = nb | 1;         // (ld odd: the transposing writes and the reads in different banks)
+    int rb = blockIdx.x * 8 * R, j = 0;
+    while (j < J.nmat - 1 && rb >= J.rows[j]) rb -= J.rows[j++];
+    const int lane = threadIdx.x & 31, r0 = rb + (threadIdx.x >> 5) * R, fmt = J.fmt[j];
+    const size_t rbytes = row_bytes(fmt, J.K);
+    const uint8_t* W = J.w[j] + size_t(r0) * rbytes;
+    const bool blk = (fmt == AQ4_0 || fmt == AQ8_0 || fmt == AQ4_1 || fmt == AQ5_0) && (rbytes & 15) == 0;
+    // the first block of each row on its way while x is staged (AQ4_0 / 4_1 / 5_0: the same 16 bytes of quants)
+    Blk q[R];
+    if (blk && lane < nb) {
+        if (fmt == AQ8_0)
+#pragma unroll
+            for (int r = 0; r < R; ++r) q[r] = blk_load<AQ8_0>(W + size_t(r) * rbytes, lane);
+        else
+#pragma unroll
+            for (int r = 0; r < R; ++r) q[r] = blk_load<AQ4_0>(W + size_t(r) * rbytes, lane);
+    }
     for (int i = threadIdx.x; i < J.K; i += 256) xs[i] = J.x[i];
     __syncthreads();
     if (J.nw) {
@@ -235,25 +331,27 @@ __global__ void __launch_bounds__(256) k_mv(Mv J) {
         for (int i = threadIdx.x; i < J.K; i += 256) xs[i] = xs[i] * r * J.nw[i];
         __syncthreads();
     }
-    int rb = blockIdx.x * kMvRows, j = 0;
-    while (j < J.nmat - 1 && rb >= J.rows[j]) rb -= J.rows[j++];
-    const int lane = threadIdx.x & 31, r0 = rb + (threadIdx.x >> 5) * 4;
-    const size_t rbytes = row_bytes(J.fmt[j], J.K);
-    // the warp's 4 rows together (their loads in flight at once, not one row after another)
-    const int fmt = J.fmt[j];
-    const uint8_t* W = J.w[j] + size_t(r0) * rbytes;
-    float acc[4] = {};
+    float* xt = xs + J.K;
+    for (int i = threadIdx.x; i < J.K; i += 256) xt[(i & 31) * ld + (i >> 5)] = xs[i];
+    __syncthreads();
+    float acc[R] = {};
+    if (blk) {
+        if (fmt == AQ4_0) blk_rows<AQ4_0, R>(W, rbytes, nb, ld, xt, lane, q, acc);
+        else if (fmt == AQ8_0) blk_rows<AQ8_0, R>(W, rbytes, nb, ld, xt, lane, q, acc);
+        else if (fmt == AQ4_1) blk_rows<AQ4_1, R>(W, rbytes, nb, ld, xt, lane, q, acc);
+        else blk_rows<AQ5_0, R>(W, rbytes, nb, ld, xt, lane, q, acc);
+    } else
     for (int g = lane; g < J.K / 8; g += 32) {
-        float v[4][8];
+        float v[R][8];
 #pragma unroll
-        for (int r = 0; r < 4; ++r) deq8(fmt, W + size_t(r) * rbytes, g, v[r], J.K);
+        for (int r = 0; r < R; ++r) deq8(fmt, W + size_t(r) * rbytes, g, v[r], J.K);
 #pragma unroll
-        for (int r = 0; r < 4; ++r)
+        for (int r = 0; r < R; ++r)
 #pragma unroll
             for (int i = 0; i < 8; ++i) acc[r] += v[r][i] * xs[g * 8 + i];
     }
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
+    for (int r = 0; r < R; ++r) {
         const float v = warp_sum(acc[r]);
         if (lane == 0) J.y[j][r0 + r] = J.acc ? J.y[j][r0 + r] + v : v;
     }
@@ -980,7 +1078,7 @@ struct Model {
             total += r;
         }
         J.nmat = j; J.x = x; J.nw = nw; J.K = K; J.acc = acc;
-        k_mv<<<total / kMvRows, 256, K * 4, st>>>(J);
+        k_mvt<<<total / kMvRows, 256, size_t(K) * 8 + 32 * 4, st>>>(J);
     }
 
     // one token (state[1]) through the model at state[0]; logits, then argmax into state[1] and state[0] + 1. The card's
