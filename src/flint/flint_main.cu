@@ -521,21 +521,85 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
     pf_v8f o[8];
 #pragma unroll
     for (int j = 0; j < 8; ++j) o[j] = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
-    for (int t0 = a0 + warp * 16; t0 < b0; t0 += 8 * 16) {
-        // 8-bit V: lane (dim j * 16 + l16, keys t0 + g * 8 ..) reads its A operand straight from the store
-        uint2 vq[8];
-        float vs[8];
-        if (v8.q) {
+    // the scores of a tile into the running max / sum: returns P (this lane: head l16, keys t0 + g * 8 + i)
+    auto soft = [&](const pf_v8f& sc, int t0, float& cf) {
+        float mx = -INFINITY, v[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int p = t0 + g * 8 + i;
+            v[i] = (l16 < 8 && p < b0) ? sc[i] * scale : -INFINITY;
+            mx = fmaxf(mx, v[i]);
+        }
+        mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+        const float mn = fmaxf(m, mx), ref = mn == -INFINITY ? 0.f : mn;
+        cf = expf(m - ref);
+        m = mn;
+        pf_v8h pb;
+        float ps = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { const float e = expf(v[i] - ref); ps += e; pb[i] = (_Float16) e; }
+        l = l * cf + ps;
+        return pb;
+    };
+    if (sizeof(kc_t) == 2 && v8.q) {
+        // 8-bit V (fp16 K): no LDS - lane (dim j * 16 + l16, keys t0 + g * 8 ..) reads its V^T operand straight from
+        // the store, and the next tile's K and V are fetched into registers while this one is used
+        uint4 kn[8];
+        uint2 vn[8];
+        float4 sn0, sn1;
+        auto fetch = [&](int t0) {
+            const int p = t0 + l16;
+            const uint4* kr = (const uint4*) ((const char*) K + (size_t(p & kv_mask) * kKvDim + kh * kHd + g * 8) * 2);
+#pragma unroll
+            for (int s8 = 0; s8 < 8; ++s8) kn[s8] = p < b0 ? kr[s8 * 2] : make_uint4(0, 0, 0, 0);
             const int pk = t0 + g * 8;
+            const bool ok = pk < b0;
             const size_t sk = size_t(pk & kv_mask);
-            const int8_t* qb8 = v8.q + v8_qi(sk, kh, 0);
-            const float4 s0 = *(const float4*) (v8.s + v8_si(sk, kh)), s1 = *(const float4*) (v8.s + v8_si(sk, kh) + 4);
-            vs[0] = s0.x; vs[1] = s0.y; vs[2] = s0.z; vs[3] = s0.w; vs[4] = s1.x; vs[5] = s1.y; vs[6] = s1.z; vs[7] = s1.w;
+            const float* sp = v8.s + v8_si(sk, kh);
+            sn0 = ok ? *(const float4*) sp : make_float4(0, 0, 0, 0);
+            sn1 = ok ? *(const float4*) (sp + 4) : make_float4(0, 0, 0, 0);
+            const int8_t* qb8 = v8.q + v8_qi(sk, kh, l16);
 #pragma unroll
-            for (int i = 0; i < 8; ++i) if (pk + i >= b0) vs[i] = 0.f;   // (past the chunk: never-written slots)
+            for (int j = 0; j < 8; ++j) vn[j] = ok ? *(const uint2*) (qb8 + j * 256) : make_uint2(0, 0);
+        };
+        if (a0 + warp * 16 < b0) fetch(a0 + warp * 16);
+        for (int t0 = a0 + warp * 16; t0 < b0; t0 += 8 * 16) {
+            uint4 kc[8];
+            uint2 vq[8];
 #pragma unroll
-            for (int j = 0; j < 8; ++j) vq[j] = pk < b0 ? *(const uint2*) (qb8 + (j * 16 + l16) * 16) : make_uint2(0, 0);
-        } else {
+            for (int i = 0; i < 8; ++i) { kc[i] = kn[i]; vq[i] = vn[i]; }
+            float vs[8] = {sn0.x, sn0.y, sn0.z, sn0.w, sn1.x, sn1.y, sn1.z, sn1.w};
+#pragma unroll
+            for (int i = 0; i < 8; ++i) if (t0 + g * 8 + i >= b0) vs[i] = 0.f;   // (past the chunk: never-written slots)
+            if (t0 + 8 * 16 < b0) fetch(t0 + 8 * 16);
+            pf_v8f sc = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+            const bool here = fused && t0 + l16 == pos;
+#pragma unroll
+            for (int s8 = 0; s8 < 8; ++s8) {
+                pf_v8h ka = __builtin_bit_cast(pf_v8h, kc[s8]);
+                if (here)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) ka[i] = (_Float16) c2f(f2c<kc_t>(kf[s8 * 16 + g * 8 + i]));
+                sc = pf_wmma(ka, qb[s8], sc);
+            }
+            float cf;
+            const pf_v8h pb = soft(sc, t0, cf);
+            // (fused: the position's own value is the exact one - the 8-bit copy may not be written yet)
+            const int self = fused ? pos - (t0 + g * 8) : -1;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                o[j] = o[j] * cf;
+                const int8_t* b8 = (const int8_t*) &vq[j];
+                pf_v8h va;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) va[i] = (_Float16) (float(b8[i]) * vs[i]);
+                if (self >= 0 && self < 8) va[self] = (_Float16) c2f(f2c<vc_t>(vf[j * 16 + l16]));
+                o[j] = pf_wmma(va, pb, o[j]);
+            }
+        }
+    } else
+    for (int t0 = a0 + warp * 16; t0 < b0; t0 += 8 * 16) {
+        {
         // V tile: lane takes key t0 + l16, dims g * 64 .. + 63, into vt transposed
             const int p = t0 + l16;
             const bool ok = p < b0;
@@ -579,36 +643,13 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
                 sc = pf_wmma(ka, qb[s8], sc);
             }
         }
-        // lane: head column l16, keys t0 + g * 8 + i
-        float mx = -INFINITY, v[8];
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int p = t0 + g * 8 + i;
-            v[i] = (l16 < 8 && p < b0) ? sc[i] * scale : -INFINITY;
-            mx = fmaxf(mx, v[i]);
-        }
-        mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
-        const float mn = fmaxf(m, mx), ref = mn == -INFINITY ? 0.f : mn;
-        const float cf = expf(m - ref);
-        m = mn;
-        pf_v8h pb;
-        float ps = 0;
-#pragma unroll
-        for (int i = 0; i < 8; ++i) { const float e = expf(v[i] - ref); ps += e; pb[i] = (_Float16) e; }
-        l = l * cf + ps;
+        float cf;
+        const pf_v8h pb = soft(sc, t0, cf);
         __builtin_amdgcn_wave_barrier();
-        // (fused: the position's own value is the exact one - the 8-bit copy may not be written yet)
-        const int self = fused ? pos - (t0 + g * 8) : -1;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             o[j] = o[j] * cf;
-            pf_v8h va;
-            if (v8.q) {
-                const int8_t* b8 = (const int8_t*) &vq[j];
-#pragma unroll
-                for (int i = 0; i < 8; ++i) va[i] = (_Float16) (float(b8[i]) * vs[i]);
-                if (self >= 0 && self < 8) va[self] = (_Float16) c2f(f2c<vc_t>(vf[j * 16 + l16]));
-            } else va = *(const pf_v8h*) &vt[warp][j * 16 + l16][g * 8];
+            const pf_v8h va = *(const pf_v8h*) &vt[warp][j * 16 + l16][g * 8];
             o[j] = pf_wmma(va, pb, o[j]);
         }
         __builtin_amdgcn_wave_barrier();
