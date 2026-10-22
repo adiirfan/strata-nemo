@@ -742,6 +742,162 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
     for (int i = 0; i < 4; ++i) P[4 + d0 + i] = O[i];
 }
 
+// The checking pass's attention on the full layers (8-bit V): the 8 query heads of up to 2 * NCG tokens as the WMMA
+// columns (column cg * 16 + l16: token col / 8, head kh * 8 + col % 8), so the history is read once for all of them
+// instead of once a token. grid (kKv, kAttnChunks, ceil(T / (2 * NCG))), 256 threads; part as k_attn_dec_w's (merged by
+// k_attn_merge per token). The tokens' own K/V are already in the cache (k_qkv_post).
+template <int NCG>
+__global__ void __launch_bounds__(256) k_attn_dec_m(const float* __restrict__ q, float* __restrict__ part,
+                                                    const int* __restrict__ state, int kv_mask, int zs, int T,
+                                                    const kc_t* __restrict__ K, V8 v8) {
+    constexpr int NC = 16 * NCG, NZ = 2 * NCG;
+    __shared__ __align__(16) _Float16 qs[NC][kHd + 8];
+    __shared__ __align__(16) float wo[8][8][kHd];
+    __shared__ float wm[8][NC], wl[8][NC];
+    const int kh = blockIdx.x, c = blockIdx.y, z0 = blockIdx.z * NZ, nz = min(NZ, T - z0);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, l16 = lane & 15, g = lane >> 4;
+    const int pos0 = state[0] + z0, n = pos0 + nz;   // keys 0 .. n - 1 (token z sees up to pos0 + z)
+    int per = max(kMinChunk, (n + kAttnChunks - 1) / kAttnChunks);
+    per = (per + 15) & ~15;
+    const int a0 = c * per, b0 = min(n, a0 + per);
+    const float scale = rsqrtf(float(kHd));
+    for (int e = tid; e < NC * kHd; e += 256) {
+        const int col = e / kHd, d = e % kHd, zl = col >> 3;
+        qs[col][d] = (_Float16) (zl < nz ? q[size_t(z0 + zl) * zs + (kh * 8 + (col & 7)) * kHd + d] * scale : 0.f);
+    }
+    __syncthreads();
+    float m[NCG], l[NCG];
+    int zlast[NCG];   // the last key this lane's column may see (-1: no token)
+    pf_v8f o[NCG][8];
+#pragma unroll
+    for (int cg = 0; cg < NCG; ++cg) {
+        m[cg] = -INFINITY; l[cg] = 0;
+        const int zl = (cg * 16 + l16) >> 3;
+        zlast[cg] = zl < nz ? pos0 + zl : -1;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) o[cg][j] = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    }
+    for (int t0 = a0 + warp * 16; t0 < b0; t0 += 8 * 16) {
+        const int p = t0 + l16, pk = t0 + g * 8;
+        const bool okk = p < b0, ok = pk < b0;
+        const size_t sk = size_t(pk & kv_mask);
+        // V^T operand bytes and scales (lane: dims j * 16 + l16, keys pk ..), K scales (8-bit K)
+        uint2 vq[8];
+        const int8_t* qb8 = v8.q + v8_qi(sk, kh, l16);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) vq[j] = ok ? *(const uint2*) (qb8 + j * 256) : make_uint2(0, 0);
+        float vs[8], ksc[8];
+        {
+            const float* sp = v8.s + v8_si(sk, kh);
+            const float4 s0 = ok ? *(const float4*) sp : make_float4(0, 0, 0, 0), s1 = ok ? *(const float4*) (sp + 4) : make_float4(0, 0, 0, 0);
+            vs[0] = s0.x; vs[1] = s0.y; vs[2] = s0.z; vs[3] = s0.w; vs[4] = s1.x; vs[5] = s1.y; vs[6] = s1.z; vs[7] = s1.w;
+            if (v8.kq) {
+                const float* kp = v8.ks + v8_si(sk, kh);
+                const float4 k0 = ok ? *(const float4*) kp : make_float4(0, 0, 0, 0), k1 = ok ? *(const float4*) (kp + 4) : make_float4(0, 0, 0, 0);
+                ksc[0] = k0.x; ksc[1] = k0.y; ksc[2] = k0.z; ksc[3] = k0.w; ksc[4] = k1.x; ksc[5] = k1.y; ksc[6] = k1.z; ksc[7] = k1.w;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) if (pk + i >= b0) vs[i] = 0.f;
+        // S^T for the columns: A = K rows (lane: key p, dims s * 16 + g * 8 ..)
+        pf_v8f sc[NCG];
+#pragma unroll
+        for (int cg = 0; cg < NCG; ++cg) sc[cg] = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+        if (v8.kq) {
+            const uint4* kr = (const uint4*) (v8.kq + k8_row(size_t(p & kv_mask), kh) + g * 64);
+#pragma unroll
+            for (int s4 = 0; s4 < 4; ++s4) {
+                const uint4 u = okk ? kr[s4] : make_uint4(0, 0, 0, 0);
+#pragma unroll
+                for (int h2 = 0; h2 < 2; ++h2) {
+                    const int s8 = s4 * 2 + h2;
+                    const int8_t* b8 = (const int8_t*) &u + h2 * 8;
+                    pf_v8h ka;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) ka[i] = (_Float16) b8[i];
+#pragma unroll
+                    for (int cg = 0; cg < NCG; ++cg) sc[cg] = pf_wmma(ka, *(const pf_v8h*) &qs[cg * 16 + l16][s8 * 16 + g * 8], sc[cg]);
+                }
+            }
+#pragma unroll
+            for (int cg = 0; cg < NCG; ++cg)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) sc[cg][i] *= ksc[i];
+        } else {
+            const uint4* kr = (const uint4*) ((const char*) K + (size_t(p & kv_mask) * kKvDim + kh * kHd + g * 8) * 2);
+#pragma unroll
+            for (int s8 = 0; s8 < 8; ++s8) {
+                const pf_v8h ka = okk ? __builtin_bit_cast(pf_v8h, kr[s8 * 2]) : pf_v8h{};
+#pragma unroll
+                for (int cg = 0; cg < NCG; ++cg) sc[cg] = pf_wmma(ka, *(const pf_v8h*) &qs[cg * 16 + l16][s8 * 16 + g * 8], sc[cg]);
+            }
+        }
+        // per column: running max / sum and P (keys pk + i)
+        pf_v8h pb[NCG];
+        float cf[NCG];
+#pragma unroll
+        for (int cg = 0; cg < NCG; ++cg) {
+            float mx = -INFINITY, v[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                v[i] = (pk + i < b0 && pk + i <= zlast[cg]) ? sc[cg][i] : -INFINITY;
+                mx = fmaxf(mx, v[i]);
+            }
+            mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+            const float mn = fmaxf(m[cg], mx), ref = mn == -INFINITY ? 0.f : mn;
+            cf[cg] = expf(m[cg] - ref);
+            m[cg] = mn;
+            float ps = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { const float e = expf(v[i] - ref); ps += e; pb[cg][i] = (_Float16) e; }
+            l[cg] = l[cg] * cf[cg] + ps;
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int8_t* b8 = (const int8_t*) &vq[j];
+            pf_v8h va;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) va[i] = (_Float16) (float(b8[i]) * vs[i]);
+#pragma unroll
+            for (int cg = 0; cg < NCG; ++cg) o[cg][j] = pf_wmma(va, pb[cg], o[cg][j] * cf[cg]);
+        }
+    }
+#pragma unroll
+    for (int cg = 0; cg < NCG; ++cg) {
+        l[cg] += __shfl_xor(l[cg], 16, 32);
+        if (g == 0) { wm[warp][cg * 16 + l16] = m[cg]; wl[warp][cg * 16 + l16] = l[cg]; }
+    }
+    // merge the 8 warps a token at a time: lane (column l16 of group cg, half g) has dims j * 16 + g * 8 + i
+#pragma unroll
+    for (int zl = 0; zl < NZ; ++zl) {
+        if (zl >= nz) break;
+        __syncthreads();
+        if ((l16 >> 3) == (zl & 1)) {
+#pragma unroll
+            for (int cg = 0; cg < NCG; ++cg)
+                if (cg == (zl >> 1))
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) wo[warp][l16 & 7][j * 16 + g * 8 + i] = o[cg][j][i];
+        }
+        __syncthreads();
+        const int hh = tid >> 5, d0 = (tid & 31) * 4, col = zl * 8 + hh;
+        float M = -INFINITY;
+        for (int w = 0; w < 8; ++w) M = fmaxf(M, wm[w][col]);
+        float Ls = 0, O[4] = {};
+        for (int w = 0; w < 8; ++w) {
+            if (wm[w][col] == -INFINITY) continue;
+            const float f = expf(wm[w][col] - M);
+            Ls += wl[w][col] * f;
+            for (int i = 0; i < 4; ++i) O[i] += wo[w][hh][d0 + i] * f;
+        }
+        float* P = part + size_t(z0 + zl) * kHeads * kAttnChunks * kPart + (size_t(kh * (kHeads / kKv) + hh) * kAttnChunks + c) * kPart;
+        if (d0 == 0) { P[0] = M; P[1] = Ls; }
+        for (int i = 0; i < 4; ++i) P[4 + d0 + i] = O[i];
+    }
+}
+
 __global__ void k_attn_merge(const float* part, const float* sinks, float* out) {
     part += size_t(blockIdx.z) * kHeads * kAttnChunks * kPart;
     out += blockIdx.z * kQDim;
@@ -2802,7 +2958,10 @@ struct Model {
             vg({{l.wq, vQKV}, {l.wk, vQKV + kQDim}, {l.wv, vQKV + kQDim + kKvDim}}, {kQDim, kKvDim, kKvDim}, kHidden, T, NQKV, 0, VgIn{vXH, vXL, vXS, kHidden});
             k_qkv_post<<<dim3(kHeads + kKv, 1, T), kHd, 0, st>>>(vQKV, vQKV + kQDim, vQKV + kQDim + kKvDim, l.q_norm, l.k_norm, l.K, l.V, state, l.swa, l.kv_mask, NQKV, l.v8);
             if (l.swa) k_attn_part<<<dim3(kHeads, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV);
-            else k_attn_dec_w<<<dim3(kKv, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV, {}, l.v8);
+            else if (l.v8.q && !std::getenv("FLINT_VATT_OLD")) {   // (the tokens share one read of the history)
+                if (T <= 2) k_attn_dec_m<1><<<dim3(kKv, kAttnChunks, (T + 1) / 2), 256, 0, st>>>(vQKV, vPart, state, l.kv_mask, NQKV, T, l.K, l.v8);
+                else k_attn_dec_m<2><<<dim3(kKv, kAttnChunks, (T + 3) / 4), 256, 0, st>>>(vQKV, vPart, state, l.kv_mask, NQKV, T, l.K, l.v8);
+            } else k_attn_dec_w<<<dim3(kKv, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV, {}, l.v8);
             k_attn_merge<<<dim3(kHeads, 1, T), kHd, 0, st>>>(vPart, l.sinks, vATT);
             k_split16<<<T, 256, 0, st>>>(vATT, nullptr, nullptr, kQDim, vXH, vXL, vXS);
             vg({{l.wo, vH}}, {kHidden}, kQDim, T, kHidden, 1, VgIn{vXH, vXL, vXS, kQDim});
@@ -2849,7 +3008,10 @@ struct Model {
             v_mv({{l.wq, vQKV}, {l.wk, vQKV + kQDim}, {l.wv, vQKV + kQDim + kKvDim}}, {kQDim, kKvDim, kKvDim}, vH, kHidden, kHidden, T, NQKV, false, l.attn_norm);
             k_qkv_post<<<dim3(kHeads + kKv, 1, T), kHd, 0, st>>>(vQKV, vQKV + kQDim, vQKV + kQDim + kKvDim, l.q_norm, l.k_norm, l.K, l.V, state, l.swa, l.kv_mask, NQKV, l.v8);
             if (l.swa) k_attn_part<<<dim3(kHeads, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV);
-            else k_attn_dec_w<<<dim3(kKv, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV, {}, l.v8);
+            else if (l.v8.q && !std::getenv("FLINT_VATT_OLD")) {   // (the tokens share one read of the history)
+                if (T <= 2) k_attn_dec_m<1><<<dim3(kKv, kAttnChunks, (T + 1) / 2), 256, 0, st>>>(vQKV, vPart, state, l.kv_mask, NQKV, T, l.K, l.v8);
+                else k_attn_dec_m<2><<<dim3(kKv, kAttnChunks, (T + 3) / 4), 256, 0, st>>>(vQKV, vPart, state, l.kv_mask, NQKV, T, l.K, l.v8);
+            } else k_attn_dec_w<<<dim3(kKv, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV, {}, l.v8);
             k_attn_merge<<<dim3(kHeads, 1, T), kHd, 0, st>>>(vPart, l.sinks, vATT);
             v_mv({{l.wo, vH}}, {kHidden}, vATT, kQDim, kQDim, T, kHidden, true);
             k_v_norm<<<T, 256, 0, st>>>(vH, l.ffn_norm, vX);
@@ -2997,6 +3159,35 @@ struct Model {
             else if (aqt == 2) k_pf_attn_w2<2><<<dim3(kKv, (T + 31) / 32), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa, l.kv_mask, l.v8);
             else if (aqt == 4) k_pf_attn_w2<4><<<dim3(kKv, (T + 63) / 64), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa, l.kv_mask, l.v8);
             else k_pf_attn_w<<<dim3(kKv, (T + 15) / 16), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa, l.kv_mask, l.v8);
+            // FLINT_DUMP_ATTN=DIR with FLINT_DUMP_AT=N: the prompt chunk ending at N writes, per full layer, the last 64
+            // rows' q, the K cache and the 8-bit V store (for studying which keys the queries use)
+            static const char* dump_dir = std::getenv("FLINT_DUMP_ATTN");
+            static const int dump_at = std::getenv("FLINT_DUMP_AT") ? std::atoi(std::getenv("FLINT_DUMP_AT")) : -1;
+            if (dump_dir && p0 + T == dump_at && !l.swa && l.K && l.v8.q && T >= 64) {
+                CK(cudaStreamSynchronize(st));
+                const size_t n = size_t(p0 + T), ng = (n + 15) & ~size_t(15);
+                std::vector<float> qh(size_t(64) * kQDim);
+                for (int r = 0; r < 64; ++r)
+                    CK(cudaMemcpy(qh.data() + size_t(r) * kQDim, pQKV + size_t(T - 64 + r) * NQKV, kQDim * 4, cudaMemcpyDeviceToHost));
+                std::vector<uint8_t> kh_(n * kKvDim * sizeof(kc_t)), vq(ng * kKvDim), vs(ng * kKv * 4), sk(kHeads * 4);
+                CK(cudaMemcpy(kh_.data(), l.K, kh_.size(), cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(vq.data(), l.v8.q, vq.size(), cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(vs.data(), l.v8.s, vs.size(), cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(sk.data(), l.sinks, sk.size(), cudaMemcpyDeviceToHost));
+                auto put = [&](const char* nm, const void* d, size_t bytes) {
+                    const std::string fn = std::string(dump_dir) + "/L" + std::to_string(i) + "_" + nm;
+                    FILE* f = std::fopen(fn.c_str(), "wb");
+                    if (!f) { std::fprintf(stderr, "strata-flint: cannot write %s\n", fn.c_str()); std::exit(1); }
+                    std::fwrite(d, 1, bytes, f);
+                    std::fclose(f);
+                };
+                put("q.f32", qh.data(), qh.size() * 4);
+                put("k.f16", kh_.data(), kh_.size());
+                put("vq.i8", vq.data(), vq.size());
+                put("vs.f32", vs.data(), vs.size());
+                put("sink.f32", sk.data(), sk.size());
+                std::fprintf(stderr, "strata-flint: layer %d attention dumped (%zu positions)\n", i, n);
+            }
             pf_split(pATT, nullptr, nullptr, kQDim, T);
             pf_gemm(l.wo, kHidden, kQDim, T, pH, kHidden, 1);
             pf_split(pH, nullptr, l.ffn_norm, kHidden, T);
