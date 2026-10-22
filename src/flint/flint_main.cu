@@ -495,8 +495,9 @@ __global__ void __launch_bounds__(256) k_gemm_q41(const uint8_t* __restrict__ W,
     const int o0 = blockIdx.x * 256 + warp * TA * 16, t0 = blockIdx.y * BN;
     const size_t rowb = size_t(K / 32) * 20;
     const uint8_t* wr[TA];
+    // (rows past N - the head's 150144 is not a multiple of 256 - read row N - 1 and are not stored)
 #pragma unroll
-    for (int a = 0; a < TA; ++a) wr[a] = W + size_t(o0 + a * 16 + l16) * rowb;
+    for (int a = 0; a < TA; ++a) wr[a] = W + size_t(min(o0 + a * 16 + l16, N - 1)) * rowb;
     // B loads: 64 tokens x 64 k x 2 = 1024 uint4; thread takes token tid / 4 (+ 0) ... 4 of them
     auto fetch = [&](int k0, uint4* r) {
 #pragma unroll
@@ -556,11 +557,293 @@ __global__ void __launch_bounds__(256) k_gemm_q41(const uint8_t* __restrict__ W,
         for (int a = 0; a < TA; ++a)
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
+                if (o0 + a * 16 + g * 8 + i >= N) break;
                 float* y = Y + size_t(t) * ldy + o0 + a * 16 + g * 8 + i;
                 const float v = acc[a][b][i] * sc;
                 *y = add ? *y + v : v;
             }
     }
+}
+
+
+// The routed experts' grouped product: rows of the grouped order (expert e's rows bounds[e] .. bounds[e + 1]) in tiles of
+// 64 (tiles: (expert, first row) pairs, *n_tiles of them). Input row of grouped row r: src[r] (or r without src).
+// GU: gate (W1) and up (W2) both, Y = silu(gate) * up; otherwise Y = W1 . x. W_e = W + e * mat_bytes.
+template <bool LO, bool GU>
+__global__ void __launch_bounds__(256) k_gemm_q41_grp(const uint8_t* __restrict__ W1, const uint8_t* __restrict__ W2, size_t mat_bytes,
+                                                      int N, int K, const uint16_t* __restrict__ xh, const uint16_t* __restrict__ xl,
+                                                      const float* __restrict__ xs, const int* __restrict__ src,
+                                                      const int* __restrict__ bounds, const int* __restrict__ tiles,
+                                                      const int* __restrict__ n_tiles, float* __restrict__ Y, int ldy) {
+    constexpr int TA = 2, TB = 4, BN = TB * 16, BK = 64, LD = BK + 8, NM = GU ? 2 : 1;
+    __shared__ __align__(16) uint16_t sx[2][2][BN][LD];
+    __shared__ int srow[BN];
+    const int tile = blockIdx.y;
+    if (tile >= *n_tiles) return;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, l16 = lane & 15, g = lane >> 4;
+    const int e = tiles[2 * tile], r0 = bounds[e] + tiles[2 * tile + 1], rn = min(BN, bounds[e + 1] - r0);
+    const int o0 = blockIdx.x * 256 + warp * TA * 16;
+    if (tid < BN) srow[tid] = tid < rn ? (src ? src[r0 + tid] : r0 + tid) : -1;
+    pf_sync();
+    const size_t rowb = size_t(K / 32) * 20;
+    const uint8_t* wr[NM][TA];
+#pragma unroll
+    for (int mm = 0; mm < NM; ++mm)
+#pragma unroll
+        for (int a = 0; a < TA; ++a) wr[mm][a] = (mm ? W2 : W1) + size_t(e) * mat_bytes + size_t(o0 + a * 16 + l16) * rowb;
+    auto fetch = [&](int k0, uint4* r) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = tid + j * 256, hl = i >> 9, t = (i >> 3) & 63, c = (i & 7) * 8;
+            const uint16_t* sp = hl ? xl : xh;
+            const int row = srow[t];
+            r[j] = (row >= 0 && (LO || !hl)) ? *(const uint4*) (sp + size_t(row) * K + k0 + c) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    auto put = [&](const uint4* r, int buf) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = tid + j * 256, hl = i >> 9, t = (i >> 3) & 63, c = (i & 7) * 8;
+            *(uint4*) &sx[buf][hl][t][c] = r[j];
+        }
+    };
+    pf_v8f acc[NM][TA][TB];
+#pragma unroll
+    for (int mm = 0; mm < NM; ++mm)
+#pragma unroll
+        for (int a = 0; a < TA; ++a)
+#pragma unroll
+            for (int b = 0; b < TB; ++b) acc[mm][a][b] = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    uint4 rb[4];
+    fetch(0, rb);
+    put(rb, 0);
+    pf_sync();
+    int buf = 0;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        if (k0 + BK < K) fetch(k0 + BK, rb);
+#pragma unroll
+        for (int kk = 0; kk < BK / 16; ++kk) {
+            pf_v8h fa[NM][TA];
+#pragma unroll
+            for (int mm = 0; mm < NM; ++mm)
+#pragma unroll
+                for (int a = 0; a < TA; ++a) fa[mm][a] = pf_q41_a8(wr[mm][a], k0 + kk * 16 + g * 8);
+#pragma unroll
+            for (int b = 0; b < TB; ++b) {
+                const pf_v8h bh = *(const pf_v8h*) &sx[buf][0][b * 16 + l16][kk * 16 + g * 8];
+#pragma unroll
+                for (int mm = 0; mm < NM; ++mm)
+#pragma unroll
+                    for (int a = 0; a < TA; ++a) acc[mm][a][b] = pf_wmma(fa[mm][a], bh, acc[mm][a][b]);
+                if (LO) {
+                    const pf_v8h bl = *(const pf_v8h*) &sx[buf][1][b * 16 + l16][kk * 16 + g * 8];
+#pragma unroll
+                    for (int mm = 0; mm < NM; ++mm)
+#pragma unroll
+                        for (int a = 0; a < TA; ++a) acc[mm][a][b] = pf_wmma(fa[mm][a], bl, acc[mm][a][b]);
+                }
+            }
+        }
+        if (k0 + BK < K) put(rb, buf ^ 1);
+        pf_sync();
+        buf ^= 1;
+    }
+#pragma unroll
+    for (int b = 0; b < TB; ++b) {
+        const int t = b * 16 + l16;
+        if (t >= rn) continue;
+        const float sc = xs[srow[t]];
+#pragma unroll
+        for (int a = 0; a < TA; ++a)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float v = GU ? silu(acc[0][a][b][i] * sc) * (acc[GU ? 1 : 0][a][b][i] * sc) : acc[0][a][b][i] * sc;
+                Y[size_t(r0 + t) * ldy + o0 + a * 16 + g * 8 + i] = v;
+            }
+    }
+}
+
+// router logits for 16 tokens a block: thread = expert, rows rmsnorm(h_t) * nw (rn: each token's 1 / rms)
+__global__ void __launch_bounds__(256) k_pf_router(const float* H, const float* rn, const float* nw, const uint16_t* W, int T,
+                                                   float* logits) {
+    __shared__ float xs[16][65];
+    const int t0 = blockIdx.x * 16, e = threadIdx.x;
+    float acc[16] = {};
+    for (int k0 = 0; k0 < kHidden; k0 += 64) {
+        for (int i = threadIdx.x; i < 16 * 64; i += 256) {
+            const int t = i / 64, k = i % 64;
+            xs[t][k] = t0 + t < T ? H[size_t(t0 + t) * kHidden + k0 + k] * rn[t0 + t] * nw[k0 + k] : 0.f;
+        }
+        __syncthreads();
+        const uint16_t* w = W + size_t(e) * kHidden + k0;
+        for (int k = 0; k < 64; k += 8) {
+            const uint4 wv = *(const uint4*) (w + k);
+            const uint32_t ww[4] = {wv.x, wv.y, wv.z, wv.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float w0 = __uint_as_float(ww[j] << 16), w1 = __uint_as_float(ww[j] & 0xffff0000u);
+#pragma unroll
+                for (int t = 0; t < 16; ++t) acc[t] += w0 * xs[t][k + 2 * j] + w1 * xs[t][k + 2 * j + 1];
+            }
+        }
+        __syncthreads();
+    }
+    for (int t = 0; t < 16; ++t) if (t0 + t < T) logits[size_t(t0 + t) * kExperts + e] = acc[t];
+}
+// each token's 1 / rms over the hidden size (one warp a token)
+__global__ void k_pf_rms(const float* H, int T, float* rn) {
+    const int t = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (t >= T) return;
+    float ss = 0;
+    for (int i = lane; i < kHidden; i += 32) ss += H[size_t(t) * kHidden + i] * H[size_t(t) * kHidden + i];
+    ss = warp_sum(ss);
+    if (lane == 0) rn[t] = rsqrtf(ss / kHidden + kEps);
+}
+// top 6 by sigmoid score per token (one warp a token, the decode path's tie rule), weights normalized; counts per expert
+__global__ void k_pf_topk(const float* logits, int T, int* idx, float* wts, int* count) {
+    const int t = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (t >= T) return;
+    float sc[8];
+    for (int j = 0; j < 8; ++j) sc[j] = 1.f / (1.f + expf(-logits[size_t(t) * kExperts + lane * 8 + j]));
+    float picked[kTopK];
+    int pi[kTopK];
+    float tot = 0;
+    for (int k = 0; k < kTopK; ++k) {
+        float v = -2.f;
+        int i = 0;
+        for (int j = 0; j < 8; ++j) if (sc[j] > v) { v = sc[j]; i = lane * 8 + j; }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor(v, o, 32);
+            const int oi = __shfl_xor(i, o, 32);
+            if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
+        }
+        if (lane == i / 8) sc[i % 8] = -1.f;
+        picked[k] = v; pi[k] = i; tot += v;
+    }
+    if (lane < kTopK) {
+        idx[t * kTopK + lane] = pi[lane];
+        wts[t * kTopK + lane] = picked[lane] / tot;
+        atomicAdd(count + pi[lane], 1);
+    }
+}
+// bounds[e] = sum of counts before e (bounds[256] = all); fill reset; tiles of 64 rows (one block of 256)
+__global__ void k_pf_bounds(const int* count, int* bounds, int* fill, int* tiles, int* n_tiles) {
+    __shared__ int sc[kExperts], st[kExperts];
+    const int e = threadIdx.x;
+    sc[e] = count[e];
+    st[e] = (count[e] + 63) / 64;
+    __syncthreads();
+    for (int off = 1; off < kExperts; off <<= 1) {
+        const int a = e >= off ? sc[e - off] : 0, b = e >= off ? st[e - off] : 0;
+        __syncthreads();
+        sc[e] += a; st[e] += b;
+        __syncthreads();
+    }
+    const int nt = (count[e] + 63) / 64, base = st[e] - nt;
+    bounds[e + 1] = sc[e];
+    if (e == 0) bounds[0] = 0;
+    fill[e] = 0;
+    for (int i = 0; i < nt; ++i) { tiles[2 * (base + i)] = e; tiles[2 * (base + i) + 1] = i * 64; }
+    if (e == kExperts - 1) *n_tiles = st[e];
+}
+// each (token, choice) its row in the grouped order
+__global__ void k_pf_scatter(const int* idx, int T, const int* bounds, int* fill, int* src, int* slot) {
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (i >= T * kTopK) return;
+    const int e = idx[i], p = bounds[e] + atomicAdd(fill + e, 1);
+    src[p] = i / kTopK;
+    slot[i] = p;
+}
+// H[t] += sum_k w[t][k] * Y[slot[t][k]] (the routed experts' outputs, grouped order)
+__global__ void k_pf_combine(float* H, const float* Y, const int* slot, const float* wts, int T) {
+    const int t = blockIdx.x, i = threadIdx.x;   // 256 threads, 8 values each
+    float s[8] = {};
+    for (int k = 0; k < kTopK; ++k) {
+        const float w = wts[t * kTopK + k];
+        const float* y = Y + size_t(slot[t * kTopK + k]) * kHidden;
+        for (int j = 0; j < 8; ++j) s[j] += w * y[i + 256 * j];
+    }
+    for (int j = 0; j < 8; ++j) H[size_t(t) * kHidden + i + 256 * j] += s[j];
+}
+__global__ void k_pf_embed(const float* table, const int* ids, float* H) {
+    const int t = blockIdx.x;
+    for (int i = threadIdx.x; i < kHidden; i += 256) H[size_t(t) * kHidden + i] = table[size_t(ids[t]) * kHidden + i];
+}
+// q / k heads: RMSNorm (+ NEOX RoPE on sliding layers) at position p0 + t; q back in place, k and v into the cache.
+// grid (36 heads, T), 128 threads
+__global__ void k_pf_qkpost(float* QKV, const float* qn, const float* kn, float* K, float* V, int p0, bool rope) {
+    __shared__ float sh[4];
+    __shared__ float tb[kHd];
+    const int hb = blockIdx.x, t = blockIdx.y, i = threadIdx.x, pos = p0 + t;
+    float* row = QKV + size_t(t) * (kQDim + 2 * kKvDim);
+    const bool isq = hb < kHeads;
+    float* src = isq ? row + hb * kHd : row + kQDim + (hb - kHeads) * kHd;
+    const float x = src[i];
+    const float s = block_sum<128>(x * x, sh);
+    float y = x * rsqrtf(s / kHd + kEps) * (isq ? qn[i] : kn[i]);
+    if (rope) {
+        tb[i] = y;
+        __syncthreads();
+        const int j = i & 63;
+        const float ang = float(pos) * powf(kRopeBase, -2.f * j / kHd);
+        float sn, cs;
+        sincosf(ang, &sn, &cs);
+        const float x0 = tb[j], x1 = tb[j + 64];
+        y = i < 64 ? x0 * cs - x1 * sn : x0 * sn + x1 * cs;
+    }
+    if (isq) src[i] = y;
+    else {
+        const int kh = hb - kHeads;
+        K[size_t(pos) * kKvDim + kh * kHd + i] = y;
+        V[size_t(pos) * kKvDim + kh * kHd + i] = row[kQDim + kKvDim + kh * kHd + i];
+    }
+}
+// Attention for T queries (positions p0 ..) against the cache, fp32: block = (head, 64 queries), 4 threads a query,
+// each 32 of the 128 dims; keys in tiles of 32 through LDS; online softmax; the sink joins the denominator at the end.
+__global__ void __launch_bounds__(256) k_pf_attn(const float* QKV, const float* K, const float* V, const float* sinks,
+                                                 float* ATT, int p0, int T, bool swa) {
+    __shared__ float ks[32][kHd + 4], vs[32][kHd + 4];
+    const int h = blockIdx.x, kh = h / (kHeads / kKv), q0 = blockIdx.y * 64;
+    const int tid = threadIdx.x, ql = tid >> 2, part = tid & 3, t = q0 + ql;
+    const bool live = t < T;
+    const int pos = p0 + min(t, T - 1);
+    const int lo = swa ? max(0, pos - (kWindow - 1)) : 0;
+    float qv[32];
+    const float scale = rsqrtf(float(kHd));
+    for (int j = 0; j < 32; ++j) qv[j] = live ? QKV[size_t(t) * (kQDim + 2 * kKvDim) + h * kHd + part * 32 + j] * scale : 0.f;
+    float m = -INFINITY, l = 0, o[32] = {};
+    // the block's key range: from the first query's window start to the last query's position
+    const int last = p0 + min(q0 + 63, T - 1);
+    const int first_lo = swa ? max(0, p0 + q0 - (kWindow - 1)) : 0;
+    for (int k0 = first_lo; k0 <= last; k0 += 32) {
+        for (int i = tid; i < 32 * 32; i += 256) {   // 32 keys x 32 float4 (k and v)
+            const int key = i >> 5, c = (i & 31) * 4, p = k0 + key;
+            const float4 kv = p <= last ? *(const float4*) (K + size_t(p) * kKvDim + kh * kHd + c) : make_float4(0, 0, 0, 0);
+            const float4 vv = p <= last ? *(const float4*) (V + size_t(p) * kKvDim + kh * kHd + c) : make_float4(0, 0, 0, 0);
+            *(float4*) &ks[key][c] = kv;
+            *(float4*) &vs[key][c] = vv;
+        }
+        __syncthreads();
+        for (int key = 0; key < 32; ++key) {
+            const int p = k0 + key;
+            float d = 0;
+#pragma unroll
+            for (int j = 0; j < 32; ++j) d += qv[j] * ks[key][part * 32 + j];
+            d += __shfl_xor(d, 1, 32);
+            d += __shfl_xor(d, 2, 32);
+            if (p < lo || p > pos || !live) continue;
+            const float mn = fmaxf(m, d), cf = expf(m - mn), e = expf(d - mn);
+#pragma unroll
+            for (int j = 0; j < 32; ++j) o[j] = o[j] * cf + e * vs[key][part * 32 + j];
+            l = l * cf + e;
+            m = mn;
+        }
+        __syncthreads();
+    }
+    if (!live) return;
+    const float sk = sinks[h], M = fmaxf(m, sk);
+    const float f = expf(m - M), L = l * f + expf(sk - M);
+    for (int j = 0; j < 32; ++j) ATT[size_t(t) * kQDim + h * kHd + part * 32 + j] = o[j] * f / L;
 }
 
 // ---------------------------------------------------------------------------------------------------- the model
@@ -731,6 +1014,118 @@ struct Model {
         J.nmat = j; J.x = x_; J.nw = nw; J.x2 = x2; J.n_in = n_in; J.acc = accum;
         k_mv_in<<<total / kMvRows, 256, n_in * 4, st>>>(J);
     }
+    // ------------------------------------------------ the prompt path: chunks of up to tc tokens through all layers
+    int tc = 0;
+    float *pH = nullptr, *pQKV, *pATT, *pG, *pU, *pACT, *pY, *pXS, *pRN, *pRL, *pW;
+    uint16_t *pXH, *pXL;
+    int *pIds, *pIdx, *pCount, *pBounds, *pFill, *pTiles, *pNT, *pSrc, *pSlot;
+    void pf_alloc(int T) {
+        if (T <= tc) return;
+        tc = T;
+        auto f = [&](float*& p_, size_t n) { if (p_) CK(cudaFree(p_)); CK(cudaMalloc(&p_, n * 4)); };
+        auto fi = [&](int*& p_, size_t n) { CK(cudaMalloc(&p_, n * 4)); };
+        const size_t S = size_t(T) * kTopK;
+        f(pH, size_t(T) * kHidden); pQKV = nullptr; f(pQKV, size_t(T) * (kQDim + 2 * kKvDim)); pATT = nullptr; f(pATT, size_t(T) * kQDim);
+        pG = nullptr; f(pG, size_t(T) * kFfDense); pU = nullptr; f(pU, size_t(T) * kFfDense); pACT = nullptr; f(pACT, S * kFfExp);
+        pY = nullptr; f(pY, S * kHidden); pXS = nullptr; f(pXS, S); pRN = nullptr; f(pRN, T); pRL = nullptr; f(pRL, size_t(T) * kExperts);
+        pW = nullptr; f(pW, S);
+        CK(cudaMalloc(&pXH, std::max(size_t(T) * kFfDense, S * kFfExp) * 2));
+        CK(cudaMalloc(&pXL, std::max(size_t(T) * kFfDense, S * kFfExp) * 2));
+        fi(pIds, T); fi(pIdx, S); fi(pCount, kExperts); fi(pBounds, kExperts + 1); fi(pFill, kExperts);
+        fi(pTiles, 2 * (S / 64 + kExperts + 1)); fi(pNT, 1); fi(pSrc, S); fi(pSlot, S);
+    }
+    // (debugging) only the first FLINT_NLAYERS layers, then the head
+    static int n_layers() { static const int n = std::getenv("FLINT_NLAYERS") ? std::atoi(std::getenv("FLINT_NLAYERS")) : kLayers; return n; }
+    static bool pf_lo() { static const bool v = !std::getenv("FLINT_PF_HI") ; return v; }
+    // y (T x N, row stride ldy; += when add) = W . x for the split rows (xh, xl, xs) of T tokens
+    void pf_gemm(const uint8_t* W, int N, int K, int T, float* Y, int ldy, int add) {
+        const dim3 gr((N + 255) / 256, (T + 63) / 64);
+        if (pf_lo()) k_gemm_q41<true><<<gr, 256, 0, st>>>(W, N, K, pXH, pXL, pXS, T, Y, ldy, add);
+        else k_gemm_q41<false><<<gr, 256, 0, st>>>(W, N, K, pXH, pXL, pXS, T, Y, ldy, add);
+    }
+    // (debugging) FLINT_DUMP_H=FILE: h after every layer, every row, appended as fp32
+    void dump_rows(const float* d, int rows) {
+        static const char* fn = std::getenv("FLINT_DUMP_H");
+        if (!fn) return;
+        static FILE* f = std::fopen(fn, "wb");
+        std::vector<float> v(size_t(rows) * kHidden);
+        CK(cudaMemcpyAsync(v.data(), d, v.size() * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        std::fwrite(v.data(), 4, v.size(), f);
+        std::fflush(f);
+    }
+    void pf_split(const float* x, const float* x2, const float* nw, int K, int rows) {
+        k_split16<<<rows, 256, 0, st>>>(x, x2, nw, K, pXH, pXL, pXS);
+    }
+    // T tokens at positions pos .. pos + T - 1; afterwards the decode state is the next position and the most likely
+    // next token. all_logits: every row's logits (into lg_all, T x vocab on the card), else only the last row's.
+    void prefill_chunk(const int* ids, int T, float* lg_all = nullptr) {
+        if (pos + T > max_ctx) { std::fprintf(stderr, "strata-flint: context full (%d)\n", max_ctx); std::exit(1); }
+        pf_alloc(T);
+        const int p0 = pos;
+        CK(cudaMemcpyAsync(pIds, ids, T * 4, cudaMemcpyHostToDevice, st));
+        k_pf_embed<<<T, 256, 0, st>>>(embed, pIds, pH);
+        const int NQKV = kQDim + 2 * kKvDim;
+        const size_t gu_bytes = size_t(kFfExp) * (kHidden / 32) * 20, d_bytes = size_t(kHidden) * (kFfExp / 32) * 20;
+        const int S = T * kTopK, max_tiles = S / 64 + kExperts + 1;
+        for (int i = 0; i < n_layers(); ++i) {
+            Layer& l = L[i];
+            pf_split(pH, nullptr, l.attn_norm, kHidden, T);
+            pf_gemm(l.wq, kQDim, kHidden, T, pQKV, NQKV, 0);
+            pf_gemm(l.wk, kKvDim, kHidden, T, pQKV + kQDim, NQKV, 0);
+            pf_gemm(l.wv, kKvDim, kHidden, T, pQKV + kQDim + kKvDim, NQKV, 0);
+            k_pf_qkpost<<<dim3(kHeads + kKv, T), kHd, 0, st>>>(pQKV, l.q_norm, l.k_norm, l.K, l.V, p0, l.swa);
+            k_pf_attn<<<dim3(kHeads, (T + 63) / 64), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa);
+            pf_split(pATT, nullptr, nullptr, kQDim, T);
+            pf_gemm(l.wo, kHidden, kQDim, T, pH, kHidden, 1);
+            pf_split(pH, nullptr, l.ffn_norm, kHidden, T);
+            if (i < kDense) {
+                pf_gemm(l.gate, kFfDense, kHidden, T, pG, kFfDense, 0);
+                pf_gemm(l.up, kFfDense, kHidden, T, pU, kFfDense, 0);
+                pf_split(pG, pU, nullptr, kFfDense, T);
+                pf_gemm(l.down, kHidden, kFfDense, T, pH, kHidden, 1);
+                dump_rows(pH, T);
+                continue;
+            }
+            // shared expert first (its input is the split rows just made)
+            pf_gemm(l.gate_s, kFfShared, kHidden, T, pG, kFfShared, 0);
+            pf_gemm(l.up_s, kFfShared, kHidden, T, pU, kFfShared, 0);
+            // routing (fp32 router on rmsnorm(h))
+            k_pf_rms<<<(T + 7) / 8, 256, 0, st>>>(pH, T, pRN);
+            k_pf_router<<<(T + 15) / 16, 256, 0, st>>>(pH, pRN, l.ffn_norm, l.router, T, pRL);
+            CK(cudaMemsetAsync(pCount, 0, kExperts * 4, st));
+            k_pf_topk<<<(T + 7) / 8, 256, 0, st>>>(pRL, T, pIdx, pW, pCount);
+            k_pf_bounds<<<1, kExperts, 0, st>>>(pCount, pBounds, pFill, pTiles, pNT);
+            k_pf_scatter<<<(S + 255) / 256, 256, 0, st>>>(pIdx, T, pBounds, pFill, pSrc, pSlot);
+            // experts' gate/up on the split rows of each routed token
+            if (pf_lo()) k_gemm_q41_grp<true, true><<<dim3(kFfExp / 256, max_tiles), 256, 0, st>>>(l.gate_e, l.up_e, gu_bytes, kFfExp, kHidden, pXH, pXL, pXS, pSrc, pBounds, pTiles, pNT, pACT, kFfExp);
+            else k_gemm_q41_grp<false, true><<<dim3(kFfExp / 256, max_tiles), 256, 0, st>>>(l.gate_e, l.up_e, gu_bytes, kFfExp, kHidden, pXH, pXL, pXS, pSrc, pBounds, pTiles, pNT, pACT, kFfExp);
+            // shared expert's down, added into h
+            pf_split(pG, pU, nullptr, kFfShared, T);
+            pf_gemm(l.down_s, kHidden, kFfShared, T, pH, kHidden, 1);
+            // experts' down on their act rows (grouped order), then the weighted sum into h
+            pf_split(pACT, nullptr, nullptr, kFfExp, S);
+            if (pf_lo()) k_gemm_q41_grp<true, false><<<dim3(kHidden / 256, max_tiles), 256, 0, st>>>(l.down_e, nullptr, d_bytes, kHidden, kFfExp, pXH, pXL, pXS, nullptr, pBounds, pTiles, pNT, pY, kHidden);
+            else k_gemm_q41_grp<false, false><<<dim3(kHidden / 256, max_tiles), 256, 0, st>>>(l.down_e, nullptr, d_bytes, kHidden, kFfExp, pXH, pXL, pXS, nullptr, pBounds, pTiles, pNT, pY, kHidden);
+            k_pf_combine<<<T, 256, 0, st>>>(pH, pY, pSlot, pW, T);
+            dump_rows(pH, T);
+        }
+        if (lg_all) {
+            pf_split(pH, nullptr, out_norm, kHidden, T);
+            pf_gemm(head, vocab, kHidden, T, lg_all, vocab, 0);
+        }
+        // the last row through the head with the writing path's kernel, and the next token into the decode state
+        mv_in({{head, logits}}, {vocab}, pH + size_t(T - 1) * kHidden, kHidden, out_norm);
+        const int st0[1] = {p0 + T - 1};
+        CK(cudaMemcpyAsync(state, st0, 4, cudaMemcpyHostToDevice, st));
+        k_argmax64<<<64, 1024, 0, st>>>(logits, vocab, state, best, done2);
+        CK(cudaStreamSynchronize(st));
+        pos = p0 + T;
+    }
+    void prefill(const std::vector<int>& ids, int chunk) {
+        for (size_t i = 0; i < ids.size(); i += chunk) prefill_chunk(ids.data() + i, int(std::min<size_t>(chunk, ids.size() - i)));
+    }
+
     // the prompt GEMM against mv_in on layer 5's q/k/v rows for T random-ish rows (normed inputs)
     void gemm_test() {
         const int T = 100, K = kHidden, N = kQDim + 2 * kKvDim;
@@ -792,7 +1187,7 @@ struct Model {
     void record() {
         static const int pf = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : 16;
         k_embed<<<kHidden / 256, 256, 0, st>>>(embed, state, h);
-        for (int i = 0; i < kLayers; ++i) {
+        for (int i = 0; i < n_layers(); ++i) {
             Layer& l = L[i];
             if (pf && i + 1 < kLayers) {   // layer i + 1's weights, from the start of layer i
                 CK(cudaEventRecord(ev[i], st));
@@ -807,11 +1202,13 @@ struct Model {
             if (i < kDense) {
                 mv_in({{l.gate, f1}, {l.up, f2}}, {kFfDense, kFfDense}, h, kHidden, l.ffn_norm);
                 mv_in({{l.down, h}}, {kHidden}, f1, kFfDense, nullptr, f2, true);
+                if (std::getenv("FLINT_DUMP_H")) dump_rows(h, 1);
                 continue;
             }
             k_router<<<kExperts / 4, 128, 0, st>>>(h, l.ffn_norm, l.router, rl, idx, wts, done);
             k_moe_gu<<<kActRows / kMvRows, 256, kHidden * 4, st>>>(h, l.ffn_norm, l.gate_e, l.up_e, l.gate_s, l.up_s, idx, act);
             k_moe_down<<<kHidden / kMvRows, 256, 0, st>>>(h, act, l.down_e, l.down_s, idx, wts);
+            if (std::getenv("FLINT_DUMP_H")) dump_rows(h, 1);
         }
         if (pf) {   // join the side stream back (the capture must end on one stream)
             CK(cudaEventRecord(ev[kLayers], side));
@@ -861,9 +1258,19 @@ int main(int argc, char** argv) {
     std::vector<float> lg(m.vocab);
     const auto t1 = std::chrono::steady_clock::now();
     FILE* lf = logits_path.empty() ? nullptr : std::fopen(logits_path.c_str(), "wb");
-    m.feed(ids, [&]() {
+    static const int chunk = std::getenv("FLINT_CHUNK") ? std::atoi(std::getenv("FLINT_CHUNK")) : 2048;
+    const bool tokwise = std::getenv("FLINT_TOKWISE") != nullptr;
+    if (lf && !tokwise) {   // the prompt path with every row's logits (small prompts: T x vocab floats on the card)
+        float* lga = nullptr;
+        CK(cudaMalloc(&lga, ids.size() * size_t(m.vocab) * 4));
+        m.prefill_chunk(ids.data(), int(ids.size()), lga);
+        std::vector<float> all(ids.size() * size_t(m.vocab));
+        CK(cudaMemcpy(all.data(), lga, all.size() * 4, cudaMemcpyDeviceToHost));
+        std::fwrite(all.data(), 4, all.size(), lf);
+    } else if (tokwise) m.feed(ids, [&]() {
         if (lf) { CK(cudaMemcpy(lg.data(), m.logits, lg.size() * 4, cudaMemcpyDeviceToHost)); std::fwrite(lg.data(), 4, lg.size(), lf); }
     });
+    else m.prefill(ids, chunk);
     if (lf) std::fclose(lf);
     CK(cudaStreamSynchronize(m.st));
     const double read_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
