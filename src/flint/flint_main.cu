@@ -1233,13 +1233,18 @@ __device__ inline void q4_rows_s(const uint8_t* W, size_t rowb, int nb, const fl
 constexpr int kVSl = 1024;
 template <int R, int T>
 __device__ inline void q4_rows_p(const uint8_t* const* W, int nb, const float* const* xp, int nt, float* sb, int lane,
-                                 float (*acc)[T]) {
+                                 float (*acc)[T], const float* rs = nullptr, const float* nw = nullptr) {
     const int qd = lane & 3, bl = lane >> 2;
     for (int kc = 0; kc < nb * 32; kc += kVSl) {
         const int kn = min(kVSl, nb * 32 - kc);
         for (int i = threadIdx.x; i < nt * (kn / 4); i += 256) {
             const int t = i / (kn / 4), c = (i % (kn / 4)) * 4;
-            *(float4*) (sb + t * kVSl + c) = *(const float4*) (xp[t] + kc + c);
+            float4 v = *(const float4*) (xp[t] + kc + c);
+            if (nw) {
+                const float4 w = *(const float4*) (nw + kc + c);
+                v = make_float4(v.x * rs[t] * w.x, v.y * rs[t] * w.y, v.z * rs[t] * w.z, v.w * rs[t] * w.w);
+            }
+            *(float4*) (sb + t * kVSl + c) = v;
         }
         __syncthreads();
         for (int b = kc / 32 + bl; b < kc / 32 + kn / 32; b += 8) {
@@ -1285,6 +1290,7 @@ struct MvV {
     const float* X;
     int ldx, n_in, T, ldy;
     bool acc;
+    const float* nw;   // set: the inputs are rmsnorm(X) * nw (computed here)
 };
 template <int T>
 __global__ void __launch_bounds__(256) k_v_mv(MvV J) {
@@ -1300,7 +1306,18 @@ __global__ void __launch_bounds__(256) k_v_mv(MvV J) {
     const uint8_t* wr[kMvRpw];
 #pragma unroll
     for (int r = 0; r < kMvRpw; ++r) wr[r] = J.w[j] + size_t(r0 + r) * rowb;
-    q4_rows_p<kMvRpw, T>(wr, nb, xp, T, sb, lane, acc);
+    __shared__ float rs[T];
+    if (J.nw) {   // each token's 1 / rms (warp t: token t)
+        const int w_ = threadIdx.x >> 5;
+        for (int t = w_; t < T; t += 8) {
+            float ss = 0;
+            for (int i = lane; i < J.n_in; i += 32) { const float x = J.X[size_t(t) * J.ldx + i]; ss += x * x; }
+            ss = warp_sum(ss);
+            if (lane == 0) rs[t] = rsqrtf(ss / J.n_in + kEps);
+        }
+        __syncthreads();
+    }
+    q4_rows_p<kMvRpw, T>(wr, nb, xp, T, sb, lane, acc, rs, J.nw);
 #pragma unroll
     for (int t = 0; t < T; ++t)
 #pragma unroll
@@ -1887,13 +1904,13 @@ struct Model {
         }
     }
     void v_mv(std::initializer_list<std::pair<const uint8_t*, float*>> mats, std::initializer_list<int> rows,
-              const float* X, int ldx, int n_in, int T, int ldy, bool accum) {
+              const float* X, int ldx, int n_in, int T, int ldy, bool accum, const float* nw = nullptr) {
         MvV J{};
         int j = 0, total = 0;
         for (auto& m_ : mats) { J.w[j] = m_.first; J.y[j] = m_.second; ++j; }
         j = 0;
         for (int r : rows) { J.rows[j++] = r; total += r; }
-        J.nmat = j; J.X = X; J.ldx = ldx; J.n_in = n_in; J.T = T; J.ldy = ldy; J.acc = accum;
+        J.nmat = j; J.X = X; J.ldx = ldx; J.n_in = n_in; J.T = T; J.ldy = ldy; J.acc = accum; J.nw = nw;
         vdispatch(T, [&](auto tc) { k_v_mv<decltype(tc)::value><<<total / kMvRows, 256, 0, st>>>(J); });
     }
     // the matrix-unit version (FLINT_VSIMT=1: the first one, below)
@@ -1948,10 +1965,20 @@ struct Model {
         if (mu) { v_record_mu(T); return; }
         const int NQKV = kQDim + 2 * kKvDim;
         k_v_embed<<<T, 256, 0, st>>>(embed, vToks, vH);
+        static const int pf = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : 32;
+        static const int pe = std::getenv("FLINT_PREDPF") ? std::atoi(std::getenv("FLINT_PREDPF")) : 64;
         for (int i = 0; i < kLayers; ++i) {
             Layer& l = L[i];
-            k_v_norm<<<T, 256, 0, st>>>(vH, l.attn_norm, vX);
-            v_mv({{l.wq, vQKV}, {l.wk, vQKV + kQDim}, {l.wv, vQKV + kQDim + kKvDim}}, {kQDim, kKvDim, kKvDim}, vX, kHidden, kHidden, T, NQKV, false);
+            if ((pf || pe) && i + 1 < kLayers) {   // as on the writing path; the guess is the first token's
+                CK(cudaEventRecord(ev[i], st));
+                CK(cudaStreamWaitEvent(side, ev[i], 0));
+                if (pe && i >= kDense) {
+                    k_router<<<kExperts / 4, 128, 0, side>>>(vH, l.ffn_norm, l.router, prl, pidx, pw, pdone);
+                    k_touch_pred<<<pe, 256, 0, side>>>(l.gate_e, l.up_e, l.down_e, pidx, sink);
+                }
+                if (pf) prefetch(i + 1);
+            }
+            v_mv({{l.wq, vQKV}, {l.wk, vQKV + kQDim}, {l.wv, vQKV + kQDim + kKvDim}}, {kQDim, kKvDim, kKvDim}, vH, kHidden, kHidden, T, NQKV, false, l.attn_norm);
             k_qkv_post<<<dim3(kHeads + kKv, 1, T), kHd, 0, st>>>(vQKV, vQKV + kQDim, vQKV + kQDim + kKvDim, l.q_norm, l.k_norm, l.K, l.V, state, l.swa, l.kv_mask, NQKV);
             if (l.swa) k_attn_part<<<dim3(kHeads, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV);
             else k_attn_dec_w<<<dim3(kKv, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV);
@@ -1972,8 +1999,11 @@ struct Model {
                 k_v_moe_down<TT><<<kHidden / kMvRows, 256, 0, st>>>(vH, vACT, l.down_e, l.down_s, vUe, vUm, vVu, vW, vUn);
             });
         }
-        k_v_norm<<<T, 256, 0, st>>>(vH, out_norm, vX);
-        v_mv({{head, vLG}}, {vocab}, vX, kHidden, kHidden, T, vocab, false);
+        if (pf || pe) {
+            CK(cudaEventRecord(ev[kLayers], side));
+            CK(cudaStreamWaitEvent(st, ev[kLayers], 0));
+        }
+        v_mv({{head, vLG}}, {vocab}, vH, kHidden, kHidden, T, vocab, false, out_norm);
         k_argmax_rows<<<T, 1024, 0, st>>>(vLG, vocab, vBest);
     }
     // the T tokens through the model at pos .. pos + T - 1 (their K/V written); afterwards each row's most likely next
