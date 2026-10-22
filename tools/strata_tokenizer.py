@@ -63,6 +63,18 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# Ling (bailingmoe / bailingmoe2): the pattern of the model's own tokenizer.json, as llama.cpp's
+# LLAMA_VOCAB_PRE_TYPE_BAILINGMOE quotes it (llama.cpp itself runs a greedy rewrite of the possessive quantifiers)
+BAILINGMOE_PATTERN = (
+    r"'(?i:[sdmt]|ll|ve|re)"
+    r"|[^\r\n\p{L}\p{N}]?+\p{L}+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]++[\r\n]*"
+    r"|\s*[\r\n]"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
@@ -347,6 +359,9 @@ def extract(gguf_path, out_dir) -> dict:
         "pre_pattern": QWEN35_PATTERN,
         "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
     }
+    if tk.pre in ("bailingmoe", "bailingmoe2"):
+        cfg["pre_pattern"] = BAILINGMOE_PATTERN
+        cfg["pre_pattern_source"] = "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_BAILINGMOE, the original regex)"
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
                                               sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")
