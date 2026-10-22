@@ -320,6 +320,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata-flint PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata-flint PRIVATE strata_kernels strata_prefill ${_strata_gpu_runtime_target} Threads::Threads)
 
+  # Ling-3.0-flash-VL (src/ling): its own program on the GGUF's formats, experts split card / CPU as Flint's hybrid mode
+  add_executable(strata-ling src/ling/ling_main.cu src/flint/flint_cpu.cpp)
+  set_source_files_properties(src/flint/flint_cpu.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+  target_include_directories(strata-ling PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata-ling PRIVATE strata_kernels ${_strata_gpu_runtime_target} Threads::Threads)
+
   add_executable(strata-concurrent src/core/concurrent_main.cpp)
   target_include_directories(strata-concurrent PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata-concurrent PRIVATE strata_core strata_kernels ${_strata_gpu_runtime_target})

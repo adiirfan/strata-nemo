@@ -61,6 +61,48 @@ __attribute__((target("avx2,f16c,fma"))) float dot256(const B* w, const float* x
     s = _mm_hadd_ps(s, s);
     return _mm_cvtss_f32(s) + mt;
 }
+// Q4_0 (fp16 d, 16 bytes of nibbles; value d * (q - 8)): d * (sum q x - 8 sum x) a block
+struct B0 { uint16_t d; uint8_t q[16]; };
+static_assert(sizeof(B0) == 18, "Q4_0 block");
+__attribute__((target("avx512f,avx512bw,f16c,fma"))) float dot0_512(const B0* w, const float* x, const float* sx, int nb) {
+    __m512 acc = _mm512_setzero_ps();
+    float mt = 0.f;
+    const __m128i mask = _mm_set1_epi8(0x0F);
+    for (int b = 0; b < nb; ++b) {
+        const __m128i v = _mm_loadu_si128((const __m128i*) w[b].q);
+        const __m512 lo = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_and_si128(v, mask)));
+        const __m512 hi = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_and_si128(_mm_srli_epi16(v, 4), mask)));
+        __m512 t = _mm512_mul_ps(lo, _mm512_loadu_ps(x + b * 32));
+        t = _mm512_fmadd_ps(hi, _mm512_loadu_ps(x + b * 32 + 16), t);
+        const float d = _cvtsh_ss(w[b].d);
+        acc = _mm512_fmadd_ps(_mm512_set1_ps(d), t, acc);
+        mt -= 8.f * d * sx[b];
+    }
+    return _mm512_reduce_add_ps(acc) + mt;
+}
+__attribute__((target("avx2,f16c,fma"))) float dot0_256(const B0* w, const float* x, const float* sx, int nb) {
+    __m256 acc = _mm256_setzero_ps();
+    float mt = 0.f;
+    const __m128i mask = _mm_set1_epi8(0x0F);
+    for (int b = 0; b < nb; ++b) {
+        const __m128i v = _mm_loadu_si128((const __m128i*) w[b].q);
+        const __m128i lo = _mm_and_si128(v, mask), hi = _mm_and_si128(_mm_srli_epi16(v, 4), mask);
+        const float* xb = x + b * 32;
+        __m256 t = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo)), _mm256_loadu_ps(xb));
+        t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(lo, 8))), _mm256_loadu_ps(xb + 8), t);
+        t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi)), _mm256_loadu_ps(xb + 16), t);
+        t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(hi, 8))), _mm256_loadu_ps(xb + 24), t);
+        const float d = _cvtsh_ss(w[b].d);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), t, acc);
+        mt -= 8.f * d * sx[b];
+    }
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s) + mt;
+}
+using Dot0Fn = float (*)(const B0*, const float*, const float*, int);
+const Dot0Fn dot0 = [] { __builtin_cpu_init(); return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") ? dot0_512 : dot0_256; }();
 using DotFn = float (*)(const B*, const float*, const float*, int);
 DotFn pick_dot() {
     __builtin_cpu_init();
@@ -214,6 +256,48 @@ void moe(const float* h, const float* nw, int n_in, int n_ff, int n, const Exper
             float t = 0;
             for (int k = 0; k < n; ++k)
                 t += w[k] * dot((const B*) ex[k].down + size_t(row) * nbf, act + size_t(k) * n_ff, sa + size_t(k) * nbf, nbf);
+            y[row] = t;
+        }
+    });
+}
+
+// a row (nb blocks) of format fmt (kQ4_0 or kQ4_1) . x
+static inline float row_dot(int fmt, const void* row, const float* x, const float* sx, int nb) {
+    return fmt == kQ4_0 ? dot0((const B0*) row, x, sx, nb) : dot((const B*) row, x, sx, nb);
+}
+static inline size_t row_bytes(int fmt, int n) { return size_t(n / 32) * (fmt == kQ4_0 ? 18 : 20); }
+
+void moe_q(const float* h, const float* nw, int n_in, int n_ff, int n, const Expert* ex, const float* w, float* y, int fmt_gu,
+           int fmt_d, float clamp) {
+    static thread_local std::vector<float> xv, sxv, actv, sav;   // (see moe(): the workers get plain pointers)
+    xv.resize(n_in); sxv.resize(n_in / 32); actv.resize(size_t(n) * n_ff); sav.resize(size_t(n) * (n_ff / 32));
+    float *x = xv.data(), *sx = sxv.data(), *act = actv.data(), *sa = sav.data();
+    double ss = 0;
+    for (int i = 0; i < n_in; ++i) ss += double(h[i]) * h[i];
+    const float r = 1.f / std::sqrt(float(ss / n_in) + 1e-6f);
+    for (int i = 0; i < n_in; ++i) x[i] = h[i] * r * nw[i];
+    for (int b = 0; b < n_in / 32; ++b) { float s = 0; for (int i = 0; i < 32; ++i) s += x[b * 32 + i]; sx[b] = s; }
+    const int P = g_pool->size(), nbi = n_in / 32, nbf = n_ff / 32;
+    const size_t rb_gu = row_bytes(fmt_gu, n_in), rb_d = row_bytes(fmt_d, n_ff);
+    const int rows1 = n * n_ff;
+    g_pool->run([&](int id) {
+        const int a = rows1 * id / P, z = rows1 * (id + 1) / P;
+        for (int rr = a; rr < z; ++rr) {
+            const int k = rr / n_ff, row = rr % n_ff;
+            float gv = row_dot(fmt_gu, (const uint8_t*) ex[k].gate + row * rb_gu, x, sx, nbi);
+            float uv = row_dot(fmt_gu, (const uint8_t*) ex[k].up + row * rb_gu, x, sx, nbi);
+            if (clamp > 0.f) { gv = std::min(gv, clamp); uv = std::max(-clamp, std::min(uv, clamp)); }
+            act[rr] = silu(gv) * uv;
+        }
+    });
+    for (int k = 0; k < n; ++k)
+        for (int b = 0; b < nbf; ++b) { float s = 0; for (int i = 0; i < 32; ++i) s += act[size_t(k) * n_ff + b * 32 + i]; sa[size_t(k) * nbf + b] = s; }
+    g_pool->run([&](int id) {
+        const int a = n_in * id / P, z = n_in * (id + 1) / P;
+        for (int row = a; row < z; ++row) {
+            float t = 0;
+            for (int k = 0; k < n; ++k)
+                t += w[k] * row_dot(fmt_d, (const uint8_t*) ex[k].down + row * rb_d, act + size_t(k) * n_ff, sa + size_t(k) * nbf, nbf);
             y[row] = t;
         }
     });
