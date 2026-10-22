@@ -904,6 +904,90 @@ __global__ void __launch_bounds__(256) k_hy_wait_add(float* h, HyShared* S, cons
     h[i] += ((volatile float*) S->y)[i];
 }
 
+// the writing step's routing and hand-off in one: the experts as route_block picks them (each warp its 32 experts' top 8,
+// then warp 0 the best 8 of those 128 - the same choice, ties to the lower index, with two block syncs instead of 17),
+// then the MoE input, choices and weights posted to the CPU as k_hy_post does
+__global__ void __launch_bounds__(512) k_route_post(const float* logits, const float* bias, int* idx, float* wts, const float* h,
+                                                    HyShared* S, uint32_t* ctr) {
+    __shared__ float sel[kExperts], prob[kExperts], gsc[kGroups], cv[128];
+    __shared__ int ci[128], keep[kGroups], top[kTopK];
+    const int e = threadIdx.x, lane = e & 31, w = e >> 5;
+    for (int i = e; i < kHidden; i += kExperts) S->h[i] = h[i];   // (the input first: it does not wait on the choice)
+    prob[e] = sigmoidf(logits[e]);
+    sel[e] = prob[e] + bias[e];
+    __syncthreads();
+    if (w < kGroups) {   // warp w: group w's top-2 sum
+        const float a = sel[w * 64 + lane], b = sel[w * 64 + 32 + lane];
+        float m1 = fmaxf(a, b), m2 = fminf(a, b);
+        for (int o = 16; o > 0; o >>= 1) {
+            const float o1 = fl_shfl_xor(m1, o, 32), o2 = fl_shfl_xor(m2, o, 32);
+            const float n1 = fmaxf(m1, o1), n2 = fmaxf(fminf(m1, o1), fmaxf(m2, o2));
+            m1 = n1; m2 = n2;
+        }
+        if (lane == 0) gsc[w] = m1 + m2;
+    }
+    __syncthreads();
+    if (e == 0) {
+        int used = 0;
+        for (int k = 0; k < kGroupsUsed; ++k) {
+            int bi = -1;
+            for (int gi = 0; gi < kGroups; ++gi) if (!(used >> gi & 1) && (bi < 0 || gsc[gi] > gsc[bi])) bi = gi;
+            used |= 1 << bi;
+        }
+        for (int gi = 0; gi < kGroups; ++gi) keep[gi] = used >> gi & 1;
+    }
+    __syncthreads();
+    // this warp's best 8 (warp-local, no block syncs)
+    float v = keep[e >> 6] ? sel[e] : -INFINITY;
+    for (int k = 0; k < kTopK; ++k) {
+        float bv = v;
+        int bi = e;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = fl_shfl_xor(bv, o, 32);
+            const int oi = fl_shfl_xor(bi, o, 32);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) { cv[w * kTopK + k] = bv; ci[w * kTopK + k] = bi; }
+        if (e == bi) v = -INFINITY;
+    }
+    __syncthreads();
+    if (w == 0) {   // the best 8 of the 16 warps' 8: four candidates a lane
+        float lv[4];
+        int li[4];
+        for (int u = 0; u < 4; ++u) { lv[u] = cv[lane * 4 + u]; li[u] = ci[lane * 4 + u]; }
+        for (int k = 0; k < kTopK; ++k) {
+            int bu = 0;
+            for (int u = 1; u < 4; ++u) if (lv[u] > lv[bu] || (lv[u] == lv[bu] && li[u] < li[bu])) bu = u;
+            float bv = lv[bu];
+            int bi = li[bu], bl = lane;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = fl_shfl_xor(bv, o, 32);
+                const int oi = fl_shfl_xor(bi, o, 32), ol = fl_shfl_xor(bl, o, 32);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; bl = ol; }
+            }
+            if (lane == 0) top[k] = bi;
+            if (lane == bl) { lv[bu] = -INFINITY; li[bu] = 0x7fffffff; }
+        }
+        if (lane == 0) {
+            float tot = 0;
+            for (int k = 0; k < kTopK; ++k) tot += prob[top[k]];
+            for (int k = 0; k < kTopK; ++k) {
+                const float wk = prob[top[k]] / tot * kExpScale;
+                idx[k] = top[k]; wts[k] = wk;
+                S->idx[k] = top[k]; S->w[k] = wk;
+            }
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (e == 0) {
+        const uint32_t sq = *ctr + 1;
+        *ctr = sq;
+        *(volatile uint32_t*) &S->in_seq = sq;
+        __threadfence_system();
+    }
+}
+
 #include "ling_prefill.cuh"
 
 struct Tensor { const uint8_t* d = nullptr; int fmt = -1; };
@@ -1194,8 +1278,7 @@ struct Model {
             attn(l);
             if (l.dense) { dense(l); continue; }
             mv({{Tensor{(const uint8_t*) l.router, F32}, rl}}, {kExperts}, h, kHidden, l.ffn_norm);
-            k_route<<<1, kExperts, 0, st>>>(rl, l.bias, idx, wts);
-            k_hy_post<<<1, 256, 0, st>>>(h, idx, wts, hy_s_dev, hy_ctr);
+            k_route_post<<<1, kExperts, 0, st>>>(rl, l.bias, idx, wts, h, hy_s_dev, hy_ctr);
             k_moe_gu<<<kActRows / (8 * kGuR), 256, 0, st>>>(MoeGu{h, l.ffn_norm, l.ge, l.ue, l.gs.d, l.us.d, aligned_fmt(l.fmt_eg), l.gs.fmt, idx,
                                                          l.slot, l.clamp_e, l.clamp_s, act});
             k_moe_down<<<kHidden / (8 * kDnR), 256, 0, st>>>(MoeDown{h, act, l.de, l.ds.d, aligned_fmt(l.fmt_ed), l.ds.fmt, idx, l.slot, wts});
