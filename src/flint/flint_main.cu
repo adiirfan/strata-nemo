@@ -846,6 +846,107 @@ __global__ void __launch_bounds__(256) k_pf_attn(const float* QKV, const float* 
     for (int j = 0; j < 32; ++j) ATT[size_t(t) * kQDim + h * kHd + part * 32 + j] = o[j] * f / L;
 }
 
+
+// Attention for T queries on the matrix units: block = (K/V head, 16 queries), warp w = query head kh * 8 + w, so the 8
+// heads sharing a K/V head read each key tile once. Per 16 keys a warp forms S^T = K Q^T (keys x queries: its C layout
+// gives each lane one query's 8 keys, which is already the B operand of the next product), takes the online softmax,
+// and adds O^T += V^T P^T (dims x queries). K and V go through LDS as fp16 (V transposed), Q and P are fp16, sums fp32.
+__global__ void __launch_bounds__(256) k_pf_attn_w(const float* __restrict__ QKV, const float* __restrict__ K,
+                                                   const float* __restrict__ V, const float* __restrict__ sinks,
+                                                   float* __restrict__ ATT, int p0, int T, int swa) {
+    constexpr int KT = 64;
+    __shared__ __align__(16) _Float16 ks[KT][kHd + 8];
+    __shared__ __align__(16) _Float16 vt[kHd][KT + 8];
+    const int kh = blockIdx.x, q0 = blockIdx.y * 16;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, l16 = lane & 15, g = lane >> 4;
+    const int h = kh * (kHeads / kKv) + warp;
+    const int tq = q0 + l16;                                  // this lane's query
+    const bool live = tq < T;
+    const int qpos = p0 + min(tq, T - 1);
+    const int qlo = swa ? max(0, qpos - (kWindow - 1)) : 0;
+    // Q^T as the B operand: lane (query l16, half g) holds dims s * 16 + g * 8 .. + 7 for the 8 steps s
+    pf_v8h qb[8];
+    {
+        const float* qr = QKV + size_t(min(tq, T - 1)) * (kQDim + 2 * kKvDim) + h * kHd;
+#pragma unroll
+        for (int s8 = 0; s8 < 8; ++s8)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) qb[s8][i] = (_Float16) qr[s8 * 16 + g * 8 + i];
+    }
+    const float scale = rsqrtf(float(kHd));
+    float m = -INFINITY, l = 0;
+    pf_v8f o[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) o[j] = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    const int last = p0 + min(q0 + 15, T - 1);
+    const int first = swa ? max(0, p0 + q0 - (kWindow - 1)) : 0;
+    for (int k0 = first; k0 <= last; k0 += KT) {
+        // K tile (keys x dims) and V^T (dims x keys) into LDS as fp16: 64 keys x 128 dims, 32 values a thread
+        {
+            const int key = tid >> 2, c0 = (tid & 3) * 32, p = k0 + key;
+            const bool ok = p <= last;
+            const float* kr = K + size_t(p) * kKvDim + kh * kHd + c0;
+            const float* vr = V + size_t(p) * kKvDim + kh * kHd + c0;
+#pragma unroll
+            for (int c = 0; c < 32; c += 4) {
+                const float4 a = ok ? *(const float4*) (kr + c) : make_float4(0, 0, 0, 0);
+                const float4 b = ok ? *(const float4*) (vr + c) : make_float4(0, 0, 0, 0);
+                ks[key][c0 + c] = (_Float16) a.x; ks[key][c0 + c + 1] = (_Float16) a.y; ks[key][c0 + c + 2] = (_Float16) a.z; ks[key][c0 + c + 3] = (_Float16) a.w;
+                vt[c0 + c][key] = (_Float16) b.x; vt[c0 + c + 1][key] = (_Float16) b.y; vt[c0 + c + 2][key] = (_Float16) b.z; vt[c0 + c + 3][key] = (_Float16) b.w;
+            }
+        }
+        pf_sync();
+#pragma unroll
+        for (int sub = 0; sub < KT / 16; ++sub) {
+            // S^T for keys k0 + sub * 16 .. + 15: A = K rows (lane l16 = key, half g = dims), B = Q^T
+            pf_v8f sc = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+            for (int s8 = 0; s8 < 8; ++s8) {
+                const pf_v8h ka = *(const pf_v8h*) &ks[sub * 16 + l16][s8 * 16 + g * 8];
+                sc = pf_wmma(ka, qb[s8], sc);
+            }
+            // lane: query l16, keys sub * 16 + g * 8 + i
+            float mx = -INFINITY;
+            float v[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int p = k0 + sub * 16 + g * 8 + i;
+                v[i] = (live && p >= qlo && p <= qpos) ? sc[i] * scale : -INFINITY;
+                mx = fmaxf(mx, v[i]);
+            }
+            mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+            // (no branch around the products: a matrix instruction needs every lane; a query with nothing visible yet
+            // keeps m = -inf and adds zeros)
+            const float mn = fmaxf(m, mx), ref = mn == -INFINITY ? 0.f : mn;
+            const float cf = expf(m - ref);
+            m = mn;
+            pf_v8h pb;
+            float ps = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { const float e = expf(v[i] - ref); ps += e; pb[i] = (_Float16) e; }
+            l = l * cf + ps;
+            // O^T += V^T P^T: A = V^T rows (lane l16 = dim within tile j, half g = keys), B = P^T (this lane's 8 keys)
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                o[j] = o[j] * cf;
+                const pf_v8h va = *(const pf_v8h*) &vt[j * 16 + l16][sub * 16 + g * 8];
+                o[j] = pf_wmma(va, pb, o[j]);
+            }
+        }
+        pf_sync();
+    }
+    // the two halves' sums, the sink, and the output: lane (query l16, half g) has dims j * 16 + g * 8 + i
+    l += __shfl_xor(l, 16, 32);
+    if (!live) return;
+    const float sk = sinks[h], M = fmaxf(m, sk);
+    const float f = expf(m - M), L = l * f + expf(sk - M);
+    float* out = ATT + size_t(tq) * kQDim + h * kHd;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) out[j * 16 + g * 8 + i] = o[j][i] * f / L;
+}
+
 // ---------------------------------------------------------------------------------------------------- the model
 struct Layer {
     const float *attn_norm, *ffn_norm, *q_norm, *k_norm, *sinks;
@@ -1075,7 +1176,9 @@ struct Model {
             pf_gemm(l.wk, kKvDim, kHidden, T, pQKV + kQDim, NQKV, 0);
             pf_gemm(l.wv, kKvDim, kHidden, T, pQKV + kQDim + kKvDim, NQKV, 0);
             k_pf_qkpost<<<dim3(kHeads + kKv, T), kHd, 0, st>>>(pQKV, l.q_norm, l.k_norm, l.K, l.V, p0, l.swa);
-            k_pf_attn<<<dim3(kHeads, (T + 63) / 64), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa);
+            static const bool attn_old = std::getenv("FLINT_PF_ATTN_OLD") != nullptr;
+            if (attn_old) k_pf_attn<<<dim3(kHeads, (T + 63) / 64), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa);
+            else k_pf_attn_w<<<dim3(kKv, (T + 15) / 16), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa);
             pf_split(pATT, nullptr, nullptr, kQDim, T);
             pf_gemm(l.wo, kHidden, kQDim, T, pH, kHidden, 1);
             pf_split(pH, nullptr, l.ffn_norm, kHidden, T);
