@@ -27,6 +27,8 @@
 #include <vector>
 #include <atomic>
 #include <sys/mman.h>
+#include <poll.h>
+#include <unistd.h>
 
 #include "../flint/flint_cpu.hpp"
 
@@ -1373,13 +1375,46 @@ struct Model {
         CK(cudaStreamSynchronize(st));
         return host_state[1];
     }
+
+    // the KDA layers' running state (S and the conv inputs) - all of the model's memory of the past besides the MLA
+    // cache, whose rows stay valid below a position - copied out and back for conversation reuse (ling_serve.cuh)
+    static constexpr size_t kSnapS = size_t(kHeads) * kHd * kHd, kSnapCs = size_t(9) * kInner;
+    static size_t snap_floats() { return size_t(kLayers - kKdaFree) * (kSnapS + kSnapCs); }
+    static constexpr int kKdaFree = 7;   // (the MLA layers: no running state)
+    void set_pos(int p) {
+        pos = p;
+        const int v[2] = {p, 0};
+        CK(cudaMemcpyAsync(state, v, 8, cudaMemcpyHostToDevice, st));
+        CK(cudaStreamSynchronize(st));
+    }
+    void clear_state() {
+        for (auto& l : L) if (l.kda) {
+            CK(cudaMemsetAsync(l.S, 0, kSnapS * 4, st));
+            CK(cudaMemsetAsync(l.cs, 0, kSnapCs * 4, st));
+        }
+        set_pos(0);
+    }
+    void snap_copy(float* buf, bool save) {
+        size_t o = 0;
+        for (auto& l : L) if (l.kda) {
+            CK(cudaMemcpyAsync(save ? buf + o : l.S, save ? l.S : buf + o, kSnapS * 4, cudaMemcpyDeviceToDevice, st));
+            o += kSnapS;
+            CK(cudaMemcpyAsync(save ? buf + o : l.cs, save ? l.cs : buf + o, kSnapCs * 4, cudaMemcpyDeviceToDevice, st));
+            o += kSnapCs;
+        }
+        CK(cudaStreamSynchronize(st));
+    }
 };
+
+#include "ling_serve.cuh"
 
 }  // namespace
 
 int main(int argc, char** argv) {
     std::string path, ids_s, logits_path;
     int n_new = 0, ctx = 4096;
+    bool serve_mode = false;
+    std::vector<int> eos_ids = {156895, 156892};   // <|role_end|>, <|endoftext|>
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() { return std::string(i + 1 < argc ? argv[++i] : ""); };
@@ -1400,11 +1435,17 @@ int main(int argc, char** argv) {
         else if (a == "--new") n_new = std::stoi(next());
         else if (a == "--max-ctx" || a == "--max-context") ctx = std::stoi(next());
         else if (a == "--logits") logits_path = next();
-        else { std::fprintf(stderr, "usage: strata-ling --model PART1.gguf --ids 1,2,3|@FILE [--new N] [--max-ctx N] [--logits FILE]\n"); return 2; }
+        else if (a == "--serve") serve_mode = true;
+        else if (a == "--eos-ids") {
+            eos_ids.clear();
+            std::stringstream es(next());
+            for (std::string v; std::getline(es, v, ',');) eos_ids.push_back(std::stoi(v));
+        }
+        else { std::fprintf(stderr, "usage: strata-ling --model PART1.gguf --ids 1,2,3|@FILE [--new N] [--max-ctx N] [--logits FILE] | --serve [--eos-ids A,B]\n"); return 2; }
     }
     std::vector<int> ids;
     { std::stringstream ss(ids_s); for (std::string v; std::getline(ss, v, ',');) if (v.find_first_not_of(" \n\r\t") != std::string::npos) ids.push_back(std::stoi(v)); }
-    if (path.empty() || ids.empty()) { std::fprintf(stderr, "strata-ling: --model and --ids are needed\n"); return 2; }
+    if (path.empty() || (ids.empty() && !serve_mode)) { std::fprintf(stderr, "strata-ling: --model and --ids (or --serve) are needed\n"); return 2; }
     const auto t0 = std::chrono::steady_clock::now();
     if (const char* tn = std::getenv("LING_FMT_TEST")) {   // (checking) one tensor's rows 0..3, both layouts
         strata::GgufFile g1(path);
@@ -1431,6 +1472,7 @@ int main(int argc, char** argv) {
     Model m(path, ctx);
     std::fprintf(stderr, "strata-ling: %.1f GB on the card in %.1f s\n", m.loaded / 1e9,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if (serve_mode) return serve(m, eos_ids, std::getenv("LING_CHUNK") ? std::atoi(std::getenv("LING_CHUNK")) : 8192);
     FILE* lf = logits_path.empty() ? nullptr : std::fopen(logits_path.c_str(), "wb");
     std::vector<float> lg(157184);
     const auto t1 = std::chrono::steady_clock::now();

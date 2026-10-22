@@ -2923,8 +2923,10 @@ class Service:
         # the end markers this tokenizer has as one token: Nemotron has no <|endoftext|>, and spelled out its '<', '|'
         # and '>' each ended a reply; its </s> is one (Qwen's is three, and stays out)
         self.stop_ids = set()
-        # (Flint ends a turn with <|end_of_text|> or by starting the next one: <|user|>, <|observation|>, <|developer|>)
-        for marker in (IM_END, "<|endoftext|>", "</s>", "<|end_of_text|>", "<|user|>", "<|observation|>", "<|developer|>"):
+        # (Flint ends a turn with <|end_of_text|> or by starting the next one: <|user|>, <|observation|>, <|developer|>;
+        # Ling with <|role_end|>)
+        for marker in (IM_END, "<|endoftext|>", "</s>", "<|end_of_text|>", "<|user|>", "<|observation|>", "<|developer|>",
+                       "<|role_end|>"):
             ids = tokenizer.encode(marker, parse_special=True)
             if len(ids) == 1:
                 self.stop_ids.update(ids)
@@ -3762,8 +3764,8 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        # (Flint writes its calls in its own form: FlintParser turns them into the template form as they stream)
-        parser = (FlintParser if MODEL_FAMILY == "flint" else OutputParser)(thinking=thinking, tools=tools, stream_tools=True,
+        # (Flint and Ling write their calls in their own form: FlintParser turns them into the template form as they stream)
+        parser = (FlintParser if MODEL_FAMILY in ("flint", "ling") else OutputParser)(thinking=thinking, tools=tools, stream_tools=True,
                                                                             recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
