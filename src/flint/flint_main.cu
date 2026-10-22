@@ -40,6 +40,23 @@ constexpr int kHidden = 2048, kLayers = 49, kDense = 2;
 constexpr int kHeads = 32, kKv = 4, kHd = 128, kQDim = kHeads * kHd, kKvDim = kKv * kHd;
 constexpr int kFfDense = 6144, kExperts = 256, kTopK = 6, kFfExp = 512, kFfShared = 1024;
 constexpr int kWindow = 513;
+constexpr int kSwaRing = 16384;
+// K and V cache element types (FLINT_K32 / FLINT_V32 at build time: fp32, for measuring what fp16 costs)
+#ifdef FLINT_K32
+typedef float kc_t;
+#else
+typedef __half kc_t;
+#endif
+#ifdef FLINT_V32
+typedef float vc_t;
+#else
+typedef __half vc_t;
+#endif
+__device__ inline float c2f(__half v) { return __half2float(v); }
+__device__ inline float c2f(float v) { return v; }
+template <class T> __device__ inline T f2c(float v);
+template <> __device__ inline __half f2c<__half>(float v) { return __float2half(v); }
+template <> __device__ inline float f2c<float>(float v) { return v; }   // sliding layers' K/V slots: the window plus the largest prompt chunk (8192)
 constexpr float kEps = 1e-6f, kRopeBase = 10000.f;
 constexpr int kQ4_1 = 3, kF32 = 0;
 
@@ -259,8 +276,8 @@ __global__ void __launch_bounds__(128) k_router(const float* h, const float* nw,
 
 // after the q/k/v products: q and k heads RMSNorm (+ RoPE on sliding layers), k and v into the cache. Blocks 0-31 the
 // query heads, 32-35 the K/V heads; 128 threads.
-__global__ void k_qkv_post(float* q, const float* k, const float* v, const float* qn, const float* kn, float* K,
-                           float* V, const int* state, bool rope) {
+__global__ void k_qkv_post(float* q, const float* k, const float* v, const float* qn, const float* kn, kc_t* K,
+                           vc_t* V, const int* state, bool rope, int kv_mask) {
     __shared__ float sh[4];
     __shared__ float t[kHd];
     const int pos = state[0], hb = blockIdx.x, i = threadIdx.x;
@@ -281,8 +298,9 @@ __global__ void k_qkv_post(float* q, const float* k, const float* v, const float
     if (isq) q[hb * kHd + i] = y;
     else {
         const int kh = hb - kHeads;
-        K[size_t(pos) * kKvDim + kh * kHd + i] = y;
-        V[size_t(pos) * kKvDim + kh * kHd + i] = v[kh * kHd + i];
+        const size_t r = size_t(pos & kv_mask) * kKvDim + kh * kHd + i;
+        K[r] = f2c<kc_t>(y);
+        V[r] = f2c<vc_t>(v[kh * kHd + i]);
     }
 }
 
@@ -290,8 +308,14 @@ __global__ void k_qkv_post(float* q, const float* k, const float* v, const float
 // for query head h; each warp walks its keys with an online softmax (lane = 4 of the 128 dims), the 8 warps merge in
 // LDS, and the chunk's (max, sum, unnormalized output) goes to part. k_attn_merge adds the chunks and the sink.
 constexpr int kAttnChunks = 16, kPart = kHd + 4;   // a chunk's record: max, sum, 2 spare, 128 outputs
-__global__ void __launch_bounds__(256) k_attn_part(const float* q, const float* K, const float* V, float* part,
-                                                   const int* state, bool swa) {
+__device__ inline float4 h4(const float* p) { return *(const float4*) p; }
+__device__ inline float4 h4(const __half* p) {
+    const uint2 u = *(const uint2*) p;
+    const float2 a = __half22float2(__builtin_bit_cast(__half2, u.x)), b = __half22float2(__builtin_bit_cast(__half2, u.y));
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+__global__ void __launch_bounds__(256) k_attn_part(const float* q, const kc_t* K, const vc_t* V, float* part,
+                                                   const int* state, bool swa, int kv_mask) {
     const int h = blockIdx.x, c = blockIdx.y, kh = h / (kHeads / kKv);
     const int pos = state[0], lo = swa ? max(0, pos - (kWindow - 1)) : 0, n = pos - lo + 1;
     const int per = (n + kAttnChunks - 1) / kAttnChunks, a = lo + c * per, b = min(pos + 1, a + per);
@@ -301,10 +325,10 @@ __global__ void __launch_bounds__(256) k_attn_part(const float* q, const float* 
     float m = -INFINITY, l = 0;
     float4 o = make_float4(0, 0, 0, 0);
     for (int p = a + w; p < b; p += 8) {
-        const float4 kv = *(const float4*) (K + size_t(p) * kKvDim + kh * kHd + lane * 4);
+        const float4 kv = h4(K + size_t(p & kv_mask) * kKvDim + kh * kHd + lane * 4);
         const float d = warp_sum(qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w) * scale;
         const float mn = fmaxf(m, d), cf = expf(m - mn), e = expf(d - mn);
-        const float4 vv = *(const float4*) (V + size_t(p) * kKvDim + kh * kHd + lane * 4);
+        const float4 vv = h4(V + size_t(p & kv_mask) * kKvDim + kh * kHd + lane * 4);
         o.x = o.x * cf + e * vv.x; o.y = o.y * cf + e * vv.y; o.z = o.z * cf + e * vv.z; o.w = o.w * cf + e * vv.w;
         l = l * cf + e;
         m = mn;
@@ -771,7 +795,7 @@ __global__ void k_pf_embed(const float* table, const int* ids, float* H) {
 }
 // q / k heads: RMSNorm (+ NEOX RoPE on sliding layers) at position p0 + t; q back in place, k and v into the cache.
 // grid (36 heads, T), 128 threads
-__global__ void k_pf_qkpost(float* QKV, const float* qn, const float* kn, float* K, float* V, int p0, bool rope) {
+__global__ void k_pf_qkpost(float* QKV, const float* qn, const float* kn, kc_t* K, vc_t* V, int p0, bool rope, int kv_mask) {
     __shared__ float sh[4];
     __shared__ float tb[kHd];
     const int hb = blockIdx.x, t = blockIdx.y, i = threadIdx.x, pos = p0 + t;
@@ -794,56 +818,10 @@ __global__ void k_pf_qkpost(float* QKV, const float* qn, const float* kn, float*
     if (isq) src[i] = y;
     else {
         const int kh = hb - kHeads;
-        K[size_t(pos) * kKvDim + kh * kHd + i] = y;
-        V[size_t(pos) * kKvDim + kh * kHd + i] = row[kQDim + kKvDim + kh * kHd + i];
+        const size_t r = size_t(pos & kv_mask) * kKvDim + kh * kHd + i;
+        K[r] = f2c<kc_t>(y);
+        V[r] = f2c<vc_t>(row[kQDim + kKvDim + kh * kHd + i]);
     }
-}
-// Attention for T queries (positions p0 ..) against the cache, fp32: block = (head, 64 queries), 4 threads a query,
-// each 32 of the 128 dims; keys in tiles of 32 through LDS; online softmax; the sink joins the denominator at the end.
-__global__ void __launch_bounds__(256) k_pf_attn(const float* QKV, const float* K, const float* V, const float* sinks,
-                                                 float* ATT, int p0, int T, bool swa) {
-    __shared__ float ks[32][kHd + 4], vs[32][kHd + 4];
-    const int h = blockIdx.x, kh = h / (kHeads / kKv), q0 = blockIdx.y * 64;
-    const int tid = threadIdx.x, ql = tid >> 2, part = tid & 3, t = q0 + ql;
-    const bool live = t < T;
-    const int pos = p0 + min(t, T - 1);
-    const int lo = swa ? max(0, pos - (kWindow - 1)) : 0;
-    float qv[32];
-    const float scale = rsqrtf(float(kHd));
-    for (int j = 0; j < 32; ++j) qv[j] = live ? QKV[size_t(t) * (kQDim + 2 * kKvDim) + h * kHd + part * 32 + j] * scale : 0.f;
-    float m = -INFINITY, l = 0, o[32] = {};
-    // the block's key range: from the first query's window start to the last query's position
-    const int last = p0 + min(q0 + 63, T - 1);
-    const int first_lo = swa ? max(0, p0 + q0 - (kWindow - 1)) : 0;
-    for (int k0 = first_lo; k0 <= last; k0 += 32) {
-        for (int i = tid; i < 32 * 32; i += 256) {   // 32 keys x 32 float4 (k and v)
-            const int key = i >> 5, c = (i & 31) * 4, p = k0 + key;
-            const float4 kv = p <= last ? *(const float4*) (K + size_t(p) * kKvDim + kh * kHd + c) : make_float4(0, 0, 0, 0);
-            const float4 vv = p <= last ? *(const float4*) (V + size_t(p) * kKvDim + kh * kHd + c) : make_float4(0, 0, 0, 0);
-            *(float4*) &ks[key][c] = kv;
-            *(float4*) &vs[key][c] = vv;
-        }
-        __syncthreads();
-        for (int key = 0; key < 32; ++key) {
-            const int p = k0 + key;
-            float d = 0;
-#pragma unroll
-            for (int j = 0; j < 32; ++j) d += qv[j] * ks[key][part * 32 + j];
-            d += __shfl_xor(d, 1, 32);
-            d += __shfl_xor(d, 2, 32);
-            if (p < lo || p > pos || !live) continue;
-            const float mn = fmaxf(m, d), cf = expf(m - mn), e = expf(d - mn);
-#pragma unroll
-            for (int j = 0; j < 32; ++j) o[j] = o[j] * cf + e * vs[key][part * 32 + j];
-            l = l * cf + e;
-            m = mn;
-        }
-        __syncthreads();
-    }
-    if (!live) return;
-    const float sk = sinks[h], M = fmaxf(m, sk);
-    const float f = expf(m - M), L = l * f + expf(sk - M);
-    for (int j = 0; j < 32; ++j) ATT[size_t(t) * kQDim + h * kHd + part * 32 + j] = o[j] * f / L;
 }
 
 
@@ -851,9 +829,9 @@ __global__ void __launch_bounds__(256) k_pf_attn(const float* QKV, const float* 
 // heads sharing a K/V head read each key tile once. Per 16 keys a warp forms S^T = K Q^T (keys x queries: its C layout
 // gives each lane one query's 8 keys, which is already the B operand of the next product), takes the online softmax,
 // and adds O^T += V^T P^T (dims x queries). K and V go through LDS as fp16 (V transposed), Q and P are fp16, sums fp32.
-__global__ void __launch_bounds__(256) k_pf_attn_w(const float* __restrict__ QKV, const float* __restrict__ K,
-                                                   const float* __restrict__ V, const float* __restrict__ sinks,
-                                                   float* __restrict__ ATT, int p0, int T, int swa) {
+__global__ void __launch_bounds__(256) k_pf_attn_w(const float* __restrict__ QKV, const kc_t* __restrict__ K,
+                                                   const vc_t* __restrict__ V, const float* __restrict__ sinks,
+                                                   float* __restrict__ ATT, int p0, int T, int swa, int kv_mask) {
     constexpr int KT = 64;
     __shared__ __align__(16) _Float16 ks[KT][kHd + 8];
     __shared__ __align__(16) _Float16 vt[kHd][KT + 8];
@@ -885,14 +863,12 @@ __global__ void __launch_bounds__(256) k_pf_attn_w(const float* __restrict__ QKV
         {
             const int key = tid >> 2, c0 = (tid & 3) * 32, p = k0 + key;
             const bool ok = p <= last;
-            const float* kr = K + size_t(p) * kKvDim + kh * kHd + c0;
-            const float* vr = V + size_t(p) * kKvDim + kh * kHd + c0;
+            const kc_t* kr = K + size_t(p & kv_mask) * kKvDim + kh * kHd + c0;
+            const vc_t* vr = V + size_t(p & kv_mask) * kKvDim + kh * kHd + c0;
 #pragma unroll
-            for (int c = 0; c < 32; c += 4) {
-                const float4 a = ok ? *(const float4*) (kr + c) : make_float4(0, 0, 0, 0);
-                const float4 b = ok ? *(const float4*) (vr + c) : make_float4(0, 0, 0, 0);
-                ks[key][c0 + c] = (_Float16) a.x; ks[key][c0 + c + 1] = (_Float16) a.y; ks[key][c0 + c + 2] = (_Float16) a.z; ks[key][c0 + c + 3] = (_Float16) a.w;
-                vt[c0 + c][key] = (_Float16) b.x; vt[c0 + c + 1][key] = (_Float16) b.y; vt[c0 + c + 2][key] = (_Float16) b.z; vt[c0 + c + 3][key] = (_Float16) b.w;
+            for (int c = 0; c < 32; ++c) {
+                ks[key][c0 + c] = (_Float16) (ok ? c2f(kr[c]) : 0.f);
+                vt[c0 + c][key] = (_Float16) (ok ? c2f(vr[c]) : 0.f);
             }
         }
         pf_sync();
@@ -956,7 +932,9 @@ struct Layer {
     const uint8_t *gate_e = nullptr, *up_e = nullptr, *down_e = nullptr;        // experts
     const uint8_t *gate_s = nullptr, *up_s = nullptr, *down_s = nullptr;        // shared expert
     bool swa = false;
-    float *K = nullptr, *V = nullptr;
+    kc_t* K = nullptr;   // [slot][K/V head][128]
+    vc_t* V = nullptr;
+    int kv_mask = 0x7fffffff;              // slot = position & kv_mask (a ring on the sliding layers)
 };
 
 struct Model {
@@ -965,7 +943,7 @@ struct Model {
     const float *embed, *out_norm;
     const uint8_t* head;
     int vocab = 0, max_ctx;
-    size_t loaded = 0;
+    size_t loaded = 0, kv_bytes = 0;
     cudaStream_t st, side;
     std::vector<cudaEvent_t> ev;
     unsigned* sink;
@@ -1043,10 +1021,24 @@ struct Model {
                 l.up_s = (const uint8_t*) up_tensor(b + "ffn_up_shexp.weight", kQ4_1);
                 l.down_s = (const uint8_t*) up_tensor(b + "ffn_down_shexp.weight", kQ4_1);
             }
-            CK(cudaMalloc(&l.K, size_t(max_ctx) * kKvDim * 4));
-            CK(cudaMalloc(&l.V, size_t(max_ctx) * kKvDim * 4));
+            // the sliding layers look back 513 positions: a ring of kSwaRing slots (a prompt chunk plus the window fits)
+            static const int ring = std::getenv("FLINT_SWA_RING") ? std::atoi(std::getenv("FLINT_SWA_RING")) : kSwaRing;   // (a power of two)
+            const size_t rows = l.swa && max_ctx > ring ? ring : max_ctx;
+            if (l.swa && rows == size_t(ring)) l.kv_mask = ring - 1;
+            CK(cudaMalloc(&l.K, rows * kKvDim * sizeof(kc_t)));
+            CK(cudaMalloc(&l.V, rows * kKvDim * sizeof(vc_t)));
+            kv_bytes += rows * kKvDim * (sizeof(kc_t) + sizeof(vc_t));
         }
-        embed = (const float*) up_tensor("token_embd.weight", kF32);
+        {   // the token table (1.2 GB fp32) stays in pinned host memory: the card reads one 8 KB row a token over the bus
+            const strata::TensorInfo* t = g->find("token_embd.weight");
+            const size_t bytes = strata::tensor_payload_bytes(*t);
+            void* hp = nullptr;
+            CK(cudaHostAlloc(&hp, bytes, cudaHostAllocMapped));
+            std::memcpy(hp, g->tensor_data(*t), bytes);
+            void* dp = nullptr;
+            CK(cudaHostGetDevicePointer(&dp, hp, 0));
+            embed = (const float*) dp;
+        }
         out_norm = (const float*) up_tensor("output_norm.weight", kF32);
         head = (const uint8_t*) up_tensor("output.weight", kQ4_1);
         auto f = [&](float*& p, size_t n) { CK(cudaMalloc(&p, n * 4)); };
@@ -1175,10 +1167,8 @@ struct Model {
             pf_gemm(l.wq, kQDim, kHidden, T, pQKV, NQKV, 0);
             pf_gemm(l.wk, kKvDim, kHidden, T, pQKV + kQDim, NQKV, 0);
             pf_gemm(l.wv, kKvDim, kHidden, T, pQKV + kQDim + kKvDim, NQKV, 0);
-            k_pf_qkpost<<<dim3(kHeads + kKv, T), kHd, 0, st>>>(pQKV, l.q_norm, l.k_norm, l.K, l.V, p0, l.swa);
-            static const bool attn_old = std::getenv("FLINT_PF_ATTN_OLD") != nullptr;
-            if (attn_old) k_pf_attn<<<dim3(kHeads, (T + 63) / 64), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa);
-            else k_pf_attn_w<<<dim3(kKv, (T + 15) / 16), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa);
+            k_pf_qkpost<<<dim3(kHeads + kKv, T), kHd, 0, st>>>(pQKV, l.q_norm, l.k_norm, l.K, l.V, p0, l.swa, l.kv_mask);
+            k_pf_attn_w<<<dim3(kKv, (T + 15) / 16), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa, l.kv_mask);
             pf_split(pATT, nullptr, nullptr, kQDim, T);
             pf_gemm(l.wo, kHidden, kQDim, T, pH, kHidden, 1);
             pf_split(pH, nullptr, l.ffn_norm, kHidden, T);
@@ -1298,8 +1288,8 @@ struct Model {
                 prefetch(i + 1);
             }
             mv_in({{l.wq, q}, {l.wk, k}, {l.wv, v}}, {kQDim, kKvDim, kKvDim}, h, kHidden, l.attn_norm);
-            k_qkv_post<<<kHeads + kKv, kHd, 0, st>>>(q, k, v, l.q_norm, l.k_norm, l.K, l.V, state, l.swa);
-            k_attn_part<<<dim3(kHeads, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa);
+            k_qkv_post<<<kHeads + kKv, kHd, 0, st>>>(q, k, v, l.q_norm, l.k_norm, l.K, l.V, state, l.swa, l.kv_mask);
+            k_attn_part<<<dim3(kHeads, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask);
             k_attn_merge<<<kHeads, kHd, 0, st>>>(part, l.sinks, att);
             mv_in({{l.wo, h}}, {kHidden}, att, kQDim, nullptr, nullptr, true);
             if (i < kDense) {
@@ -1355,13 +1345,14 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     Model m(path, ctx);
     if (std::getenv("FLINT_GEMM_TEST")) { m.gemm_test(); return 0; }
+    std::fprintf(stderr, "strata-flint: K/V for %d positions: %.2f GB\n", ctx, m.kv_bytes / 1e9);
     std::fprintf(stderr, "strata-flint: %.1f GB on the card in %.1f s\n", m.loaded / 1e9,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     FILE* top = top_path.empty() ? nullptr : std::fopen(top_path.c_str(), "w");
     std::vector<float> lg(m.vocab);
     const auto t1 = std::chrono::steady_clock::now();
     FILE* lf = logits_path.empty() ? nullptr : std::fopen(logits_path.c_str(), "wb");
-    static const int chunk = std::getenv("FLINT_CHUNK") ? std::atoi(std::getenv("FLINT_CHUNK")) : 2048;
+    static const int chunk = std::min(8192, std::getenv("FLINT_CHUNK") ? std::atoi(std::getenv("FLINT_CHUNK")) : 8192);
     const bool tokwise = std::getenv("FLINT_TOKWISE") != nullptr;
     if (lf && !tokwise) {   // the prompt path with every row's logits (small prompts: T x vocab floats on the card)
         float* lga = nullptr;
