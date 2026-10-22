@@ -1690,6 +1690,382 @@ __global__ void k_pred_overlap(const int* pred, const int* real, unsigned* cnt) 
     atomicAdd(cnt + 1, unsigned(kTopK));
 }
 
+
+// ---------------------------------------------------------------------------------------------------- one launch a token
+// The whole writing step in one kernel of kMegaTot blocks (what fits the card at once: 4 a WGP at <= 192 registers).
+// Blocks 0 .. G - 1 work: they walk the 49 layers phase by phase with a grid barrier between phases (about 0.6 us,
+// against about 2 us a kernel launch). The rest prefetch: as the workers start layer i, they pick layer i's likely
+// experts from its input (the router on the layer's input agrees with the real pick 84-87% of the time) and read them,
+// then layer i + 1's fixed weights, into the memory-side cache. Each row is still one warp's dot product as in the
+// separate kernels, so results match them (up to the router's summation order).
+constexpr int kMegaTot = 128;
+struct MegaLayer {
+    const float *attn_norm, *ffn_norm, *q_norm, *k_norm, *sinks;
+    const uint16_t* router;
+    const uint8_t *wqkv, *wo, *gate, *up, *down, *gate_e, *up_e, *down_e, *gate_s, *up_s, *down_s;
+    kc_t* K;
+    vc_t* V;
+    int swa, kv_mask;
+};
+struct MegaArgs {
+    const MegaLayer* L;
+    const float *embed, *out_norm;
+    const uint8_t* head;
+    int vocab, G;
+    int* state;
+    float *h, *qkv, *att, *part, *rl, *act, *logits, *plog;
+    float2* best;
+    unsigned* ctr;   // [0] workers' barrier, [1] progress (layer + 1), [2] argmax done, [3] prefetchers' barrier
+};
+__device__ inline void mega_bar(unsigned* cnt, unsigned& gen, unsigned n) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        const unsigned target = (gen + 1) * n;
+        atomicAdd(cnt, 1u);
+        while (__hip_atomic_load(cnt, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < target) __builtin_amdgcn_s_sleep(1);
+        __threadfence();
+    }
+    ++gen;
+    __syncthreads();
+}
+// R rows given by their own pointers (GGUF Q4_1 rows of nb blocks) against xs (LDS or memory); warp sums in out
+template <int R>
+__device__ inline void q4_rows_ptr(const uint8_t* const* W, int nb, const float* xs, int lane, float* out) {
+    const int qd = lane & 3;
+    float acc[R] = {};
+    for (int b = lane >> 2; b < nb; b += 8) {
+        const float4 xa = *(const float4*) (xs + b * 32 + qd * 4);
+        const float4 xb = *(const float4*) (xs + b * 32 + 16 + qd * 4);
+        const float sx = xa.x + xa.y + xa.z + xa.w + xb.x + xb.y + xb.z + xb.w;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint8_t* B = W[r] + size_t(b) * 20;
+            const uint32_t dm = *(const uint32_t*) B, q = *(const uint32_t*) (B + 4 + qd * 4);
+            const float d = __half2float(__ushort_as_half(uint16_t(dm))), m = __half2float(__ushort_as_half(uint16_t(dm >> 16)));
+            const float t = float(q & 15) * xa.x + float((q >> 8) & 15) * xa.y + float((q >> 16) & 15) * xa.z + float((q >> 24) & 15) * xa.w
+                          + float((q >> 4) & 15) * xb.x + float((q >> 12) & 15) * xb.y + float((q >> 20) & 15) * xb.z + float(q >> 28) * xb.w;
+            acc[r] += d * t + m * sx;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) out[r] = warp_sum(acc[r]);
+}
+__device__ inline void mega_touch(const void* p, size_t bytes, int b, int nb, uint32_t& a) {
+    const uint4* q = (const uint4*) p;
+    for (size_t i = size_t(b) * 256 + threadIdx.x; i < bytes / 16; i += size_t(nb) * 256) { const uint4 v = q[i]; a ^= v.x ^ v.w; }
+}
+// top 6 of 256 logits (lg in LDS) by sigmoid score, one warp; lane k < 6 gets the k-th index and normalized weight
+__device__ inline void mega_top6(const float* lg, int lane, int& oi, float& ow) {
+    float sc[8];
+    for (int j = 0; j < 8; ++j) sc[j] = 1.f / (1.f + expf(-lg[lane * 8 + j]));
+    float pv = 0, tot = 0;
+    int pi = 0;
+    for (int k = 0; k < kTopK; ++k) {
+        float v = -2.f;
+        int i = 0;
+        for (int j = 0; j < 8; ++j) if (sc[j] > v) { v = sc[j]; i = lane * 8 + j; }
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor(v, o, 32);
+            const int oi_ = __shfl_xor(i, o, 32);
+            if (ov > v || (ov == v && oi_ < i)) { v = ov; i = oi_; }
+        }
+        if (lane == i / 8) sc[i % 8] = -1.f;
+        if (lane == k) { pv = v; pi = i; }
+        tot += v;
+    }
+    oi = pi; ow = pv / tot;
+}
+__device__ inline void mega_router_row(const uint16_t* W, int r, const float* xs, int lane, float* out) {
+    float acc = 0;
+    for (int k = lane * 8; k < kHidden; k += 256) {
+        const uint4 w = *(const uint4*) (W + size_t(r) * kHidden + k);
+        const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc += __uint_as_float(ww[j] << 16) * xs[k + 2 * j] + __uint_as_float(ww[j] & 0xffff0000u) * xs[k + 2 * j + 1];
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) out[r] = acc;
+}
+__global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8))) k_token(MegaArgs A) {
+    extern __shared__ float xs[];
+    __shared__ __align__(16) float qf[kHd], kf[kHd], vf[kHd];
+    __shared__ int sidx[kTopK];
+    __shared__ float swts[kTopK];
+    __shared__ float lg256[kExperts];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int G = A.G, NW = G * 8;
+    constexpr size_t r2k = size_t(kHidden / 32) * 20;
+    const int pos = A.state[0];
+    unsigned gen = 0;
+    if (int(blockIdx.x) >= G) {
+        // ------------------------------------------------ prefetchers
+        const int P = kMegaTot - G, b = blockIdx.x - G;
+        uint32_t a = 0;
+        __shared__ int at;
+        for (int i = 0; i < kLayers; ++i) {
+            if (tid == 0) {
+                unsigned p;
+                while ((p = __hip_atomic_load(A.ctr + 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT)) < unsigned(i + 1)) __builtin_amdgcn_s_sleep(2);
+                at = int(p) - 1;   // the layer the workers are on
+            }
+            __syncthreads();
+            if (at > i) continue;   // fallen behind: never hold the workers' step up, skip to where they are
+            const MegaLayer& l = A.L[i];
+            if (i >= kDense && false) {
+                // the router on rmsnorm(h) * ffn_norm as the workers start the layer (a guess: h is still changing)
+                stage_in(xs, A.h, l.ffn_norm, nullptr, kHidden);
+                for (int r = b * 8 + warp; r < kExperts; r += P * 8) mega_router_row(l.router, r, xs, lane, A.plog);
+                mega_bar(A.ctr + 3, gen, P);
+                if (warp == 0) {
+                    for (int j = 0; j < 8; ++j) lg256[lane * 8 + j] = ((volatile float*) A.plog)[lane * 8 + j];
+                    int oi; float ow;
+                    mega_top6(lg256, lane, oi, ow);
+                    if (lane < kTopK) sidx[lane] = oi;
+                }
+                __syncthreads();
+                constexpr size_t mb = size_t(kFfExp) * r2k;
+                for (int k = 0; k < kTopK; ++k) {
+                    const size_t e = size_t(sidx[k]);
+                    mega_touch(l.gate_e + e * mb, mb, b, P, a);
+                    mega_touch(l.up_e + e * mb, mb, b, P, a);
+                    mega_touch(l.down_e + e * mb, mb, b, P, a);
+                }
+                mega_bar(A.ctr + 3, gen, P);   // (plog is rewritten next layer only after every prefetcher read it)
+            }
+            if (i + 1 < kLayers) {
+                const MegaLayer& n = A.L[i + 1];
+                mega_touch(n.wqkv, size_t(kQDim + 2 * kKvDim) * r2k, b, P, a);
+                mega_touch(n.wo, size_t(kHidden) * (kQDim / 32) * 20, b, P, a);
+                if (i + 1 < kDense) {
+                    mega_touch(n.gate, kFfDense * r2k, b, P, a); mega_touch(n.up, kFfDense * r2k, b, P, a);
+                    mega_touch(n.down, size_t(kHidden) * (kFfDense / 32) * 20, b, P, a);
+                } else {
+                    mega_touch(n.router, size_t(kExperts) * kHidden * 2, b, P, a);
+                    mega_touch(n.gate_s, kFfShared * r2k, b, P, a); mega_touch(n.up_s, kFfShared * r2k, b, P, a);
+                    mega_touch(n.down_s, size_t(kHidden) * (kFfShared / 32) * 20, b, P, a);
+                }
+            }
+        }
+        if (a == 0x9e3779b9u) A.state[2] = int(a);
+        return;
+    }
+    // ------------------------------------------------ workers
+    const int gw = blockIdx.x * 8 + warp;
+    const int tok = A.state[1];
+    float* h = A.h;
+    for (int i = blockIdx.x * 256 + tid; i < kHidden; i += G * 256) h[i] = A.embed[size_t(tok) * kHidden + i];
+    mega_bar(A.ctr, gen, G);
+    for (int il = 0; il < kLayers; ++il) {
+        const MegaLayer& l = A.L[il];
+        if (blockIdx.x == 0 && tid == 0) __hip_atomic_store(A.ctr + 1, unsigned(il + 1), __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        // A: q/k/v rows (5120), 6 a warp unit, on rmsnorm(h) * attn_norm
+        stage_in(xs, h, l.attn_norm, nullptr, kHidden);
+        for (int u = gw; u * 6 < kQDim + 2 * kKvDim; u += NW) {
+            const uint8_t* W[6];
+            for (int r = 0; r < 6; ++r) W[r] = l.wqkv + size_t(min(u * 6 + r, kQDim + 2 * kKvDim - 1)) * r2k;
+            float o[6];
+            q4_rows_ptr<6>(W, kHidden / 32, xs, lane, o);
+            if (lane == 0) for (int r = 0; r < 6 && u * 6 + r < kQDim + 2 * kKvDim; ++r) A.qkv[u * 6 + r] = o[r];
+        }
+        mega_bar(A.ctr, gen, G);
+        // B: attention partials, items (head, chunk); q / this position's k and v normed here; the chunk-0 item of a
+        // K/V head's first query head writes the cache
+        {
+            const int lo = l.swa ? max(0, pos - (kWindow - 1)) : 0, n = pos - lo + 1;
+            const int per = max(kMinChunk, (n + kAttnChunks - 1) / kAttnChunks);
+            const int nch = (n + per - 1) / per;
+            float4 (*so)[32] = (float4 (*)[32]) xs;
+            float* sm = xs + 8 * 32 * 4;
+            float* sl = sm + 8;
+            for (int it = blockIdx.x; it < kHeads * kAttnChunks; it += G) {
+                const int hh = it / kAttnChunks, c = it % kAttnChunks, kh = hh / (kHeads / kKv);
+                float* P = A.part + (size_t(hh) * kAttnChunks + c) * kPart;
+                if (c >= nch) { if (tid == 0) { P[0] = -INFINITY; P[1] = 0; } continue; }
+                if (tid < kHd) { qf[tid] = A.qkv[hh * kHd + tid]; kf[tid] = A.qkv[kQDim + kh * kHd + tid]; vf[tid] = A.qkv[kQDim + kKvDim + kh * kHd + tid]; }
+                __syncthreads();
+                if (warp == 0) head_norm_warp(qf, l.q_norm, pos, l.swa, lane);
+                else if (warp == 1) head_norm_warp(kf, l.k_norm, pos, l.swa, lane);
+                __syncthreads();
+                if (c == 0 && hh % (kHeads / kKv) == 0 && tid < kHd) {
+                    const size_t r = size_t(pos & l.kv_mask) * kKvDim + kh * kHd + tid;
+                    l.K[r] = f2c<kc_t>(kf[tid]);
+                    l.V[r] = f2c<vc_t>(vf[tid]);
+                }
+                const int a0 = lo + c * per, b0 = min(pos + 1, a0 + per);
+                const float4 qv = *(const float4*) (qf + lane * 4);
+                const float scale = rsqrtf(float(kHd));
+                float m = -INFINITY, sum = 0;
+                float4 o = make_float4(0, 0, 0, 0);
+                for (int p = a0 + warp; p < b0; p += 8) {
+                    const bool here = p == pos;
+                    const float4 kk = here ? make_float4(c2f(f2c<kc_t>(kf[lane * 4])), c2f(f2c<kc_t>(kf[lane * 4 + 1])), c2f(f2c<kc_t>(kf[lane * 4 + 2])), c2f(f2c<kc_t>(kf[lane * 4 + 3])))
+                                           : h4(l.K + size_t(p & l.kv_mask) * kKvDim + kh * kHd + lane * 4);
+                    const float d = warp_sum(qv.x * kk.x + qv.y * kk.y + qv.z * kk.z + qv.w * kk.w) * scale;
+                    const float mn = fmaxf(m, d), cf = expf(m - mn), e = expf(d - mn);
+                    const float4 vv = here ? make_float4(c2f(f2c<vc_t>(vf[lane * 4])), c2f(f2c<vc_t>(vf[lane * 4 + 1])), c2f(f2c<vc_t>(vf[lane * 4 + 2])), c2f(f2c<vc_t>(vf[lane * 4 + 3])))
+                                           : h4(l.V + size_t(p & l.kv_mask) * kKvDim + kh * kHd + lane * 4);
+                    o.x = o.x * cf + e * vv.x; o.y = o.y * cf + e * vv.y; o.z = o.z * cf + e * vv.z; o.w = o.w * cf + e * vv.w;
+                    sum = sum * cf + e;
+                    m = mn;
+                }
+                if (lane == 0) { sm[warp] = m; sl[warp] = sum; }
+                so[warp][lane] = o;
+                __syncthreads();
+                if (warp == 0) {
+                    float M = -INFINITY;
+                    for (int i = 0; i < 8; ++i) M = fmaxf(M, sm[i]);
+                    float Ls = 0;
+                    float4 O = make_float4(0, 0, 0, 0);
+                    for (int i = 0; i < 8; ++i) {
+                        if (sm[i] == -INFINITY) continue;
+                        const float f = expf(sm[i] - M);
+                        Ls += sl[i] * f;
+                        O.x += so[i][lane].x * f; O.y += so[i][lane].y * f; O.z += so[i][lane].z * f; O.w += so[i][lane].w * f;
+                    }
+                    if (lane == 0) { P[0] = M; P[1] = Ls; }
+                    *(float4*) (P + 4 + lane * 4) = O;
+                }
+                __syncthreads();
+            }
+        }
+        mega_bar(A.ctr, gen, G);
+        // C: the chunks merged with the sink, a head a block
+        for (int hh = blockIdx.x; hh < kHeads; hh += G) {
+            if (tid >= kHd) continue;
+            const float* P = A.part + size_t(hh) * kAttnChunks * kPart;
+            float M = l.sinks[hh];
+            for (int c = 0; c < kAttnChunks; ++c) M = fmaxf(M, P[c * kPart]);
+            float Ls = expf(l.sinks[hh] - M), O = 0;
+            for (int c = 0; c < kAttnChunks; ++c) {
+                const float mc = P[c * kPart];
+                if (mc == -INFINITY) continue;
+                const float f = expf(mc - M);
+                Ls += P[c * kPart + 1] * f;
+                O += P[c * kPart + 4 + tid] * f;
+            }
+            A.att[hh * kHd + tid] = O / Ls;
+        }
+        mega_bar(A.ctr, gen, G);
+        // D: o rows (2048), 3 a warp unit, added into h
+        stage_in(xs, A.att, nullptr, nullptr, kQDim);
+        for (int u = gw; u * 3 < kHidden; u += NW) {
+            const uint8_t* W[3];
+            for (int r = 0; r < 3; ++r) W[r] = l.wo + size_t(min(u * 3 + r, kHidden - 1)) * (kQDim / 32) * 20;
+            float o[3];
+            q4_rows_ptr<3>(W, kQDim / 32, xs, lane, o);
+            if (lane == 0) for (int r = 0; r < 3 && u * 3 + r < kHidden; ++r) h[u * 3 + r] += o[r];
+        }
+        mega_bar(A.ctr, gen, G);
+        stage_in(xs, h, l.ffn_norm, nullptr, kHidden);
+        if (il < kDense) {
+            // dense gate/up (6144 each), 7 a warp unit: act = silu(gate) * up
+            for (int u = gw; u * 7 < kFfDense; u += NW) {
+                const uint8_t* W[14];
+                for (int r = 0; r < 7; ++r) { const int row = min(u * 7 + r, kFfDense - 1); W[r] = l.gate + size_t(row) * r2k; W[7 + r] = l.up + size_t(row) * r2k; }
+                float o[14];
+                q4_rows_ptr<14>(W, kHidden / 32, xs, lane, o);
+                if (lane == 0) for (int r = 0; r < 7 && u * 7 + r < kFfDense; ++r) A.act[u * 7 + r] = silu(o[r]) * o[7 + r];
+            }
+            mega_bar(A.ctr, gen, G);
+            for (int u = gw; u * 3 < kHidden; u += NW) {   // (6144 inputs read from memory: LDS stays small)
+                const uint8_t* W[3];
+                for (int r = 0; r < 3; ++r) W[r] = l.down + size_t(min(u * 3 + r, kHidden - 1)) * (kFfDense / 32) * 20;
+                float o[3];
+                q4_rows_ptr<3>(W, kFfDense / 32, A.act, lane, o);
+                if (lane == 0) for (int r = 0; r < 3 && u * 3 + r < kHidden; ++r) h[u * 3 + r] += o[r];
+            }
+            mega_bar(A.ctr, gen, G);
+            continue;
+        }
+        // E: router rows (256: one a warp) on the staged rmsnorm(h)
+        for (int r = gw; r < kExperts; r += NW) mega_router_row(l.router, r, xs, lane, A.rl);
+        mega_bar(A.ctr, gen, G);
+        // F: each block picks the top 6 (warp 0), then gate/up rows of the 6 experts and the shared one (4096 act rows,
+        // 5 a warp unit; a row's expert from its index), on the still-staged x
+        if (warp == 0) {
+            for (int j = 0; j < 8; ++j) lg256[lane * 8 + j] = A.rl[lane * 8 + j];
+            int oi; float ow;
+            mega_top6(lg256, lane, oi, ow);
+            if (lane < kTopK) { sidx[lane] = oi; swts[lane] = ow; }
+        }
+        __syncthreads();
+        for (int u = gw; u * 5 < kActRows; u += NW) {
+            const uint8_t* W[10];
+            for (int r = 0; r < 5; ++r) {
+                const int row = min(u * 5 + r, kActRows - 1);
+                if (row < kTopK * kFfExp) {
+                    const size_t e = size_t(sidx[row / kFfExp]) * kFfExp + row % kFfExp;
+                    W[r] = l.gate_e + e * r2k; W[5 + r] = l.up_e + e * r2k;
+                } else { W[r] = l.gate_s + size_t(row - kTopK * kFfExp) * r2k; W[5 + r] = l.up_s + size_t(row - kTopK * kFfExp) * r2k; }
+            }
+            float o[10];
+            q4_rows_ptr<10>(W, kHidden / 32, xs, lane, o);
+            if (lane == 0) for (int r = 0; r < 5 && u * 5 + r < kActRows; ++r) A.act[u * 5 + r] = silu(o[r]) * o[5 + r];
+        }
+        mega_bar(A.ctr, gen, G);
+        // G: down rows (2048), 3 a warp unit: the 6 experts weighted plus the shared one, added into h
+        stage_in(xs, A.act, nullptr, nullptr, kActRows);
+        {
+            constexpr size_t rowe = size_t(kFfExp / 32) * 20, rows_ = size_t(kFfShared / 32) * 20;
+            for (int u = gw; u * 3 < kHidden; u += NW) {
+                float tot[3] = {};
+                for (int k = 0; k < kTopK; ++k) {
+                    const uint8_t* W[3];
+                    for (int r = 0; r < 3; ++r) W[r] = l.down_e + (size_t(sidx[k]) * kHidden + min(u * 3 + r, kHidden - 1)) * rowe;
+                    float o[3];
+                    q4_rows_ptr<3>(W, kFfExp / 32, xs + k * kFfExp, lane, o);
+                    for (int r = 0; r < 3; ++r) tot[r] += swts[k] * o[r];
+                }
+                const uint8_t* W[3];
+                for (int r = 0; r < 3; ++r) W[r] = l.down_s + size_t(min(u * 3 + r, kHidden - 1)) * rows_;
+                float o[3];
+                q4_rows_ptr<3>(W, kFfShared / 32, xs + kTopK * kFfExp, lane, o);
+                if (lane == 0) for (int r = 0; r < 3 && u * 3 + r < kHidden; ++r) h[u * 3 + r] += tot[r] + o[r];
+            }
+        }
+        mega_bar(A.ctr, gen, G);
+    }
+    // the head, 4 rows a warp step, and this block's best; the last block picks the token
+    stage_in(xs, h, A.out_norm, nullptr, kHidden);
+    float bv = -INFINITY;
+    int bi = 0;
+    for (int r0 = gw * 4; r0 < A.vocab; r0 += NW * 4) {
+        const uint8_t* W[4];
+        for (int r = 0; r < 4; ++r) W[r] = A.head + size_t(r0 + r) * r2k;
+        float o[4];
+        q4_rows_ptr<4>(W, kHidden / 32, xs, lane, o);
+        if (lane == 0)
+            for (int r = 0; r < 4; ++r) {
+                A.logits[r0 + r] = o[r];
+                if (o[r] > bv) { bv = o[r]; bi = r0 + r; }
+            }
+    }
+    __shared__ float wbv[8];
+    __shared__ int wbi[8];
+    __shared__ bool last;
+    if (lane == 0) { wbv[warp] = bv; wbi[warp] = bi; }
+    __syncthreads();
+    if (tid == 0) {
+        for (int w = 1; w < 8; ++w) if (wbv[w] > bv || (wbv[w] == bv && wbi[w] < bi)) { bv = wbv[w]; bi = wbi[w]; }
+        A.best[blockIdx.x] = make_float2(bv, __int_as_float(bi));
+        __threadfence();
+        last = atomicAdd(A.ctr + 2, 1u) == unsigned(G) - 1;
+    }
+    __syncthreads();
+    if (!last || tid != 0) return;
+    __threadfence();
+    float v = -INFINITY;
+    int i = 0;
+    for (int b = 0; b < G; ++b) {
+        const float cv = ((volatile float*) A.best)[2 * b];
+        const int ci = __float_as_int(((volatile float*) A.best)[2 * b + 1]);
+        if (cv > v || (cv == v && ci < i)) { v = cv; i = ci; }
+    }
+    A.state[1] = i;
+    A.state[0] = pos + 1;
+}
+
 // ---------------------------------------------------------------------------------------------------- the model
 struct Layer {
     const float *attn_norm, *ffn_norm, *q_norm, *k_norm, *sinks;
@@ -1715,6 +2091,11 @@ struct Model {
     std::vector<cudaEvent_t> ev;
     unsigned* sink;
     // scratch
+    MegaLayer* mega_layers = nullptr;
+    unsigned* mega_ctr = nullptr;
+    float *mega_plog = nullptr, *mega_qkv = nullptr;
+    float2* mega_best = nullptr;
+    int mega_g = 0;   // worker blocks (0: the separate kernels)
     int* pidx = nullptr;
     float *pw = nullptr, *prl = nullptr;
     unsigned* pcnt = nullptr;
@@ -1775,9 +2156,22 @@ struct Model {
             l.q_norm = (const float*) up_tensor(b + "attn_q_norm.weight", kF32);
             l.k_norm = (const float*) up_tensor(b + "attn_k_norm.weight", kF32);
             l.sinks = (const float*) up_tensor(b + "attn_sinks.weight", kF32);
-            l.wq = (const uint8_t*) up_tensor(b + "attn_q.weight", kQ4_1);
-            l.wk = (const uint8_t*) up_tensor(b + "attn_k.weight", kQ4_1);
-            l.wv = (const uint8_t*) up_tensor(b + "attn_v.weight", kQ4_1);
+            {   // q, k and v rows in one buffer (the one-launch step reads them as 5120 rows)
+                const size_t r2k = size_t(kHidden / 32) * 20;
+                uint8_t* qkvw = nullptr;
+                CK(cudaMalloc(&qkvw, size_t(kQDim + 2 * kKvDim) * r2k));
+                const char* nm[3] = {"attn_q.weight", "attn_k.weight", "attn_v.weight"};
+                size_t off = 0;
+                for (int j = 0; j < 3; ++j) {
+                    const strata::TensorInfo* t = g->find(b + nm[j]);
+                    if (!t || int(t->type) != kQ4_1) { std::fprintf(stderr, "strata-flint: %s%s missing or not Q4_1\n", b.c_str(), nm[j]); std::exit(1); }
+                    const size_t bytes = strata::tensor_payload_bytes(*t);
+                    CK(cudaMemcpy(qkvw + off, g->tensor_data(*t), bytes, cudaMemcpyHostToDevice));
+                    (j == 0 ? l.wq : j == 1 ? l.wk : l.wv) = qkvw + off;
+                    off += bytes;
+                    loaded += bytes;
+                }
+            }
             l.wo = (const uint8_t*) up_tensor(b + "attn_output.weight", kQ4_1);
             if (i < kDense) {
                 l.gate = (const uint8_t*) up_tensor(b + "ffn_gate.weight", kQ4_1);
@@ -1817,7 +2211,7 @@ struct Model {
         f(logits, vocab); f(rl, kExperts); f(wts, kTopK);
         CK(cudaMalloc(&idx, kTopK * 4));
         CK(cudaMalloc(&part, size_t(kHeads) * kAttnChunks * kPart * 4));
-        CK(cudaMalloc(&act, kActRows * 4));
+        CK(cudaMalloc(&act, kFfDense * 4));   // (the one-launch step's dense layers use 6144)
         CK(cudaMalloc(&done, 4));
         CK(cudaMemset(done, 0, 4));
         CK(cudaMalloc(&state, 8));
@@ -1826,6 +2220,31 @@ struct Model {
         CK(cudaMalloc(&pidx, kTopK * 4)); CK(cudaMalloc(&pw, kTopK * 4)); CK(cudaMalloc(&prl, kExperts * 4));
         CK(cudaMalloc(&pdone, 4)); CK(cudaMemset(pdone, 0, 4));
         if (std::getenv("FLINT_PRED")) { CK(cudaMalloc(&pcnt, 8)); CK(cudaMemset(pcnt, 0, 8)); }
+        {   // the one-launch step (FLINT_MEGA=G worker blocks of kMegaTot; 0: off) when kMegaTot blocks fit at once
+            const int want = std::getenv("FLINT_MEGA") ? std::atoi(std::getenv("FLINT_MEGA")) : 0;
+            int dev = 0, per = 0;
+            cudaDeviceProp pr;
+            CK(cudaGetDevice(&dev));
+            CK(cudaGetDeviceProperties(&pr, dev));
+            CK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&per, k_token, 256, kActRows * 4));
+            hipFuncAttributes fa;
+            CK(hipFuncGetAttributes(&fa, (const void*) k_token));
+            if (want > 0 && want < kMegaTot && per * pr.multiProcessorCount >= kMegaTot) mega_g = want;
+            if (want > 0) std::fprintf(stderr, "strata-flint: one-launch step %s (%d workers, %d prefetchers; %d blocks fit a unit x %d, %d registers)\n",
+                                       mega_g ? "on" : "off", mega_g, kMegaTot - mega_g, per, pr.multiProcessorCount, fa.numRegs);
+            std::vector<MegaLayer> ml(kLayers);
+            for (int i = 0; i < kLayers; ++i) {
+                const Layer& l = L[i];
+                ml[i] = MegaLayer{l.attn_norm, l.ffn_norm, l.q_norm, l.k_norm, l.sinks, l.router, l.wq, l.wo, l.gate, l.up,
+                                  l.down, l.gate_e, l.up_e, l.down_e, l.gate_s, l.up_s, l.down_s, l.K, l.V, l.swa ? 1 : 0, l.kv_mask};
+            }
+            CK(cudaMalloc(&mega_layers, kLayers * sizeof(MegaLayer)));
+            CK(cudaMemcpy(mega_layers, ml.data(), kLayers * sizeof(MegaLayer), cudaMemcpyHostToDevice));
+            CK(cudaMalloc(&mega_ctr, 16));
+            CK(cudaMalloc(&mega_plog, kExperts * 4));
+            CK(cudaMalloc(&mega_qkv, (kQDim + 2 * kKvDim) * 4));
+            CK(cudaMalloc(&mega_best, kMegaTot * sizeof(float2)));
+        }
         CK(cudaMalloc(&done2, 4));
         CK(cudaMemset(done2, 0, 4));
         CK(cudaMalloc(&best, 64 * sizeof(float2)));
@@ -2234,6 +2653,12 @@ struct Model {
         k_touch<<<nb, 256, 0, side>>>(T, sink);
     }
     void record() {
+        if (mega_g) {
+            CK(cudaMemsetAsync(mega_ctr, 0, 16, st));
+            MegaArgs A{mega_layers, embed, out_norm, head, vocab, mega_g, state, h, mega_qkv, att, part, rl, act, logits, mega_plog, mega_best, mega_ctr};
+            k_token<<<kMegaTot, 256, kActRows * 4, st>>>(A);
+            return;
+        }
         static const int pf = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : 32;
         k_embed<<<kHidden / 256, 256, 0, st>>>(embed, state, h);
         for (int i = 0; i < n_layers(); ++i) {
