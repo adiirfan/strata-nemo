@@ -29,6 +29,10 @@
 #include <type_traits>
 #include <memory>
 #include <sstream>
+#include <atomic>
+#include <sys/mman.h>
+#include <thread>
+#include "flint_cpu.hpp"
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -247,7 +251,12 @@ __global__ void __launch_bounds__(256) k_moe_gu(const float* h, const float* nw,
     constexpr size_t rowb = size_t(nb) * 20;
     const uint8_t *G, *U;
     if (row < kTopK * kFfExp) {
-        const size_t e = size_t(idx[row / kFfExp]) * kFfExp + row % kFfExp;
+        const int sl = idx[row / kFfExp];
+        if (sl < 0) {   // (hybrid: an expert the card does not hold - the CPU computes it)
+            if (lane == 0) for (int r = 0; r < kMvRpw; ++r) act[row + r] = 0.f;
+            return;
+        }
+        const size_t e = size_t(sl) * kFfExp + row % kFfExp;
         G = ge + e * rowb; U = ue + e * rowb;
     } else {
         G = gs + size_t(row - kTopK * kFfExp) * rowb; U = us + size_t(row - kTopK * kFfExp) * rowb;
@@ -272,6 +281,7 @@ __global__ void __launch_bounds__(256) k_moe_down(float* h, const float* act, co
     float tot[kMvRpw] = {};
     constexpr size_t rowe = size_t(kFfExp / 32) * 20, rows_ = size_t(kFfShared / 32) * 20;
     for (int k = 0; k < kTopK; ++k) {
+        if (idx[k] < 0) continue;   // (hybrid: on the CPU)
         float a[kMvRpw] = {};
         q4_rows<kMvRpw>(de + (size_t(idx[k]) * kHidden + r0) * rowe, rowe, kFfExp / 32, xs + k * kFfExp, lane, a);
         const float wk = wts[k];
@@ -284,6 +294,55 @@ __global__ void __launch_bounds__(256) k_moe_down(float* h, const float* act, co
         const float v = warp_sum(tot[r]);
         if (lane == 0) h[r0 + r] += v;
     }
+}
+
+// hybrid: the card and the CPU meet in host memory the card reads and writes directly (as Strata's verify windows
+// do): the card posts a layer's MoE input and raises in_seq; the CPU computes the experts the card does not hold and
+// raises out_seq; a card kernel spins on it and adds the CPU's y. No host CUDA call inside the step, so it stays a graph.
+struct HyShared {
+    float h[kHidden];
+    float y[kHidden];
+    int idx[kTopK];
+    float w[kTopK];
+    alignas(128) uint32_t in_seq;    // card -> CPU: this layer's input is posted
+    alignas(128) uint32_t out_seq;   // CPU -> card: its share is in y (has: anything at all)
+    uint32_t has;
+};
+__device__ __forceinline__ void hy_pause() {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    __builtin_amdgcn_s_sleep(1);
+#else
+    __nanosleep(100);
+#endif
+}
+// the layer's input, its experts and their weights to the CPU; each chosen expert's card slot (or -1)
+__global__ void __launch_bounds__(256) k_hy_post(const float* h, const int* idx, const float* wts, const int* slot, int* ridx,
+                                                 HyShared* S, uint32_t* ctr) {
+    const int t = threadIdx.x;
+    for (int i = t; i < kHidden; i += 256) S->h[i] = h[i];
+    if (t < kTopK) { S->idx[t] = idx[t]; S->w[t] = wts[t]; ridx[t] = slot[idx[t]]; }
+    __threadfence_system();
+    __syncthreads();
+    if (t == 0) {
+        const uint32_t s = *ctr + 1;
+        *ctr = s;
+        *(volatile uint32_t*) &S->in_seq = s;
+        __threadfence_system();
+    }
+}
+// wait for the CPU's share of this layer, then h += y
+__global__ void __launch_bounds__(256) k_hy_wait_add(float* h, HyShared* S, const uint32_t* ctr) {
+    __shared__ uint32_t has;
+    if (threadIdx.x == 0) {
+        const uint32_t s = *ctr;
+        while (*(volatile uint32_t*) &S->out_seq < s) hy_pause();
+        __threadfence_system();
+        has = *(volatile uint32_t*) &S->has;
+    }
+    __syncthreads();
+    if (!has) return;
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    h[i] += ((volatile float*) S->y)[i];
 }
 
 // router: logits = W . (rmsnorm(h) * nw) (fp32, 256 rows), one warp a row, 4 rows a block; the last block to finish
@@ -2681,7 +2740,12 @@ struct Layer {
     const uint16_t* router = nullptr;   // bf16
     const uint8_t *wq, *wk, *wv, *wo;
     const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;              // dense (layers 0-1)
-    const uint8_t *gate_e = nullptr, *up_e = nullptr, *down_e = nullptr;        // experts
+    const uint8_t *gate_e = nullptr, *up_e = nullptr, *down_e = nullptr;        // experts (hybrid: the card's, packed)
+    // hybrid (FLINT_PLAN): every expert in host memory (the GGUF mapping), which the card holds (slot, -1: the CPU)
+    const uint8_t *gate_h = nullptr, *up_h = nullptr, *down_h = nullptr;
+    int* slot = nullptr;
+    std::vector<int> slot_h;
+    std::vector<float> ffn_norm_h;
     const uint8_t *gate_s = nullptr, *up_s = nullptr, *down_s = nullptr;        // shared expert
     bool swa = false;
     kc_t* K = nullptr;   // [slot][K/V head][128]
@@ -2716,6 +2780,20 @@ struct Model {
     float2* best;
     unsigned *done, *done2;
     int* idx;
+    // hybrid mode (FLINT_PLAN=FILE, lines "layer expert expert ..."): only the listed experts on the card, the rest
+    // computed by the CPU from the GGUF mapping while the card computes its own; no step graph, no drafts
+    bool hybrid = false;
+    std::vector<std::vector<int>> plan;
+    int* ridx = nullptr;          // the chosen experts' card slots
+    HyShared* hy_s = nullptr;     // host memory (mapped): the card's and the CPU's meeting place; hy_s_dev the card's view
+    HyShared* hy_s_dev = nullptr;
+    uint32_t* hy_ctr = nullptr;   // on the card: the layers posted so far (hy_seq: the CPU's count)
+    uint32_t hy_seq = 0;
+    uint8_t *stg_g = nullptr, *stg_u = nullptr, *stg_d = nullptr;                 // prompt path: a layer's experts
+    uint8_t* hy_arena = nullptr;  // every routed expert, host side (large pages; pinned unless FLINT_HY_PIN=0)
+    size_t hy_arena_bytes = 0;
+    size_t hy_cpu_experts = 0, hy_card_experts = 0;   // (counted over the writing steps)
+    double hy_t_wait = 0, hy_t_cpu = 0;               // (seconds: waiting for the card's hand-over, the CPU's share)
     int pos = 0;
     int* state;          // on the card: [0] the position, [1] the token going in next
     int* host_state;     // pinned copy
@@ -2763,6 +2841,21 @@ struct Model {
             CK(cudaMemcpyToSymbol(q8grp, &grp, 4));
         }
         g = std::make_unique<strata::GgufFile>(path);
+        if (const char* pf = std::getenv("FLINT_PLAN")) {
+            FILE* f = std::fopen(pf, "r");
+            if (!f) { std::fprintf(stderr, "strata-flint: cannot read the plan %s\n", pf); std::exit(1); }
+            plan.assign(kLayers, {});
+            char line[1 << 16];
+            while (std::fgets(line, sizeof line, f)) {
+                std::stringstream ss(line);
+                int li;
+                if (!(ss >> li) || li < 0 || li >= kLayers) continue;
+                for (int e; ss >> e;) if (e >= 0 && e < kExperts) plan[li].push_back(e);
+            }
+            std::fclose(f);
+            hybrid = true;
+            flint_cpu::init(std::getenv("FLINT_CPU_THREADS") ? std::atoi(std::getenv("FLINT_CPU_THREADS")) : 0);
+        }
         const auto* arch = g->get("general.architecture");
         if (!arch || arch->s != "flint") { std::fprintf(stderr, "strata-flint: %s is not a Flint GGUF\n", path.c_str()); std::exit(1); }
         const auto* pat = g->get("flint.attention.sliding_window_pattern");
@@ -2807,9 +2900,61 @@ struct Model {
                 l.router = (const uint16_t*) up_tensor(b + "ffn_gate_inp.weight", kF32);
                 l.router16 = (const __half*) (l.router + size_t(kExperts) * kHidden);
                 l.router_e = last_router_e;
-                l.gate_e = (const uint8_t*) up_tensor(b + "ffn_gate_exps.weight", kQ4_1);
-                l.up_e = (const uint8_t*) up_tensor(b + "ffn_up_exps.weight", kQ4_1);
-                l.down_e = (const uint8_t*) up_tensor(b + "ffn_down_exps.weight", kQ4_1);
+                if (!hybrid) {
+                    l.gate_e = (const uint8_t*) up_tensor(b + "ffn_gate_exps.weight", kQ4_1);
+                    l.up_e = (const uint8_t*) up_tensor(b + "ffn_up_exps.weight", kQ4_1);
+                    l.down_e = (const uint8_t*) up_tensor(b + "ffn_down_exps.weight", kQ4_1);
+                } else {   // the plan's experts packed on the card; all of them stay in the mapping for the CPU
+                    auto host = [&](const char* nm) {
+                        const strata::TensorInfo* t = g->find(b + nm);
+                        if (!t || int(t->type) != kQ4_1) { std::fprintf(stderr, "strata-flint: %s%s missing or not Q4_1\n", b.c_str(), nm); std::exit(1); }
+                        return (const uint8_t*) g->tensor_data(*t);
+                    };
+                    l.gate_h = host("ffn_gate_exps.weight"); l.up_h = host("ffn_up_exps.weight"); l.down_h = host("ffn_down_exps.weight");
+                    {   // into the arena (large pages, pinned below): the CPU reads it faster than the file mapping, and
+                        // the prompt path copies from it at full bus speed
+                        const size_t lb = size_t(kExperts) * kFfExp * (kHidden / 32) * 20;
+                        if (!hy_arena) {
+                            hy_arena_bytes = size_t(kLayers - kDense) * 3 * lb;
+                            void* a = mmap(nullptr, hy_arena_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                            if (a == MAP_FAILED) { std::fprintf(stderr, "strata-flint: no room for the %.1f GB expert arena\n", hy_arena_bytes / 1e9); std::exit(1); }
+                            madvise(a, hy_arena_bytes, MADV_HUGEPAGE);
+                            hy_arena = (uint8_t*) a;
+                        }
+                        uint8_t* dst = hy_arena + size_t(i - kDense) * 3 * lb;
+                        const uint8_t* src[3] = {l.gate_h, l.up_h, l.down_h};
+                        std::vector<std::thread> cp;
+                        for (int t = 0; t < 6; ++t)
+                            cp.emplace_back([&, t] {
+                                for (int m = 0; m < 3; ++m) {
+                                    const size_t a = lb * t / 6, z = lb * (t + 1) / 6;
+                                    std::memcpy(dst + m * lb + a, src[m] + a, z - a);
+                                }
+                            });
+                        for (auto& c : cp) c.join();
+                        l.gate_h = dst; l.up_h = dst + lb; l.down_h = dst + 2 * lb;
+                    }
+                    const std::vector<int>& R = plan[i];
+                    l.slot_h.assign(kExperts, -1);
+                    for (size_t j = 0; j < R.size(); ++j) l.slot_h[R[j]] = int(j);
+                    const size_t eb = size_t(kFfExp) * (kHidden / 32) * 20;   // (an expert's gate, up or down: same size)
+                    uint8_t *cg = nullptr, *cu = nullptr, *cd = nullptr;
+                    if (!R.empty()) {
+                        CK(cudaMalloc(&cg, R.size() * eb)); CK(cudaMalloc(&cu, R.size() * eb)); CK(cudaMalloc(&cd, R.size() * eb));
+                        for (size_t j = 0; j < R.size(); ++j) {
+                            CK(cudaMemcpy(cg + j * eb, l.gate_h + size_t(R[j]) * eb, eb, cudaMemcpyHostToDevice));
+                            CK(cudaMemcpy(cu + j * eb, l.up_h + size_t(R[j]) * eb, eb, cudaMemcpyHostToDevice));
+                            CK(cudaMemcpy(cd + j * eb, l.down_h + size_t(R[j]) * eb, eb, cudaMemcpyHostToDevice));
+                        }
+                        loaded += 3 * R.size() * eb;
+                    }
+                    l.gate_e = cg; l.up_e = cu; l.down_e = cd;
+                    CK(cudaMalloc(&l.slot, kExperts * 4));
+                    CK(cudaMemcpy(l.slot, l.slot_h.data(), kExperts * 4, cudaMemcpyHostToDevice));
+                    const strata::TensorInfo* tn = g->find(b + "ffn_norm.weight");
+                    const float* nf = (const float*) g->tensor_data(*tn);
+                    l.ffn_norm_h.assign(nf, nf + kHidden);
+                }
                 l.gate_s = (const uint8_t*) up_tensor(b + "ffn_gate_shexp.weight", kQ4_1);
                 l.up_s = (const uint8_t*) up_tensor(b + "ffn_up_shexp.weight", kQ4_1);
                 l.down_s = (const uint8_t*) up_tensor(b + "ffn_down_shexp.weight", kQ4_1);
@@ -2854,7 +2999,27 @@ struct Model {
         }
         out_norm = (const float*) up_tensor("output_norm.weight", kF32);
         head = (const uint8_t*) up_tensor("output.weight", kQ4_1);
-        g.reset();   // (everything is on the card or in the pinned token table: the file's mapping goes)
+        if (!hybrid) g.reset();   // (everything is on the card or in the pinned token table: the file's mapping goes)
+        else {
+            g.reset();   // (the experts are in the arena now)
+            static const bool pin = !(std::getenv("FLINT_HY_PIN") && std::atoi(std::getenv("FLINT_HY_PIN")) == 0);
+            if (pin && cudaHostRegister(hy_arena, hy_arena_bytes, 0) != cudaSuccess) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata-flint: could not pin the expert arena (prompts copy slower)\n");
+            }   // the CPU's buffers, and the prompt path's staging for one layer's experts
+            CK(cudaMalloc(&ridx, kTopK * 4));
+            CK(cudaHostAlloc((void**) &hy_s, sizeof(HyShared), cudaHostAllocMapped));
+            std::memset((void*) hy_s, 0, sizeof(HyShared));
+            CK(cudaHostGetDevicePointer((void**) &hy_s_dev, hy_s, 0));
+            CK(cudaMalloc(&hy_ctr, 4));
+            CK(cudaMemset(hy_ctr, 0, 4));
+            const size_t lb = size_t(kExperts) * kFfExp * (kHidden / 32) * 20;
+            CK(cudaMalloc(&stg_g, lb)); CK(cudaMalloc(&stg_u, lb)); CK(cudaMalloc(&stg_d, lb));
+            size_t n = 0;
+            for (const auto& r : plan) n += r.size();
+            std::fprintf(stderr, "strata-flint: hybrid - %zu of %d experts on the card, the rest on %s\n", n, (kLayers - kDense) * kExperts,
+                         "the CPU");
+        }
         auto f = [&](float*& p, size_t n) { CK(cudaMalloc(&p, n * 4)); };
         f(h, kHidden); f(q, kQDim); f(k, kKvDim); f(v, kKvDim); f(att, kQDim); f(f1, kFfDense); f(f2, kFfDense);
         f(logits, vocab); f(rl, kExperts); f(wts, kTopK);
@@ -2915,10 +3080,62 @@ struct Model {
         CK(cudaStreamSynchronize(st));
         CK(cudaFreeHost(pin));
     }
+    // the CPU's half of each MoE layer of a writing step: wait for the card's post, compute the experts it does not
+    // hold, hand the sum back
+    void hy_serve() {
+        volatile HyShared* S = hy_s;
+        const size_t eb = size_t(kFfExp) * (kHidden / 32) * 20;
+        for (int i = kDense; i < n_layers(); ++i) {
+            const Layer& l = L[i];
+            const uint32_t sq = ++hy_seq;
+            const auto w0 = std::chrono::steady_clock::now();
+            for (long spin = 0; S->in_seq < sq; ++spin) {
+                __builtin_ia32_pause();
+                if ((spin & 0xfffff) == 0xfffff && std::chrono::steady_clock::now() - w0 > std::chrono::seconds(30)) {
+                    std::fprintf(stderr, "strata-flint: hybrid - the card never posted layer %d (%s)\n", i, cudaGetErrorString(cudaStreamQuery(st)));
+                    std::exit(1);
+                }
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const auto w1 = std::chrono::steady_clock::now();
+            hy_t_wait += std::chrono::duration<double>(w1 - w0).count();
+            flint_cpu::Expert ex[kTopK];
+            float w[kTopK];
+            int n = 0;
+            for (int k = 0; k < kTopK; ++k) {
+                const int e = S->idx[k];
+                if (l.slot_h[e] >= 0) { ++hy_card_experts; continue; }
+                ex[n] = {l.gate_h + size_t(e) * eb, l.up_h + size_t(e) * eb, l.down_h + size_t(e) * eb};
+                w[n++] = S->w[k];
+            }
+            hy_cpu_experts += n;
+            if (n) flint_cpu::moe((const float*) S->h, l.ffn_norm_h.data(), kHidden, kFfExp, n, ex, w, (float*) S->y);
+            S->has = n > 0;
+            hy_t_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - w1).count();
+            std::atomic_thread_fence(std::memory_order_release);
+            S->out_seq = sq;
+        }
+    }
     void step(int tok) {
         if (pos >= max_ctx) { std::fprintf(stderr, "strata-flint: context full (%d)\n", max_ctx); std::exit(1); }
         if (tok >= 0) { feed({tok}); return; }
         static const bool no_graph = std::getenv("FLINT_NO_GRAPH") != nullptr;
+        if (hybrid) {   // the step's graph runs while this thread serves its CPU halves, layer by layer
+            if (!graph) {
+                cudaGraph_t g;
+                CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+                record();
+                CK(cudaStreamEndCapture(st, &g));
+                CK(cudaGraphInstantiate(&graph, g, nullptr, nullptr, 0));
+                CK(cudaGraphDestroy(g));
+            }
+            flint_cpu::set_active(true);
+            CK(cudaGraphLaunch(graph, st));
+            hy_serve();
+            flint_cpu::set_active(false);
+            ++pos;
+            return;
+        }
         if (no_graph) { record(); ++pos; return; }
         if (!graph) {
             cudaGraph_t g;
@@ -3266,18 +3483,40 @@ struct Model {
             } else k_pf_router_w<<<(T + 15) / 16, 256, 0, st>>>(pXH, pXL, pXS, l.router16, l.router_e, T, pRL);
             CK(cudaMemsetAsync(pCount, 0, kExperts * 4, st));
             k_pf_topk<<<(T + 7) / 8, 256, 0, st>>>(pRL, T, pIdx, pW, pCount);
+            // FLINT_ROUTE_DUMP=FILE: every token's 6 experts, appended per (chunk, layer) as int16 records
+            // [layer, T] then T x 6 ids (for choosing which experts live on the card)
+            static FILE* route_f = std::getenv("FLINT_ROUTE_DUMP") ? std::fopen(std::getenv("FLINT_ROUTE_DUMP"), "ab") : nullptr;
+            if (route_f) {
+                std::vector<int> ix(size_t(T) * kTopK);
+                CK(cudaMemcpyAsync(ix.data(), pIdx, ix.size() * 4, cudaMemcpyDeviceToHost, st));
+                CK(cudaStreamSynchronize(st));
+                std::vector<int16_t> rec(2 + ix.size());
+                rec[0] = int16_t(i); rec[1] = int16_t(T);
+                for (size_t j = 0; j < ix.size(); ++j) rec[2 + j] = int16_t(ix[j]);
+                std::fwrite(rec.data(), 2, rec.size(), route_f);
+                std::fflush(route_f);
+            }
             k_pf_bounds<<<1, kExperts, 0, st>>>(pCount, pBounds, pFill, pTiles, pNT);
             k_pf_scatter<<<(S + 255) / 256, 256, 0, st>>>(pIdx, T, pBounds, pFill, pSrc, pSlot);
             // experts' gate/up on the split rows of each routed token
-            if (pf_lo_e()) k_gemm_q41_grp<true, true><<<dim3(kFfExp / 256, max_tiles), 256, 0, st>>>(l.gate_e, l.up_e, gu_bytes, kFfExp, kHidden, pXH, pXL, pXS, pSrc, pBounds, pTiles, pNT, pACT, kFfExp);
-            else k_gemm_q41_grp<false, true><<<dim3(kFfExp / 256, max_tiles), 256, 0, st>>>(l.gate_e, l.up_e, gu_bytes, kFfExp, kHidden, pXH, pXL, pXS, pSrc, pBounds, pTiles, pNT, pACT, kFfExp);
+            // hybrid: the layer's experts are not all on the card - copy the whole layer into the staging buffers
+            const uint8_t *eg = l.gate_e, *eu = l.up_e, *ed = l.down_e;
+            if (hybrid) {
+                const size_t lb = size_t(kExperts) * kFfExp * (kHidden / 32) * 20;
+                CK(cudaMemcpyAsync(stg_g, l.gate_h, lb, cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(stg_u, l.up_h, lb, cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(stg_d, l.down_h, lb, cudaMemcpyHostToDevice, st));
+                eg = stg_g; eu = stg_u; ed = stg_d;
+            }
+            if (pf_lo_e()) k_gemm_q41_grp<true, true><<<dim3(kFfExp / 256, max_tiles), 256, 0, st>>>(eg, eu, gu_bytes, kFfExp, kHidden, pXH, pXL, pXS, pSrc, pBounds, pTiles, pNT, pACT, kFfExp);
+            else k_gemm_q41_grp<false, true><<<dim3(kFfExp / 256, max_tiles), 256, 0, st>>>(eg, eu, gu_bytes, kFfExp, kHidden, pXH, pXL, pXS, pSrc, pBounds, pTiles, pNT, pACT, kFfExp);
             // shared expert's down, added into h
             pf_split(pG, pU, nullptr, kFfShared, T);
             pf_gemm(l.down_s, kHidden, kFfShared, T, pH, kHidden, 1);
             // experts' down on their act rows (grouped order), then the weighted sum into h
             pf_split(pACT, nullptr, nullptr, kFfExp, S);
-            if (pf_lo_e()) k_gemm_q41_grp<true, false><<<dim3(kHidden / 256, max_tiles), 256, 0, st>>>(l.down_e, nullptr, d_bytes, kHidden, kFfExp, pXH, pXL, pXS, nullptr, pBounds, pTiles, pNT, pY, kHidden);
-            else k_gemm_q41_grp<false, false><<<dim3(kHidden / 256, max_tiles), 256, 0, st>>>(l.down_e, nullptr, d_bytes, kHidden, kFfExp, pXH, pXL, pXS, nullptr, pBounds, pTiles, pNT, pY, kHidden);
+            if (pf_lo_e()) k_gemm_q41_grp<true, false><<<dim3(kHidden / 256, max_tiles), 256, 0, st>>>(ed, nullptr, d_bytes, kHidden, kFfExp, pXH, pXL, pXS, nullptr, pBounds, pTiles, pNT, pY, kHidden);
+            else k_gemm_q41_grp<false, false><<<dim3(kHidden / 256, max_tiles), 256, 0, st>>>(ed, nullptr, d_bytes, kHidden, kFfExp, pXH, pXL, pXS, nullptr, pBounds, pTiles, pNT, pY, kHidden);
             k_pf_combine<<<T, 256, 0, st>>>(pH, pY, pSlot, pW, T);
             dump_rows(pH, T);
         }
@@ -3370,7 +3609,7 @@ struct Model {
             if ((pf || pe) && i + 1 < kLayers) {   // from the start of layer i, on the side stream:
                 CK(cudaEventRecord(ev[i], st));
                 CK(cudaStreamWaitEvent(side, ev[i], 0));
-                if (pe && i >= kDense) {   // this layer's likely experts, picked from its input
+                if (pe && i >= kDense && !hybrid) {   // this layer's likely experts, picked from its input
                     k_router<<<kExperts / 4, 128, 0, side>>>(h, l.ffn_norm, l.router, prl, pidx, pw, pdone);
                     k_touch_pred<<<pe, 256, 0, side>>>(l.gate_e, l.up_e, l.down_e, pidx, sink);
                 }
@@ -3398,8 +3637,15 @@ struct Model {
             }
             k_router<<<kExperts / 4, 128, 0, st>>>(h, l.ffn_norm, l.router, rl, idx, wts, done);
             if (pred) k_pred_overlap<<<1, 32, 0, st>>>(pidx, idx, pcnt);
-            k_moe_gu<<<kActRows / kMvRows, 256, kHidden * 4, st>>>(h, l.ffn_norm, l.gate_e, l.up_e, l.gate_s, l.up_s, idx, act);
-            k_moe_down<<<kHidden / kMvRows, 256, 0, st>>>(h, act, l.down_e, l.down_s, idx, wts);
+            if (hybrid) {   // the card computes the experts it holds while the CPU computes the others (hy_serve)
+                k_hy_post<<<1, 256, 0, st>>>(h, idx, wts, l.slot, ridx, hy_s_dev, hy_ctr);
+                k_moe_gu<<<kActRows / kMvRows, 256, kHidden * 4, st>>>(h, l.ffn_norm, l.gate_e, l.up_e, l.gate_s, l.up_s, ridx, act);
+                k_moe_down<<<kHidden / kMvRows, 256, 0, st>>>(h, act, l.down_e, l.down_s, ridx, wts);
+                k_hy_wait_add<<<kHidden / 256, 256, 0, st>>>(h, hy_s_dev, hy_ctr);
+            } else {
+                k_moe_gu<<<kActRows / kMvRows, 256, kHidden * 4, st>>>(h, l.ffn_norm, l.gate_e, l.up_e, l.gate_s, l.up_s, idx, act);
+                k_moe_down<<<kHidden / kMvRows, 256, 0, st>>>(h, act, l.down_e, l.down_s, idx, wts);
+            }
             if (std::getenv("FLINT_DUMP_H")) dump_rows(h, 1);
         }
         static const int pe2 = std::getenv("FLINT_PREDPF") ? std::atoi(std::getenv("FLINT_PREDPF")) : 64;
@@ -3567,5 +3813,9 @@ int main(int argc, char** argv) {
     if (top) std::fclose(top);
     std::fprintf(stderr, "strata-flint: read %zu in %.3f s (%.1f per second), wrote %d in %.2f s (%.2f per second)\n",
                  ids.size(), read_s, ids.size() / read_s, n_new, write_s, n_new / std::max(write_s, 1e-9));
+    if (m.hybrid && n_new > 0)
+        std::fprintf(stderr, "strata-flint: hybrid - %.0f%% of the chosen experts on the card; a token: %.2f ms waiting for the card's "
+                     "hand-over, %.2f ms on the CPU\n", 100.0 * m.hy_card_experts / std::max<size_t>(1, m.hy_card_experts + m.hy_cpu_experts),
+                     m.hy_t_wait * 1e3 / n_new, m.hy_t_cpu * 1e3 / n_new);
     return 0;
 }

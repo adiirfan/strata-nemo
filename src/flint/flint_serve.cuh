@@ -395,7 +395,7 @@ static int serve(Model& m, const std::vector<int>& eos_ids, int chunk) {
             return m.next_token();
         };
         int tok = pick();
-        const bool can_spec = spec_on && (!sample || (sp.top_k > 0 && sp.top_k <= kTopKMax));
+        const bool can_spec = spec_on && !m.hybrid && (!sample || (sp.top_k > 0 && sp.top_k <= kTopKMax));
         std::vector<int> seq, drafts;
         auto emit = [&](int t) {
             std::printf("T %d\n", t);
