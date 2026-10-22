@@ -2150,6 +2150,153 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8))) k
     A.state[0] = pos + 1;
 }
 
+
+// The prompt attention, second form: QT query tiles of 16 a warp (so each K/V tile in LDS serves 16 * QT queries of 8
+// heads), keys in tiles of 32, double-buffered: the next tile's K and V are loaded into registers while the current
+// one is used, then stored to the other LDS buffer. Same arithmetic per query as k_pf_attn_w.
+template <int QT>
+__global__ void __launch_bounds__(256) k_pf_attn_w2(const float* __restrict__ QKV, const kc_t* __restrict__ K,
+                                                    const vc_t* __restrict__ V, const float* __restrict__ sinks,
+                                                    float* __restrict__ ATT, int p0, int T, int swa, int kv_mask, V8 v8) {
+    constexpr int KT = 32, NQ = 16 * QT, LDQ = kQDim + 2 * kKvDim;
+    __shared__ __align__(16) _Float16 ks[2][KT][kHd + 8];
+    __shared__ __align__(16) _Float16 vt[2][kHd][KT + 8];
+    const int kh = blockIdx.x, q0 = blockIdx.y * NQ;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, l16 = lane & 15, g = lane >> 4;
+    const int h = kh * (kHeads / kKv) + warp;
+    int qpos[QT], qlo[QT];
+    bool live[QT];
+    pf_v8h qb[QT][8];
+#pragma unroll
+    for (int j = 0; j < QT; ++j) {
+        const int tq = q0 + j * 16 + l16;
+        live[j] = tq < T;
+        qpos[j] = p0 + min(tq, T - 1);
+        qlo[j] = swa ? max(0, qpos[j] - (kWindow - 1)) : 0;
+        const float* qr = QKV + size_t(min(tq, T - 1)) * LDQ + h * kHd;
+#pragma unroll
+        for (int s8 = 0; s8 < 8; ++s8)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) qb[j][s8][i] = (_Float16) qr[s8 * 16 + g * 8 + i];
+    }
+    const float scale = rsqrtf(float(kHd));
+    float m[QT], l[QT];
+    pf_v8f o[QT][8];
+#pragma unroll
+    for (int j = 0; j < QT; ++j) {
+        m[j] = -INFINITY; l[j] = 0;
+#pragma unroll
+        for (int d = 0; d < 8; ++d) o[j][d] = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    }
+    const int last = p0 + min(q0 + NQ - 1, T - 1);
+    const int first = swa ? max(0, p0 + q0 - (kWindow - 1)) : 0;
+    // a thread's share of a tile: key lk, dims lc .. lc + 15
+    const int lk = tid >> 3, lc = (tid & 7) * 16;
+    uint4 rk[2];
+    uint32_t rv[8];
+    auto load = [&](int k0) {
+        const int p = k0 + lk;
+        const bool ok = p <= last;
+        const kc_t* kr = K + size_t(p & kv_mask) * kKvDim + kh * kHd + lc;
+        if constexpr (sizeof(kc_t) == 2) {
+            rk[0] = ok ? *(const uint4*) kr : make_uint4(0, 0, 0, 0);
+            rk[1] = ok ? *(const uint4*) (kr + 8) : make_uint4(0, 0, 0, 0);
+        } else {
+            pf_v8h a, b;
+            for (int i = 0; i < 8; ++i) { a[i] = (_Float16) (ok ? c2f(kr[i]) : 0.f); b[i] = (_Float16) (ok ? c2f(kr[8 + i]) : 0.f); }
+            rk[0] = __builtin_bit_cast(uint4, a); rk[1] = __builtin_bit_cast(uint4, b);
+        }
+        float vv[16];
+        if (!ok) for (int i = 0; i < 16; ++i) vv[i] = 0.f;
+        else if (v8.q && p >= p0) {   // this chunk's own keys: exact values
+            const float* vr = QKV + size_t(p - p0) * LDQ + kQDim + kKvDim + kh * kHd + lc;
+            for (int i = 0; i < 16; i += 4) { const float4 f = *(const float4*) (vr + i); vv[i] = f.x; vv[i + 1] = f.y; vv[i + 2] = f.z; vv[i + 3] = f.w; }
+        } else if (v8.q) {
+            const float d8 = v8.s[size_t(p & kv_mask) * kKv + kh];
+            const uint4 u = *(const uint4*) (v8.q + size_t(p & kv_mask) * kKvDim + kh * kHd + lc);
+            const int8_t* b = (const int8_t*) &u;
+            for (int i = 0; i < 16; ++i) vv[i] = float(b[i]) * d8;
+        } else {
+            const vc_t* vr = V + size_t(p & kv_mask) * kKvDim + kh * kHd + lc;
+            for (int i = 0; i < 16; ++i) vv[i] = c2f(vr[i]);
+        }
+        for (int i = 0; i < 8; ++i) rv[i] = __builtin_bit_cast(uint32_t, pf_v2h{(_Float16) vv[2 * i], (_Float16) vv[2 * i + 1]});
+    };
+    auto store = [&](int buf) {
+        *(uint4*) &ks[buf][lk][lc] = rk[0];
+        *(uint4*) &ks[buf][lk][lc + 8] = rk[1];
+        for (int i = 0; i < 8; ++i) {
+            const pf_v2h v2 = __builtin_bit_cast(pf_v2h, rv[i]);
+            vt[buf][lc + 2 * i][lk] = v2[0];
+            vt[buf][lc + 2 * i + 1][lk] = v2[1];
+        }
+    };
+    load(first);
+    store(0);
+    pf_sync();
+    int buf = 0;
+    for (int k0 = first; k0 <= last; k0 += KT) {
+        const bool more = k0 + KT <= last;
+        if (more) load(k0 + KT);
+#pragma unroll
+        for (int sub = 0; sub < KT / 16; ++sub) {
+            pf_v8f sc[QT];
+#pragma unroll
+            for (int j = 0; j < QT; ++j) sc[j] = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+            for (int s8 = 0; s8 < 8; ++s8) {
+                const pf_v8h ka = *(const pf_v8h*) &ks[buf][sub * 16 + l16][s8 * 16 + g * 8];
+#pragma unroll
+                for (int j = 0; j < QT; ++j) sc[j] = pf_wmma(ka, qb[j][s8], sc[j]);
+            }
+            pf_v8h pb[QT];
+            float cf[QT];
+#pragma unroll
+            for (int j = 0; j < QT; ++j) {
+                float mx = -INFINITY, v[8];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int p = k0 + sub * 16 + g * 8 + i;
+                    v[i] = (live[j] && p >= qlo[j] && p <= qpos[j]) ? sc[j][i] * scale : -INFINITY;
+                    mx = fmaxf(mx, v[i]);
+                }
+                mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+                const float mn = fmaxf(m[j], mx), ref = mn == -INFINITY ? 0.f : mn;
+                cf[j] = expf(m[j] - ref);
+                m[j] = mn;
+                float ps = 0;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { const float e = expf(v[i] - ref); ps += e; pb[j][i] = (_Float16) e; }
+                l[j] = l[j] * cf[j] + ps;
+            }
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const pf_v8h va = *(const pf_v8h*) &vt[buf][d * 16 + l16][sub * 16 + g * 8];
+#pragma unroll
+                for (int j = 0; j < QT; ++j) {
+                    o[j][d] = o[j][d] * cf[j];
+                    o[j][d] = pf_wmma(va, pb[j], o[j][d]);
+                }
+            }
+        }
+        if (more) store(buf ^ 1);
+        pf_sync();
+        buf ^= 1;
+    }
+#pragma unroll
+    for (int j = 0; j < QT; ++j) {
+        const float lt = l[j] + __shfl_xor(l[j], 16, 32);
+        if (!live[j]) continue;
+        const float sk = sinks[h], M = fmaxf(m[j], sk);
+        const float f = expf(m[j] - M), L = lt * f + expf(sk - M);
+        float* out = ATT + size_t(q0 + j * 16 + l16) * kQDim + h * kHd;
+#pragma unroll
+        for (int d = 0; d < 8; ++d)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) out[d * 16 + g * 8 + i] = o[j][d][i] * f / L;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------- the model
 struct Layer {
     const float *attn_norm, *ffn_norm, *q_norm, *k_norm, *sinks;
@@ -2641,7 +2788,11 @@ struct Model {
             pf_gemm(l.wk, kKvDim, kHidden, T, pQKV + kQDim, NQKV, 0);
             pf_gemm(l.wv, kKvDim, kHidden, T, pQKV + kQDim + kKvDim, NQKV, 0);
             k_pf_qkpost<<<dim3(kHeads + kKv, T), kHd, 0, st>>>(pQKV, l.q_norm, l.k_norm, l.K, l.V, p0, l.swa, l.kv_mask, l.v8);
-            k_pf_attn_w<<<dim3(kKv, (T + 15) / 16), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa, l.kv_mask, l.v8);
+            static const int aqt = std::getenv("FLINT_PF_QT") ? std::atoi(std::getenv("FLINT_PF_QT")) : 1;
+            if (aqt == 1) k_pf_attn_w2<1><<<dim3(kKv, (T + 15) / 16), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa, l.kv_mask, l.v8);
+            else if (aqt == 2) k_pf_attn_w2<2><<<dim3(kKv, (T + 31) / 32), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa, l.kv_mask, l.v8);
+            else if (aqt == 4) k_pf_attn_w2<4><<<dim3(kKv, (T + 63) / 64), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa, l.kv_mask, l.v8);
+            else k_pf_attn_w<<<dim3(kKv, (T + 15) / 16), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa, l.kv_mask, l.v8);
             pf_split(pATT, nullptr, nullptr, kQDim, T);
             pf_gemm(l.wo, kHidden, kQDim, T, pH, kHidden, 1);
             pf_split(pH, nullptr, l.ffn_norm, kHidden, T);
