@@ -7,7 +7,7 @@ a count, or a size in GB ("5.5GB": 3 x 655,360 bytes an expert). Writes lines "l
 import argparse
 import numpy as np
 
-EXPERTS, EXPERT_BYTES = 256, 3 * 655360
+EXPERTS, EXPERT_BYTES, TOPK = 256, 3 * 655360, 6   # (Flint's; --model ling: Ling-3.0-flash-VL's)
 
 
 def counts(path):
@@ -15,8 +15,8 @@ def counts(path):
     c, i = {}, 0
     while i < len(a):
         layer, t = int(a[i]), int(a[i + 1])
-        ids = a[i + 2:i + 2 + t * 6]
-        i += 2 + t * 6
+        ids = a[i + 2:i + 2 + t * TOPK]
+        i += 2 + t * TOPK
         c[layer] = c.get(layer, np.zeros(EXPERTS)) + np.bincount(ids, minlength=EXPERTS)
     return c
 
@@ -26,7 +26,11 @@ def main():
     ap.add_argument("out")
     ap.add_argument("routes", nargs="+")
     ap.add_argument("--experts", required=True)
+    ap.add_argument("--model", default="flint", choices=["flint", "ling"])
     a = ap.parse_args()
+    global EXPERTS, EXPERT_BYTES, TOPK
+    if a.model == "ling":   # 512 experts, top 8; Q4_0 gate / up (768 x 2560) and down - ~3.3 MB an expert
+        EXPERTS, EXPERT_BYTES, TOPK = 512, 3 * 768 * 2560 * 18 // 32, 8
     total = {}
     for p in a.routes:
         c = counts(p)

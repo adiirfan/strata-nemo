@@ -25,6 +25,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <atomic>
 #include <sys/mman.h>
 
 #include "../flint/flint_cpu.hpp"
@@ -490,6 +491,54 @@ __global__ void __launch_bounds__(1024) k_argmax(const float* lg, int n, int* st
     }
 }
 
+// ---- the card / CPU hand-off (strata-flint's): host memory the card reads and writes directly. The card posts a MoE
+// layer's input and experts and raises in_seq; the CPU computes the experts the card does not hold and raises out_seq;
+// a card kernel spins on it and adds y. No host CUDA call inside the step, so it can be one graph.
+struct HyShared {
+    float h[kHidden];
+    float y[kHidden];
+    int idx[kTopK];
+    float w[kTopK];
+    alignas(128) uint32_t in_seq;
+    alignas(128) uint32_t out_seq;
+    uint32_t has;
+};
+__device__ __forceinline__ void hy_pause() {
+#if defined(__HIPCC__)
+    __builtin_amdgcn_s_sleep(1);
+#else
+    __nanosleep(100);
+#endif
+}
+__global__ void __launch_bounds__(256) k_hy_post(const float* h, const int* idx, const float* wts, HyShared* S, uint32_t* ctr) {
+    const int t = threadIdx.x;
+    for (int i = t; i < kHidden; i += 256) S->h[i] = h[i];
+    if (t < kTopK) { S->idx[t] = idx[t]; S->w[t] = wts[t]; }
+    __threadfence_system();
+    __syncthreads();
+    if (t == 0) {
+        const uint32_t s = *ctr + 1;
+        *ctr = s;
+        *(volatile uint32_t*) &S->in_seq = s;
+        __threadfence_system();
+    }
+}
+__global__ void __launch_bounds__(256) k_hy_wait_add(float* h, HyShared* S, const uint32_t* ctr) {
+    __shared__ uint32_t has;
+    if (threadIdx.x == 0) {
+        const uint32_t s = *ctr;
+        while (*(volatile uint32_t*) &S->out_seq < s) hy_pause();
+        __threadfence_system();
+        has = *(volatile uint32_t*) &S->has;
+    }
+    __syncthreads();
+    if (!has) return;
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    h[i] += ((volatile float*) S->y)[i];
+}
+
+#include "ling_prefill.cuh"
+
 struct Tensor { const uint8_t* d = nullptr; int fmt = -1; };
 struct Layer {
     bool kda = false, dense = false;
@@ -528,6 +577,13 @@ struct Model {
     size_t loaded = 0;
     std::vector<int> layer_kvh;
     std::vector<float> clamp_exp, clamp_shexp;
+    HyShared *hy_s = nullptr, *hy_s_dev = nullptr;   // the hand-off (mapped host memory; the card's view)
+    uint32_t* hy_ctr = nullptr;
+    uint32_t hy_seq = 0;
+    cudaGraphExec_t graph = nullptr;
+    size_t hy_cpu_experts = 0, hy_card_experts = 0;
+    double hy_t_wait = 0, hy_t_cpu = 0;
+    std::vector<std::vector<int>> plan;
     float* hy_h = nullptr;   // pinned: the layer's MoE input (host side of the CPU's experts)
     int* hy_idx = nullptr;
     float* hy_w = nullptr;
@@ -572,6 +628,19 @@ struct Model {
     }
 
     Model(const std::string& path, int ctx) : max_ctx(ctx) {
+        plan.assign(kLayers, {});
+        if (const char* pf = std::getenv("LING_PLAN")) {   // lines "layer expert expert ..." (tools/flint/make_plan.py --model ling)
+            FILE* f = std::fopen(pf, "r");
+            if (!f) { std::fprintf(stderr, "strata-ling: cannot read the plan %s\n", pf); std::exit(1); }
+            static char line[1 << 16];
+            while (std::fgets(line, sizeof line, f)) {
+                std::stringstream ss(line);
+                int li;
+                if (!(ss >> li) || li < 0 || li >= kLayers) continue;
+                for (int e; ss >> e;) if (e >= 0 && e < kExperts) plan[li].push_back(e);
+            }
+            std::fclose(f);
+        }
         parts.push_back(std::make_unique<strata::GgufFile>(path));
         {   // the other parts of a split GGUF (NAME-00001-of-0000N.gguf)
             const auto p = path.find("-00001-of-");
@@ -634,10 +703,25 @@ struct Model {
                 }
                 l.clamp_e = i < int(clamp_exp.size()) ? clamp_exp[i] : 0.f;
                 l.clamp_s = i < int(clamp_shexp.size()) ? clamp_shexp[i] : 0.f;
-                l.slot_h.assign(kExperts, -1);   // (no plan yet: every routed expert on the CPU)
+                // the plan's experts packed on the card (slot order); the rest stay in the file mapping for the CPU
+                l.slot_h.assign(kExperts, -1);
+                const std::vector<int>& R = plan[i];
+                for (size_t j = 0; j < R.size(); ++j) l.slot_h[R[j]] = int(j);
                 CK(cudaMalloc(&l.slot, kExperts * 4));
                 CK(cudaMemcpy(l.slot, l.slot_h.data(), kExperts * 4, cudaMemcpyHostToDevice));
                 l.ge = l.ue = l.de = nullptr;
+                if (!R.empty()) {
+                    const size_t eg = size_t(kFfExp) * row_bytes(l.fmt_eg, kHidden), ed = size_t(kHidden) * row_bytes(l.fmt_ed, kFfExp);
+                    uint8_t *cg, *cu, *cd;
+                    CK(cudaMalloc(&cg, R.size() * eg)); CK(cudaMalloc(&cu, R.size() * eg)); CK(cudaMalloc(&cd, R.size() * ed));
+                    for (size_t j = 0; j < R.size(); ++j) {
+                        CK(cudaMemcpy(cg + j * eg, l.ge_h + size_t(R[j]) * eg, eg, cudaMemcpyHostToDevice));
+                        CK(cudaMemcpy(cu + j * eg, l.ue_h + size_t(R[j]) * eg, eg, cudaMemcpyHostToDevice));
+                        CK(cudaMemcpy(cd + j * ed, l.de_h + size_t(R[j]) * ed, ed, cudaMemcpyHostToDevice));
+                    }
+                    loaded += R.size() * (2 * eg + ed);
+                    l.ge = cg; l.ue = cu; l.de = cd;
+                }
                 const float* nf = (const float*) host(b + "ffn_norm.weight");
                 l.ffn_norm_h.assign(nf, nf + kHidden);
             }
@@ -650,6 +734,11 @@ struct Model {
         CK(cudaMalloc(&idx, kTopK * 4));
         CK(cudaMalloc(&state, 8)); CK(cudaMemset(state, 0, 8));
         CK(cudaMallocHost(&host_state, 8));
+        CK(cudaHostAlloc((void**) &hy_s, sizeof(HyShared), cudaHostAllocMapped));
+        std::memset((void*) hy_s, 0, sizeof(HyShared));
+        CK(cudaHostGetDevicePointer((void**) &hy_s_dev, hy_s, 0));
+        CK(cudaMalloc(&hy_ctr, 4));
+        CK(cudaMemset(hy_ctr, 0, 4));
         CK(cudaMallocHost(&hy_h, kHidden * 4)); CK(cudaMallocHost(&hy_y, kHidden * 4));
         CK(cudaMallocHost(&hy_idx, kTopK * 4)); CK(cudaMallocHost(&hy_w, kTopK * 4));
     }
@@ -669,8 +758,110 @@ struct Model {
         k_mv<<<total / kMvRows, 256, K * 4, st>>>(J);
     }
 
-    // one token (state[1]) through the model at state[0]; logits, then argmax into state[1] and state[0] + 1
+    // one token (state[1]) through the model at state[0]; logits, then argmax into state[1] and state[0] + 1. The card's
+    // work is one graph (record); this thread serves the MoE layers' CPU halves while it runs (hy_serve). LING_SYNC=1:
+    // the older layer-by-layer path with host syncs (and LING_DUMP_H), for checking
     void step() {
+        static const bool sync = std::getenv("LING_SYNC") != nullptr;
+        if (sync) { step_sync(); return; }
+        static const bool no_graph = std::getenv("LING_NO_GRAPH") != nullptr;
+        flint_cpu::set_active(true);
+        if (no_graph) record();
+        else {
+            if (!graph) {
+                cudaGraph_t g;
+                CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+                record();
+                CK(cudaStreamEndCapture(st, &g));
+                CK(cudaGraphInstantiate(&graph, g, nullptr, nullptr, 0));
+                CK(cudaGraphDestroy(g));
+            }
+            CK(cudaGraphLaunch(graph, st));
+        }
+        hy_serve();
+        flint_cpu::set_active(false);
+        ++pos;
+    }
+    void record() {
+        k_embed<<<(kHidden / 8 + 63) / 64, 64, 0, st>>>(embed.d, embed.fmt, state, h);
+        for (int i = 0; i < kLayers; ++i) {
+            Layer& l = L[i];
+            attn(l);
+            if (l.dense) { dense(l); continue; }
+            mv({{Tensor{(const uint8_t*) l.router, F32}, rl}}, {kExperts}, h, kHidden, l.ffn_norm);
+            k_route<<<1, kExperts, 0, st>>>(rl, l.bias, idx, wts);
+            k_hy_post<<<1, 256, 0, st>>>(h, idx, wts, hy_s_dev, hy_ctr);
+            k_moe_gu<<<kActRows / 8, 256, 0, st>>>(MoeGu{h, l.ffn_norm, l.ge, l.ue, l.gs.d, l.us.d, l.fmt_eg, l.gs.fmt, idx, l.slot,
+                                                         l.clamp_e, l.clamp_s, act});
+            k_moe_down<<<kHidden / 8, 256, 0, st>>>(MoeDown{h, act, l.de, l.ds.d, l.fmt_ed, l.ds.fmt, idx, l.slot, wts});
+            k_hy_wait_add<<<kHidden / 256, 256, 0, st>>>(h, hy_s_dev, hy_ctr);
+        }
+        mv({{head, logits}}, {157184}, h, kHidden, out_norm);
+        k_argmax<<<1, 1024, 0, st>>>(logits, 157184, state);
+    }
+    // the CPU's half of each MoE layer: wait for the card's post, compute the experts it does not hold, hand the sum back
+    void hy_serve() {
+        volatile HyShared* S = hy_s;
+        for (int i = kDense; i < kLayers; ++i) {
+            const Layer& l = L[i];
+            const uint32_t sq = ++hy_seq;
+            const auto w0 = std::chrono::steady_clock::now();
+            for (long spin = 0; S->in_seq < sq; ++spin) {
+#if defined(__x86_64__)
+                __builtin_ia32_pause();
+#endif
+                if ((spin & 0xfffff) == 0xfffff && std::chrono::steady_clock::now() - w0 > std::chrono::seconds(30)) {
+                    std::fprintf(stderr, "strata-ling: the card never posted layer %d (%s)\n", i, cudaGetErrorString(cudaStreamQuery(st)));
+                    std::exit(1);
+                }
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const auto w1 = std::chrono::steady_clock::now();
+            hy_t_wait += std::chrono::duration<double>(w1 - w0).count();
+            static FILE* route_f = std::getenv("LING_ROUTE_DUMP") ? std::fopen(std::getenv("LING_ROUTE_DUMP"), "ab") : nullptr;
+            if (route_f) {
+                int16_t rec[2 + kTopK] = {int16_t(i), 1};
+                for (int k = 0; k < kTopK; ++k) rec[2 + k] = int16_t(S->idx[k]);
+                std::fwrite(rec, 2, 2 + kTopK, route_f);
+            }
+            flint_cpu::Expert ex[kTopK];
+            float w[kTopK];
+            int n = 0;
+            const size_t eb_gu = size_t(kFfExp) * row_bytes(l.fmt_eg, kHidden), eb_d = size_t(kHidden) * row_bytes(l.fmt_ed, kFfExp);
+            for (int k = 0; k < kTopK; ++k) {
+                const int e = S->idx[k];
+                if (l.slot_h[e] >= 0) { ++hy_card_experts; continue; }
+                ex[n] = {l.ge_h + size_t(e) * eb_gu, l.ue_h + size_t(e) * eb_gu, l.de_h + size_t(e) * eb_d};
+                w[n++] = S->w[k];
+            }
+            hy_cpu_experts += n;
+            if (n) flint_cpu::moe_q((const float*) S->h, l.ffn_norm_h.data(), kHidden, kFfExp, n, ex, w, (float*) S->y, l.fmt_eg, l.fmt_ed, l.clamp_e);
+            S->has = n > 0;
+            hy_t_cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - w1).count();
+            std::atomic_thread_fence(std::memory_order_release);
+            S->out_seq = sq;
+        }
+    }
+    void attn(Layer& l) {
+        if (l.kda) {
+            mv({{l.wq, qb}, {l.wk, kb}, {l.wv, vb}, {l.wf, fb}, {l.wg, gb}, {Tensor{(const uint8_t*) l.beta_w, F32}, betab}},
+               {kInner, kInner, kInner, kInner, kInner, kHeads}, h, kHidden, l.attn_norm);
+            k_kda<<<kHeads, kHd, 0, st>>>(Kda{qb, kb, vb, fb, gb, betab, l.cq, l.ck, l.cv, l.dtb, l.a, l.onorm, l.cs, l.S, ob});
+        } else {
+            mv({{l.q, qb}, {l.kva, kb}, {l.gate, betab}}, {kHeads * kQkHd, kKvA, kHeads}, h, kHidden, l.attn_norm);
+            k_mla_kv<<<1, kLat, 0, st>>>(kb, l.kv_norm, l.cache, state);
+            k_mla_q<<<kHeads, 256, 0, st>>>(qb, l.kb.d, l.kb.fmt, qa, state);
+            k_mla_attn<<<kHeads, 256, size_t(max_ctx) * 4, st>>>(qa, l.cache, ol, state);
+            k_mla_out<<<kHeads, 256, 0, st>>>(ol, l.vb.d, l.vb.fmt, betab, ob);
+        }
+        mv({{l.wo, h}}, {kHidden}, ob, kInner, nullptr, true);
+    }
+    void dense(Layer& l) {
+        mv({{l.fg, act}, {l.fu, ob}}, {kFfDense, kFfDense}, h, kHidden, l.ffn_norm);
+        k_swiglu<<<(kFfDense + 255) / 256, 256, 0, st>>>(act, ob, kFfDense);
+        mv({{l.fd, h}}, {kHidden}, act, kFfDense, nullptr, true);
+    }
+    void step_sync() {
         k_embed<<<(kHidden / 8 + 63) / 64, 64, 0, st>>>(embed.d, embed.fmt, state, h);
         for (int i = 0; i < kLayers; ++i) {
             Layer& l = L[i];
@@ -702,6 +893,13 @@ struct Model {
                                                          l.clamp_e, l.clamp_s, act});
             k_moe_down<<<kHidden / 8, 256, 0, st>>>(MoeDown{h, act, l.de, l.ds.d, l.fmt_ed, l.ds.fmt, idx, l.slot, wts});
             CK(cudaStreamSynchronize(st));
+            // LING_ROUTE_DUMP=FILE: each token's 8 experts a layer, as int16 records [layer, 1, 8 ids] (tools/flint/make_plan.py)
+            static FILE* route_f = std::getenv("LING_ROUTE_DUMP") ? std::fopen(std::getenv("LING_ROUTE_DUMP"), "ab") : nullptr;
+            if (route_f) {
+                int16_t rec[2 + kTopK] = {int16_t(i), 1};
+                for (int k = 0; k < kTopK; ++k) rec[2 + k] = int16_t(hy_idx[k]);
+                std::fwrite(rec, 2, 2 + kTopK, route_f);
+            }
             flint_cpu::Expert ex[kTopK];
             float w[kTopK];
             int n = 0;
@@ -722,6 +920,143 @@ struct Model {
         mv({{head, logits}}, {157184}, h, kHidden, out_norm);
         k_argmax<<<1, 1024, 0, st>>>(logits, 157184, state);
         ++pos;
+    }
+    // ------------------------------------------------ the prompt path (ling_prefill.cuh): chunks of up to pf_t tokens
+    int pf_t = 0;
+    float *pH = nullptr, *pX, *pQ, *pK, *pV, *pF, *pG, *pB, *pO, *pQa, *pOl, *pRL, *pW, *pAG, *pAU, *pY, *pSG, *pSU, *pD1, *pD2, *pXc;
+    int *pIds, *pIdx, *pCount, *pBounds, *pFill, *pTiles, *pNT, *pSrc, *pSlot, *hCount;
+    const uint8_t** wptr = nullptr;      // the grouped products' expert pointers: gate, up, down (3 x 512), device
+    const uint8_t** wptr_h = nullptr;    // (pinned host copy)
+    uint8_t* stg = nullptr;              // the chunk's routed experts the card does not hold, copied from the mapping
+    size_t stg_bytes = 0;
+    void pf_alloc(int T) {
+        if (T <= pf_t) return;
+        pf_t = T;
+        auto f = [&](float*& p, size_t n) { if (p) CK(cudaFree(p)); CK(cudaMalloc(&p, n * 4)); };
+        auto fi = [&](int*& p, size_t n) { if (p) CK(cudaFree(p)); CK(cudaMalloc(&p, n * 4)); };
+        const size_t S = size_t(T) * kTopK;
+        f(pH, size_t(T) * kHidden); f(pX, size_t(T) * kHidden); f(pQ, size_t(T) * kHeads * kQkHd); f(pK, size_t(T) * kInner);
+        f(pV, size_t(T) * kInner); f(pF, size_t(T) * kInner); f(pG, size_t(T) * kInner); f(pB, size_t(T) * kHeads);
+        f(pO, size_t(T) * kInner); f(pQa, size_t(T) * kHeads * kKvA); f(pOl, size_t(T) * kHeads * kLat); f(pRL, size_t(T) * kExperts);
+        f(pW, S); f(pAG, S * kFfExp); f(pAU, S * kFfExp); f(pY, S * kHidden); f(pSG, size_t(T) * kFfDense); f(pSU, size_t(T) * kFfDense);
+        f(pD1, size_t(T) * kInner); f(pD2, size_t(T) * kInner); f(pXc, size_t(T) * kInner);
+        fi(pIds, T); fi(pIdx, S); fi(pCount, kExperts); fi(pBounds, kExperts + 1); fi(pFill, kExperts);
+        fi(pTiles, 2 * (S / 64 + kExperts + 1)); fi(pNT, 1); fi(pSrc, S); fi(pSlot, S);
+        if (!hCount) CK(cudaMallocHost(&hCount, kExperts * 4));
+        if (!wptr) { CK(cudaMalloc(&wptr, 3 * kExperts * sizeof(void*))); CK(cudaMallocHost(&wptr_h, 3 * kExperts * sizeof(void*))); }
+    }
+    void gemm(const Tensor& w, int N, int K, const float* X, int ldx, int T, float* Y, int ldy, bool add) {
+        Gemm J{};
+        J.W = w.d; J.fmt = w.fmt; J.N = N; J.K = K; J.X = X; J.ldx = ldx; J.T = T; J.Y = Y; J.ldy = ldy; J.add = add;
+        k_gemm<<<dim3((N + 63) / 64, (T + 63) / 64), 256, 0, st>>>(J);
+    }
+    void gemm_grp(const uint8_t* const* wp, int fmt, int N, int K, const float* X, int ldx, const int* src, float* Y, int ldy, int S) {
+        Gemm J{};
+        J.wp = wp; J.fmt = fmt; J.N = N; J.K = K; J.X = X; J.ldx = ldx; J.Y = Y; J.ldy = ldy; J.src = src;
+        J.bounds = pBounds; J.tiles = pTiles; J.n_tiles = pNT;
+        k_gemm<<<dim3((N + 63) / 64, S / 64 + kExperts + 1), 256, 0, st>>>(J);
+    }
+    void prefill_chunk(const int* ids, int T) {
+        if (pos + T > max_ctx) { std::fprintf(stderr, "strata-ling: context full (%d)\n", max_ctx); std::exit(1); }
+        pf_alloc(T);
+        const int p0 = pos;
+        CK(cudaMemcpyAsync(pIds, ids, T * 4, cudaMemcpyHostToDevice, st));
+        k_pembed<<<T, kHidden / 8, 0, st>>>(embed.d, embed.fmt, pIds, pH);
+        for (int i = 0; i < kLayers; ++i) {
+            Layer& l = L[i];
+            k_rms_rows<<<T, 256, 0, st>>>(pH, l.attn_norm, pX, kHidden);
+            if (l.kda) {
+                gemm(l.wq, kInner, kHidden, pX, kHidden, T, pQ, kInner, false);
+                gemm(l.wk, kInner, kHidden, pX, kHidden, T, pK, kInner, false);
+                gemm(l.wv, kInner, kHidden, pX, kHidden, T, pV, kInner, false);
+                gemm(l.wf, kInner, kHidden, pX, kHidden, T, pF, kInner, false);
+                gemm(l.wg, kInner, kHidden, pX, kHidden, T, pG, kInner, false);
+                gemm(Tensor{(const uint8_t*) l.beta_w, F32}, kHeads, kHidden, pX, kHidden, T, pB, kHeads, false);
+                k_kda_conv<<<kInner / 256, 256, 0, st>>>(pQ, l.cq, l.cs, pD1, T);
+                k_kda_conv<<<kInner / 256, 256, 0, st>>>(pK, l.ck, l.cs + 3 * kInner, pD2, T);
+                k_kda_conv<<<kInner / 256, 256, 0, st>>>(pV, l.cv, l.cs + 6 * kInner, pXc, T);
+                k_kda_conv_state<<<kInner / 256, 256, 0, st>>>(pQ, l.cs, T);
+                k_kda_conv_state<<<kInner / 256, 256, 0, st>>>(pK, l.cs + 3 * kInner, T);
+                k_kda_conv_state<<<kInner / 256, 256, 0, st>>>(pV, l.cs + 6 * kInner, T);
+                k_kda_prep<<<T * kHeads, kHd, 0, st>>>(pD1, pD2, pF, l.dtb, l.a, pB);
+                k_kda_scan<<<kHeads, kHd, 0, st>>>(pD1, pD2, pXc, pF, pB, l.S, pO, T);
+                k_kda_out<<<T * kHeads, kHd, 0, st>>>(pO, pG, l.onorm);
+            } else {
+                gemm(l.q, kHeads * kQkHd, kHidden, pX, kHidden, T, pQ, kHeads * kQkHd, false);
+                gemm(l.kva, kKvA, kHidden, pX, kHidden, T, pK, kKvA, false);
+                gemm(l.gate, kHeads, kHidden, pX, kHidden, T, pB, kHeads, false);
+                k_pmla_kv<<<T, kLat, 0, st>>>(pK, l.kv_norm, l.cache, p0);
+                const size_t rbk = row_bytes(l.kb.fmt, kQkNope), rbv = row_bytes(l.vb.fmt, kLat);
+                for (int hh = 0; hh < kHeads; ++hh)
+                    gemm(Tensor{l.kb.d + size_t(hh) * kLat * rbk, l.kb.fmt}, kLat, kQkNope, pQ + hh * kQkHd, kHeads * kQkHd, T,
+                         pQa + hh * kKvA, kHeads * kKvA, false);
+                k_pmla_qrope<<<T * kHeads, 32, 0, st>>>(pQ, pQa, p0);
+                k_pmla_attn<<<T, 256, 0, st>>>(pQa, l.cache, pOl, p0);
+                for (int hh = 0; hh < kHeads; ++hh)
+                    gemm(Tensor{l.vb.d + size_t(hh) * kHd * rbv, l.vb.fmt}, kHd, kLat, pOl + hh * kLat, kHeads * kLat, T,
+                         pO + hh * kHd, kInner, false);
+                k_pmla_gate<<<T, 256, 0, st>>>(pO, pB);
+            }
+            gemm(l.wo, kHidden, kInner, pO, kInner, T, pH, kHidden, true);
+            k_rms_rows<<<T, 256, 0, st>>>(pH, l.ffn_norm, pX, kHidden);
+            if (l.dense) {
+                gemm(l.fg, kFfDense, kHidden, pX, kHidden, T, pSG, kFfDense, false);
+                gemm(l.fu, kFfDense, kHidden, pX, kHidden, T, pSU, kFfDense, false);
+                k_pswiglu<<<(T * kFfDense + 255) / 256, 256, 0, st>>>(pSG, pSU, size_t(T) * kFfDense, 0.f);
+                gemm(l.fd, kHidden, kFfDense, pSG, kFfDense, T, pH, kHidden, true);
+                continue;
+            }
+            // shared expert, added into h
+            gemm(l.gs, kFfShared, kHidden, pX, kHidden, T, pSG, kFfShared, false);
+            gemm(l.us, kFfShared, kHidden, pX, kHidden, T, pSU, kFfShared, false);
+            k_pswiglu<<<(T * kFfShared + 255) / 256, 256, 0, st>>>(pSG, pSU, size_t(T) * kFfShared, l.clamp_s);
+            gemm(l.ds, kHidden, kFfShared, pSG, kFfShared, T, pH, kHidden, true);
+            // routing, then the rows grouped by expert
+            gemm(Tensor{(const uint8_t*) l.router, F32}, kExperts, kHidden, pX, kHidden, T, pRL, kExperts, false);
+            CK(cudaMemsetAsync(pCount, 0, kExperts * 4, st));
+            k_proute<<<T, kExperts, 0, st>>>(pRL, l.bias, pIdx, pW, pCount);
+            k_pbounds<<<1, 512, 0, st>>>(pCount, pBounds, pFill, pTiles, pNT);
+            k_pscatter<<<(T * kTopK + 255) / 256, 256, 0, st>>>(pIdx, T, pBounds, pFill, pSrc, pSlot);
+            CK(cudaMemcpyAsync(hCount, pCount, kExperts * 4, cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+            // each used expert's three matrices: on the card already, or copied into the staging area
+            const size_t eg = size_t(kFfExp) * row_bytes(l.fmt_eg, kHidden), ed = size_t(kHidden) * row_bytes(l.fmt_ed, kFfExp);
+            size_t need = 0;
+            for (int e = 0; e < kExperts; ++e) if (hCount[e] && l.slot_h[e] < 0) need += 2 * eg + ed;
+            if (need > stg_bytes) {
+                if (stg) CK(cudaFree(stg));
+                stg_bytes = std::max(need, size_t(64) << 20);
+                CK(cudaMalloc(&stg, stg_bytes));
+            }
+            size_t off = 0;
+            for (int e = 0; e < kExperts; ++e) {
+                wptr_h[e] = wptr_h[kExperts + e] = wptr_h[2 * kExperts + e] = nullptr;
+                if (!hCount[e]) continue;
+                if (l.slot_h[e] >= 0) {
+                    const size_t sl = size_t(l.slot_h[e]);
+                    wptr_h[e] = l.ge + sl * eg; wptr_h[kExperts + e] = l.ue + sl * eg; wptr_h[2 * kExperts + e] = l.de + sl * ed;
+                    continue;
+                }
+                CK(cudaMemcpyAsync(stg + off, l.ge_h + size_t(e) * eg, eg, cudaMemcpyHostToDevice, st)); wptr_h[e] = stg + off; off += eg;
+                CK(cudaMemcpyAsync(stg + off, l.ue_h + size_t(e) * eg, eg, cudaMemcpyHostToDevice, st)); wptr_h[kExperts + e] = stg + off; off += eg;
+                CK(cudaMemcpyAsync(stg + off, l.de_h + size_t(e) * ed, ed, cudaMemcpyHostToDevice, st)); wptr_h[2 * kExperts + e] = stg + off; off += ed;
+            }
+            CK(cudaMemcpyAsync(wptr, wptr_h, 3 * kExperts * sizeof(void*), cudaMemcpyHostToDevice, st));
+            const int S = T * kTopK;
+            gemm_grp(wptr, l.fmt_eg, kFfExp, kHidden, pX, kHidden, pSrc, pAG, kFfExp, S);
+            gemm_grp(wptr + kExperts, l.fmt_eg, kFfExp, kHidden, pX, kHidden, pSrc, pAU, kFfExp, S);
+            k_pswiglu<<<(unsigned) ((size_t(S) * kFfExp + 255) / 256), 256, 0, st>>>(pAG, pAU, size_t(S) * kFfExp, l.clamp_e);
+            gemm_grp(wptr + 2 * kExperts, l.fmt_ed, kHidden, kFfExp, pAG, kFfExp, nullptr, pY, kHidden, S);
+            k_pcombine<<<T, 256, 0, st>>>(pH, pY, pSlot, pW);
+            CK(cudaStreamSynchronize(st));   // (wptr_h and the staging area are reused by the next layer)
+        }
+        // the last row through the head (the writing path's kernel), its argmax the next token
+        mv({{head, logits}}, {157184}, pH + size_t(T - 1) * kHidden, kHidden, out_norm);
+        const int st0[2] = {p0 + T - 1, 0};
+        CK(cudaMemcpyAsync(state, st0, 4, cudaMemcpyHostToDevice, st));
+        k_argmax<<<1, 1024, 0, st>>>(logits, 157184, state);
+        CK(cudaStreamSynchronize(st));
+        pos = p0 + T;
     }
     std::vector<float> dumped;
     void dump_h() {
@@ -780,7 +1115,16 @@ int main(int argc, char** argv) {
     FILE* lf = logits_path.empty() ? nullptr : std::fopen(logits_path.c_str(), "wb");
     std::vector<float> lg(157184);
     const auto t1 = std::chrono::steady_clock::now();
-    for (int t : ids) {
+    static const bool tokwise = std::getenv("LING_TOKWISE") != nullptr;
+    const int chunk = std::getenv("LING_CHUNK") ? std::atoi(std::getenv("LING_CHUNK")) : 2048;
+    if (!tokwise) {   // (with --logits: only the last position's, the prompt path computes no others)
+        for (size_t i = 0; i < ids.size(); i += chunk) m.prefill_chunk(ids.data() + i, int(std::min(ids.size() - i, size_t(chunk))));
+        if (lf) {
+            CK(cudaMemcpyAsync(lg.data(), m.logits, lg.size() * 4, cudaMemcpyDeviceToHost, m.st));
+            CK(cudaStreamSynchronize(m.st));
+            std::fwrite(lg.data(), 4, lg.size(), lf);
+        }
+    } else for (int t : ids) {
         m.feed_token(t);
         if (lf) {
             CK(cudaMemcpyAsync(lg.data(), m.logits, lg.size() * 4, cudaMemcpyDeviceToHost, m.st));
@@ -806,5 +1150,9 @@ int main(int argc, char** argv) {
     const double write_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count();
     std::fprintf(stderr, "strata-ling: read %zu in %.3f s (%.1f per second), wrote %d in %.2f s (%.2f per second)\n", ids.size(), read_s,
                  ids.size() / read_s, n_new, write_s, n_new / std::max(write_s, 1e-9));
+    if (m.hy_card_experts + m.hy_cpu_experts)
+        std::fprintf(stderr, "strata-ling: %.0f%% of the chosen experts on the card; a token: %.2f ms waiting for the card, %.2f ms on the CPU\n",
+                     100.0 * m.hy_card_experts / double(m.hy_card_experts + m.hy_cpu_experts), m.hy_t_wait * 1e3 / std::max<int>(1, m.pos),
+                     m.hy_t_cpu * 1e3 / std::max<int>(1, m.pos));
     return 0;
 }
