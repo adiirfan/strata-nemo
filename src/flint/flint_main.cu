@@ -1195,6 +1195,7 @@ __device__ __forceinline__ pf_v8h pf_q41_a8(const uint8_t* W, int k) {
 // row. A block: 8 warps side by side over 256 outputs (2 tiles of 16 each), 64 tokens (4 tiles), k 64 a step; the
 // weights go straight from memory into the operand registers, the inputs through LDS (double-buffered).
 // LO: also the lo halves (two products a pair of operands).
+#if FL_HIP
 template <bool LO>
 __global__ void __launch_bounds__(256) k_gemm_q41(const uint8_t* __restrict__ W, int N, int K, const uint16_t* __restrict__ xh,
                                                   const uint16_t* __restrict__ xl, const float* __restrict__ xs, int T,
@@ -1274,11 +1275,135 @@ __global__ void __launch_bounds__(256) k_gemm_q41(const uint8_t* __restrict__ W,
             }
     }
 }
+#endif
+#if !FL_HIP
+// NVIDIA: the same product with mma.sync m16n8k16 in its native layout. A = weights, unpacked from Q4_1 straight into
+// the fragment (lane (gid, tig): rows gid and gid + 8, k pairs 2 tig and 2 tig + 8), B = the tokens' x from LDS, the
+// 16 outputs x 64 tokens of a row tile as 8 products of 8 tokens. Weights to fp16 as d * q + m, as the gfx12 kernel does.
+__device__ __forceinline__ uint32_t nv_q41_pair(const uint8_t* blk, int byte, int sh, __half2 d2, __half2 m2) {
+    const uint16_t q = *(const uint16_t*) (blk + 4 + byte);
+    const __half2 v = __halves2half2(__ushort2half_rn((q >> sh) & 15), __ushort2half_rn((q >> (8 + sh)) & 15));
+    const __half2 w = __hfma2(v, d2, m2);
+    uint32_t r;
+    std::memcpy(&r, &w, 4);
+    return r;
+}
+// rows R0 (gid) and R1 (gid + 8), k0 .. k0 + 15: the four A registers
+__device__ __forceinline__ void nv_q41_afrag(const uint8_t* R0, const uint8_t* R1, int k0, int tig, uint32_t* a) {
+    const int sh = (k0 & 16) ? 4 : 0;
+    const uint8_t* b0 = R0 + (k0 >> 5) * 20;
+    const uint8_t* b1 = R1 + (k0 >> 5) * 20;
+    __half2 d0, m0, d1, m1;
+    {
+        const uint32_t dm0 = *(const uint32_t*) b0, dm1 = *(const uint32_t*) b1;
+        __half h;
+        uint16_t u;
+        u = uint16_t(dm0); std::memcpy(&h, &u, 2); d0 = __half2half2(h);
+        u = uint16_t(dm0 >> 16); std::memcpy(&h, &u, 2); m0 = __half2half2(h);
+        u = uint16_t(dm1); std::memcpy(&h, &u, 2); d1 = __half2half2(h);
+        u = uint16_t(dm1 >> 16); std::memcpy(&h, &u, 2); m1 = __half2half2(h);
+    }
+    a[0] = nv_q41_pair(b0, 2 * tig, sh, d0, m0);
+    a[1] = nv_q41_pair(b1, 2 * tig, sh, d1, m1);
+    a[2] = nv_q41_pair(b0, 2 * tig + 8, sh, d0, m0);
+    a[3] = nv_q41_pair(b1, 2 * tig + 8, sh, d1, m1);
+}
+__device__ __forceinline__ void nv_mma(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+template <bool LO>
+__global__ void __launch_bounds__(256) k_gemm_q41(const uint8_t* __restrict__ W, int N, int K, const uint16_t* __restrict__ xh,
+                                                  const uint16_t* __restrict__ xl, const float* __restrict__ xs, int T,
+                                                  float* __restrict__ Y, int ldy, int add) {
+    constexpr int TA = 2, BN = 64, NT = BN / 8, BK = 64, LD = BK + 8;
+    __shared__ __align__(16) uint16_t sx[2][2][BN][LD];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, gid = lane >> 2, tig = lane & 3;
+    const int o0 = blockIdx.x * 256 + warp * TA * 16, t0 = blockIdx.y * BN;
+    const size_t rowb = size_t(K / 32) * 20;
+    const uint8_t* wr[TA][2];
+#pragma unroll
+    for (int a = 0; a < TA; ++a) {
+        wr[a][0] = W + size_t(min(o0 + a * 16 + gid, N - 1)) * rowb;
+        wr[a][1] = W + size_t(min(o0 + a * 16 + gid + 8, N - 1)) * rowb;
+    }
+    auto fetch = [&](int k0, uint4* r) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = tid + j * 256, hl = i >> 9, t = (i >> 3) & 63, c = (i & 7) * 8;
+            const uint16_t* src = hl ? xl : xh;
+            r[j] = (t0 + t < T && (LO || !hl)) ? *(const uint4*) (src + size_t(t0 + t) * K + k0 + c) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    auto put = [&](const uint4* r, int buf) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = tid + j * 256, hl = i >> 9, t = (i >> 3) & 63, c = (i & 7) * 8;
+            *(uint4*) &sx[buf][hl][t][c] = r[j];
+        }
+    };
+    float acc[TA][NT][4];
+#pragma unroll
+    for (int a = 0; a < TA; ++a)
+#pragma unroll
+        for (int n = 0; n < NT; ++n) acc[a][n][0] = acc[a][n][1] = acc[a][n][2] = acc[a][n][3] = 0.f;
+    uint4 rb[4];
+    fetch(0, rb);
+    put(rb, 0);
+    __syncthreads();
+    int buf = 0;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        if (k0 + BK < K) fetch(k0 + BK, rb);
+#pragma unroll
+        for (int kk = 0; kk < BK / 16; ++kk) {
+            uint32_t fa[TA][4];
+#pragma unroll
+            for (int a = 0; a < TA; ++a) nv_q41_afrag(wr[a][0], wr[a][1], k0 + kk * 16, tig, fa[a]);
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                const uint32_t bh0 = *(const uint32_t*) &sx[buf][0][n * 8 + gid][kk * 16 + 2 * tig];
+                const uint32_t bh1 = *(const uint32_t*) &sx[buf][0][n * 8 + gid][kk * 16 + 2 * tig + 8];
+#pragma unroll
+                for (int a = 0; a < TA; ++a) nv_mma(acc[a][n], fa[a], bh0, bh1);
+                if (LO) {
+                    const uint32_t bl0 = *(const uint32_t*) &sx[buf][1][n * 8 + gid][kk * 16 + 2 * tig];
+                    const uint32_t bl1 = *(const uint32_t*) &sx[buf][1][n * 8 + gid][kk * 16 + 2 * tig + 8];
+#pragma unroll
+                    for (int a = 0; a < TA; ++a) nv_mma(acc[a][n], fa[a], bl0, bl1);
+                }
+            }
+        }
+        if (k0 + BK < K) put(rb, buf ^ 1);
+        __syncthreads();
+        buf ^= 1;
+    }
+    // lane: outputs o0 + a * 16 + gid (+ 8), tokens t0 + n * 8 + 2 tig (+ 1)
+#pragma unroll
+    for (int n = 0; n < NT; ++n)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int t = t0 + n * 8 + 2 * tig + j;
+            if (t >= T) continue;
+            const float sc = xs[t];
+#pragma unroll
+            for (int a = 0; a < TA; ++a)
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    const int o = o0 + a * 16 + gid + 8 * r;
+                    if (o >= N) continue;
+                    float* y = Y + size_t(t) * ldy + o;
+                    const float v = acc[a][n][2 * r + j] * sc;
+                    *y = add ? *y + v : v;
+                }
+        }
+}
+#endif
 
 
 // The routed experts' grouped product: rows of the grouped order (expert e's rows bounds[e] .. bounds[e + 1]) in tiles of
 // 64 (tiles: (expert, first row) pairs, *n_tiles of them). Input row of grouped row r: src[r] (or r without src).
 // GU: gate (W1) and up (W2) both, Y = silu(gate) * up; otherwise Y = W1 . x. W_e = W + e * mat_bytes.
+#if FL_HIP
 template <bool LO, bool GU>
 __global__ void __launch_bounds__(256) k_gemm_q41_grp(const uint8_t* __restrict__ W1, const uint8_t* __restrict__ W2, size_t mat_bytes,
                                                       int N, int K, const uint16_t* __restrict__ xh, const uint16_t* __restrict__ xl,
@@ -1372,6 +1497,110 @@ __global__ void __launch_bounds__(256) k_gemm_q41_grp(const uint8_t* __restrict_
             }
     }
 }
+#endif
+#if !FL_HIP
+// NVIDIA's grouped product (see k_gemm_q41 above for the fragment layout)
+template <bool LO, bool GU>
+__global__ void __launch_bounds__(256) k_gemm_q41_grp(const uint8_t* __restrict__ W1, const uint8_t* __restrict__ W2, size_t mat_bytes,
+                                                      int N, int K, const uint16_t* __restrict__ xh, const uint16_t* __restrict__ xl,
+                                                      const float* __restrict__ xs, const int* __restrict__ src,
+                                                      const int* __restrict__ bounds, const int* __restrict__ tiles,
+                                                      const int* __restrict__ n_tiles, float* __restrict__ Y, int ldy) {
+    constexpr int TA = 2, BN = 64, NT = BN / 8, BK = 64, LD = BK + 8, NM = GU ? 2 : 1;
+    __shared__ __align__(16) uint16_t sx[2][2][BN][LD];
+    __shared__ int srow[BN];
+    const int tile = blockIdx.y;
+    if (tile >= *n_tiles) return;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, gid = lane >> 2, tig = lane & 3;
+    const int e = tiles[2 * tile], r0 = bounds[e] + tiles[2 * tile + 1], rn = min(BN, bounds[e + 1] - r0);
+    const int o0 = blockIdx.x * 256 + warp * TA * 16;
+    if (tid < BN) srow[tid] = tid < rn ? (src ? src[r0 + tid] : r0 + tid) : -1;
+    __syncthreads();
+    const size_t rowb = size_t(K / 32) * 20;
+    const uint8_t* wr[NM][TA][2];
+#pragma unroll
+    for (int mm = 0; mm < NM; ++mm)
+#pragma unroll
+        for (int a = 0; a < TA; ++a)
+#pragma unroll
+            for (int r = 0; r < 2; ++r) wr[mm][a][r] = (mm ? W2 : W1) + size_t(e) * mat_bytes + size_t(o0 + a * 16 + gid + 8 * r) * rowb;
+    auto fetch = [&](int k0, uint4* r) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = tid + j * 256, hl = i >> 9, t = (i >> 3) & 63, c = (i & 7) * 8;
+            const uint16_t* sp = hl ? xl : xh;
+            const int row = srow[t];
+            r[j] = (row >= 0 && (LO || !hl)) ? *(const uint4*) (sp + size_t(row) * K + k0 + c) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    auto put = [&](const uint4* r, int buf) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = tid + j * 256, hl = i >> 9, t = (i >> 3) & 63, c = (i & 7) * 8;
+            *(uint4*) &sx[buf][hl][t][c] = r[j];
+        }
+    };
+    float acc[NM][TA][NT][4];
+#pragma unroll
+    for (int mm = 0; mm < NM; ++mm)
+#pragma unroll
+        for (int a = 0; a < TA; ++a)
+#pragma unroll
+            for (int n = 0; n < NT; ++n) acc[mm][a][n][0] = acc[mm][a][n][1] = acc[mm][a][n][2] = acc[mm][a][n][3] = 0.f;
+    uint4 rb[4];
+    fetch(0, rb);
+    put(rb, 0);
+    __syncthreads();
+    int buf = 0;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        if (k0 + BK < K) fetch(k0 + BK, rb);
+#pragma unroll
+        for (int kk = 0; kk < BK / 16; ++kk) {
+            uint32_t fa[NM][TA][4];
+#pragma unroll
+            for (int mm = 0; mm < NM; ++mm)
+#pragma unroll
+                for (int a = 0; a < TA; ++a) nv_q41_afrag(wr[mm][a][0], wr[mm][a][1], k0 + kk * 16, tig, fa[mm][a]);
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                const uint32_t bh0 = *(const uint32_t*) &sx[buf][0][n * 8 + gid][kk * 16 + 2 * tig];
+                const uint32_t bh1 = *(const uint32_t*) &sx[buf][0][n * 8 + gid][kk * 16 + 2 * tig + 8];
+#pragma unroll
+                for (int mm = 0; mm < NM; ++mm)
+#pragma unroll
+                    for (int a = 0; a < TA; ++a) nv_mma(acc[mm][a][n], fa[mm][a], bh0, bh1);
+                if (LO) {
+                    const uint32_t bl0 = *(const uint32_t*) &sx[buf][1][n * 8 + gid][kk * 16 + 2 * tig];
+                    const uint32_t bl1 = *(const uint32_t*) &sx[buf][1][n * 8 + gid][kk * 16 + 2 * tig + 8];
+#pragma unroll
+                    for (int mm = 0; mm < NM; ++mm)
+#pragma unroll
+                        for (int a = 0; a < TA; ++a) nv_mma(acc[mm][a][n], fa[mm][a], bl0, bl1);
+                }
+            }
+        }
+        if (k0 + BK < K) put(rb, buf ^ 1);
+        __syncthreads();
+        buf ^= 1;
+    }
+#pragma unroll
+    for (int n = 0; n < NT; ++n)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int t = n * 8 + 2 * tig + j;
+            if (t >= rn) continue;
+            const float sc = xs[srow[t]];
+#pragma unroll
+            for (int a = 0; a < TA; ++a)
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    const float g0 = acc[0][a][n][2 * r + j] * sc;
+                    const float v = GU ? silu(g0) * (acc[GU ? 1 : 0][a][n][2 * r + j] * sc) : g0;
+                    Y[size_t(r0 + t) * ldy + o0 + a * 16 + gid + 8 * r] = v;
+                }
+        }
+}
+#endif
 
 // router logits for 16 tokens a block: thread = expert, rows rmsnorm(h_t) * nw (rn: each token's 1 / rms)
 __global__ void __launch_bounds__(256) k_pf_router(const float* H, const float* rn, const float* nw, const uint16_t* W, int T,
@@ -2869,6 +3098,24 @@ struct Model {
     uint32_t hy_seq = 0;
     uint8_t *stg_g = nullptr, *stg_u = nullptr, *stg_d = nullptr;                 // prompt path: a layer's experts
     uint8_t* hy_arena = nullptr;  // every routed expert, host side (large pages; pinned unless FLINT_HY_PIN=0)
+    // prompt path: the experts copied on their own stream, overlapping the card's work - gate/up for the next layer
+    // while this one's down (and the next attention) runs, down while gate/up runs; the events keep each buffer's
+    // copy and its use apart
+    cudaStream_t hy_cp = nullptr;
+    cudaEvent_t ev_gu_ready = nullptr, ev_gu_free = nullptr, ev_d_ready = nullptr, ev_d_free = nullptr;
+    void hy_copy_gu(const Layer& l) {
+        const size_t lb = size_t(kExperts) * kFfExp * (kHidden / 32) * 20;
+        CK(cudaStreamWaitEvent(hy_cp, ev_gu_free, 0));
+        CK(cudaMemcpyAsync(stg_g, l.gate_h, lb, cudaMemcpyHostToDevice, hy_cp));
+        CK(cudaMemcpyAsync(stg_u, l.up_h, lb, cudaMemcpyHostToDevice, hy_cp));
+        CK(cudaEventRecord(ev_gu_ready, hy_cp));
+    }
+    void hy_copy_d(const Layer& l) {
+        const size_t lb = size_t(kExperts) * kFfExp * (kHidden / 32) * 20;
+        CK(cudaStreamWaitEvent(hy_cp, ev_d_free, 0));
+        CK(cudaMemcpyAsync(stg_d, l.down_h, lb, cudaMemcpyHostToDevice, hy_cp));
+        CK(cudaEventRecord(ev_d_ready, hy_cp));
+    }
     size_t hy_arena_bytes = 0;
     size_t hy_cpu_experts = 0, hy_card_experts = 0;   // (counted over the writing steps)
     double hy_t_wait = 0, hy_t_cpu = 0;               // (seconds: waiting for the card's hand-over, the CPU's share)
@@ -3041,7 +3288,7 @@ struct Model {
             static const int ring = std::getenv("FLINT_SWA_RING") ? std::atoi(std::getenv("FLINT_SWA_RING")) : kSwaRing;   // (a power of two)
             const size_t rows = l.swa && max_ctx > ring ? ring : max_ctx;
             if (l.swa && rows == size_t(ring)) l.kv_mask = ring - 1;
-            static const bool v16 = std::getenv("FLINT_V16") != nullptr;   // (fp16 V on the full layers too)
+            static const bool v16 = std::getenv("FLINT_V16") != nullptr || !FL_HIP;   // (NVIDIA: fp16 V, the per-head attention)   // (fp16 V on the full layers too)
             static const bool k8 = std::getenv("FLINT_K8") != nullptr;      // (8-bit K too: about a third less to read)
             if (k8 && (v16 || sizeof(kc_t) != 2 || std::getenv("FLINT_ATTN_OLD") ||
                        (std::getenv("FLINT_PF_QT") && !std::strchr("124", std::getenv("FLINT_PF_QT")[0])))) {
@@ -3093,6 +3340,10 @@ struct Model {
             CK(cudaMemset(hy_ctr, 0, 4));
             const size_t lb = size_t(kExperts) * kFfExp * (kHidden / 32) * 20;
             CK(cudaMalloc(&stg_g, lb)); CK(cudaMalloc(&stg_u, lb)); CK(cudaMalloc(&stg_d, lb));
+            CK(cudaStreamCreateWithFlags(&hy_cp, cudaStreamNonBlocking));
+            for (cudaEvent_t* e : {&ev_gu_ready, &ev_gu_free, &ev_d_ready, &ev_d_free}) CK(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
+            CK(cudaEventRecord(ev_gu_free, st));
+            CK(cudaEventRecord(ev_d_free, st));
             size_t n = 0;
             for (const auto& r : plan) n += r.size();
             std::fprintf(stderr, "strata-flint: hybrid - %zu of %d experts on the card, the rest on %s\n", n, (kLayers - kDense) * kExperts,
@@ -3337,8 +3588,8 @@ struct Model {
         if (mu) { v_record_mu(T); return; }
         const int NQKV = kQDim + 2 * kKvDim;
         k_v_embed<<<T, 256, 0, st>>>(embed, vToks, vH);
-        static const int pf = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : 32;
-        static const int pe = std::getenv("FLINT_PREDPF") ? std::atoi(std::getenv("FLINT_PREDPF")) : 64;
+        static const int pf = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : (FL_HIP ? 32 : 0);   // (NVIDIA: no 64 MB memory-side cache to fill)
+        static const int pe = std::getenv("FLINT_PREDPF") ? std::atoi(std::getenv("FLINT_PREDPF")) : (FL_HIP ? 64 : 0);
         for (int i = 0; i < kLayers; ++i) {
             Layer& l = L[i];
             if ((pf || pe) && i + 1 < kLayers) {   // as on the writing path; the guess is the first token's
@@ -3504,8 +3755,10 @@ struct Model {
         const int NQKV = kQDim + 2 * kKvDim;
         const size_t gu_bytes = size_t(kFfExp) * (kHidden / 32) * 20, d_bytes = size_t(kHidden) * (kFfExp / 32) * 20;
         const int S = T * kTopK, max_tiles = S / 64 + kExperts + 1;
+        if (hybrid && n_layers() > kDense) hy_copy_gu(L[kDense]);   // (the first expert layer's gate/up)
         for (int i = 0; i < n_layers(); ++i) {
             Layer& l = L[i];
+            if (hybrid && i >= kDense) hy_copy_d(l);   // (this layer's down, during its attention and gate/up)
             pf_split(pH, nullptr, l.attn_norm, kHidden, T);
             pf_gemm(l.wq, kQDim, kHidden, T, pQKV, NQKV, 0);
             pf_gemm(l.wk, kKvDim, kHidden, T, pQKV + kQDim, NQKV, 0);
@@ -3585,22 +3838,25 @@ struct Model {
             // experts' gate/up on the split rows of each routed token
             // hybrid: the layer's experts are not all on the card - copy the whole layer into the staging buffers
             const uint8_t *eg = l.gate_e, *eu = l.up_e, *ed = l.down_e;
-            if (hybrid) {
-                const size_t lb = size_t(kExperts) * kFfExp * (kHidden / 32) * 20;
-                CK(cudaMemcpyAsync(stg_g, l.gate_h, lb, cudaMemcpyHostToDevice, st));
-                CK(cudaMemcpyAsync(stg_u, l.up_h, lb, cudaMemcpyHostToDevice, st));
-                CK(cudaMemcpyAsync(stg_d, l.down_h, lb, cudaMemcpyHostToDevice, st));
+            if (hybrid) {   // (copied on hy_cp: see hy_copy_gu / hy_copy_d)
+                CK(cudaStreamWaitEvent(st, ev_gu_ready, 0));
                 eg = stg_g; eu = stg_u; ed = stg_d;
             }
             if (pf_lo_e()) k_gemm_q41_grp<true, true><<<dim3(kFfExp / 256, max_tiles), 256, 0, st>>>(eg, eu, gu_bytes, kFfExp, kHidden, pXH, pXL, pXS, pSrc, pBounds, pTiles, pNT, pACT, kFfExp);
             else k_gemm_q41_grp<false, true><<<dim3(kFfExp / 256, max_tiles), 256, 0, st>>>(eg, eu, gu_bytes, kFfExp, kHidden, pXH, pXL, pXS, pSrc, pBounds, pTiles, pNT, pACT, kFfExp);
+            if (hybrid) {   // gate/up's buffers are free: the next expert layer's go in while this layer finishes
+                CK(cudaEventRecord(ev_gu_free, st));
+                if (i + 1 < n_layers()) hy_copy_gu(L[i + 1]);
+            }
             // shared expert's down, added into h
             pf_split(pG, pU, nullptr, kFfShared, T);
             pf_gemm(l.down_s, kHidden, kFfShared, T, pH, kHidden, 1);
             // experts' down on their act rows (grouped order), then the weighted sum into h
             pf_split(pACT, nullptr, nullptr, kFfExp, S);
+            if (hybrid) CK(cudaStreamWaitEvent(st, ev_d_ready, 0));
             if (pf_lo_e()) k_gemm_q41_grp<true, false><<<dim3(kHidden / 256, max_tiles), 256, 0, st>>>(ed, nullptr, d_bytes, kHidden, kFfExp, pXH, pXL, pXS, nullptr, pBounds, pTiles, pNT, pY, kHidden);
             else k_gemm_q41_grp<false, false><<<dim3(kHidden / 256, max_tiles), 256, 0, st>>>(ed, nullptr, d_bytes, kHidden, kFfExp, pXH, pXL, pXS, nullptr, pBounds, pTiles, pNT, pY, kHidden);
+            if (hybrid) CK(cudaEventRecord(ev_d_free, st));
             k_pf_combine<<<T, 256, 0, st>>>(pH, pY, pSlot, pW, T);
             dump_rows(pH, T);
         }
@@ -3675,7 +3931,7 @@ struct Model {
             add(l.router, size_t(kExperts) * kHidden * 2);
             add(l.gate_s, kFfShared * r2k); add(l.up_s, kFfShared * r2k); add(l.down_s, size_t(kHidden) * (kFfShared / 32) * 20);
         }
-        static const int nb = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : 32;
+        static const int nb = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : (FL_HIP ? 32 : 0);   // (NVIDIA: no 64 MB memory-side cache to fill)
         k_touch<<<nb, 256, 0, side>>>(T, sink);
     }
     void record() {
@@ -3685,11 +3941,11 @@ struct Model {
             k_token<<<kMegaTot, 256, kActRows * 4, st>>>(A);
             return;
         }
-        static const int pf = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : 32;
+        static const int pf = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : (FL_HIP ? 32 : 0);   // (NVIDIA: no 64 MB memory-side cache to fill)
         k_embed<<<kHidden / 256, 256, 0, st>>>(embed, state, h);
         for (int i = 0; i < n_layers(); ++i) {
             Layer& l = L[i];
-            static const int pe = std::getenv("FLINT_PREDPF") ? std::atoi(std::getenv("FLINT_PREDPF")) : 64;
+            static const int pe = std::getenv("FLINT_PREDPF") ? std::atoi(std::getenv("FLINT_PREDPF")) : (FL_HIP ? 64 : 0);
             if ((pf || pe) && i + 1 < kLayers) {   // from the start of layer i, on the side stream:
                 CK(cudaEventRecord(ev[i], st));
                 CK(cudaStreamWaitEvent(side, ev[i], 0));
@@ -3709,7 +3965,7 @@ struct Model {
             // the sliding layers (at most 513 keys) keep the per-head kernel; the full layers, whose keys grow with the
             // context, read each key once for the 8 heads sharing it
             static const bool attn_old = std::getenv("FLINT_ATTN_OLD") != nullptr;
-            if ((attn_old && !l.v8.q) || l.swa) k_attn_part<<<dim3(kHeads, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask, 0, F);
+            if ((attn_old && !l.v8.q) || l.swa || !FL_HIP) k_attn_part<<<dim3(kHeads, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask, 0, F);
             else k_attn_dec_w<<<dim3(kKv, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask, 0, F, l.v8);
             k_attn_merge<<<kHeads, kHd, 0, st>>>(part, l.sinks, att);
             mv_in({{l.wo, h}}, {kHidden}, att, kQDim, nullptr, nullptr, true);
@@ -3732,7 +3988,7 @@ struct Model {
             }
             if (std::getenv("FLINT_DUMP_H")) dump_rows(h, 1);
         }
-        static const int pe2 = std::getenv("FLINT_PREDPF") ? std::atoi(std::getenv("FLINT_PREDPF")) : 64;
+        static const int pe2 = std::getenv("FLINT_PREDPF") ? std::atoi(std::getenv("FLINT_PREDPF")) : (FL_HIP ? 64 : 0);
         if (pf || pe2) {   // join the side stream back (the capture must end on one stream)
             CK(cudaEventRecord(ev[kLayers], side));
             CK(cudaStreamWaitEvent(st, ev[kLayers], 0));
