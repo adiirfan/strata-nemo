@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -383,6 +384,19 @@ __global__ void __launch_bounds__(1024) k_argmax64(const float* lg, int n, int* 
     *done = 0;
 }
 
+// read a set of buffers so they sit in the card's memory-side cache (64 MB on the R9700) when the main stream gets to
+// them; the values are not used
+struct Touch { const uint4* p[12]; uint32_t n16[12]; int n; };
+__global__ void __launch_bounds__(256) k_touch(Touch T, unsigned* sink) {
+    uint32_t a = 0;
+    for (int j = 0; j < T.n; ++j)
+        for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < T.n16[j]; i += gridDim.x * 256) {
+            const uint4 v = T.p[j][i];
+            a ^= v.x ^ v.w;
+        }
+    if (a == 0x9e3779b9u) *sink = a;
+}
+
 __global__ void k_embed(const float* table, const int* state, float* h) {
     const int i = blockIdx.x * 256 + threadIdx.x, tok = state[1];
     if (i < kHidden) h[i] = table[size_t(tok) * kHidden + i];
@@ -407,7 +421,9 @@ struct Model {
     const uint8_t* head;
     int vocab = 0, max_ctx;
     size_t loaded = 0;
-    cudaStream_t st;
+    cudaStream_t st, side;
+    std::vector<cudaEvent_t> ev;
+    unsigned* sink;
     // scratch
     float *act, *part, *h, *q, *k, *v, *att, *f1, *f2, *logits, *rl, *wts;
     float2* best;
@@ -451,6 +467,10 @@ struct Model {
         const auto* pat = g->get("flint.attention.sliding_window_pattern");
         vocab = int(g->find("output.weight")->shape[1]);
         CK(cudaStreamCreate(&st));
+        CK(cudaStreamCreate(&side));
+        ev.resize(kLayers + 2);
+        for (auto& e : ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        CK(cudaMalloc(&sink, 4));
         L.resize(kLayers);
         for (int i = 0; i < kLayers; ++i) {
             Layer& l = L[i];
@@ -502,12 +522,23 @@ struct Model {
 
     // one token through the model (tok, or the last step's own choice when tok < 0); logits on the card, the most
     // likely next token in state[1]. Recorded as a graph on the first call and replayed after that.
+    // the prompt's tokens one step each; each copy reads its own pinned slot (one shared slot was overwritten by the
+    // next token before the card had read it), and the slots are kept until the stream has passed them
+    void feed(const std::vector<int>& toks, const std::function<void()>& after_each = nullptr) {
+        int* pin = nullptr;
+        CK(cudaMallocHost(&pin, std::max<size_t>(toks.size(), 1) * 4));
+        std::memcpy(pin, toks.data(), toks.size() * 4);
+        for (size_t i = 0; i < toks.size(); ++i) {
+            CK(cudaMemcpyAsync(state + 1, pin + i, 4, cudaMemcpyHostToDevice, st));
+            step(-1);
+            if (after_each) after_each();
+        }
+        CK(cudaStreamSynchronize(st));
+        CK(cudaFreeHost(pin));
+    }
     void step(int tok) {
         if (pos >= max_ctx) { std::fprintf(stderr, "strata-flint: context full (%d)\n", max_ctx); std::exit(1); }
-        if (tok >= 0) {
-            host_state[1] = tok;
-            CK(cudaMemcpyAsync(state + 1, host_state + 1, 4, cudaMemcpyHostToDevice, st));
-        }
+        if (tok >= 0) { feed({tok}); return; }
         static const bool no_graph = std::getenv("FLINT_NO_GRAPH") != nullptr;
         if (no_graph) { record(); ++pos; return; }
         if (!graph) {
@@ -519,6 +550,8 @@ struct Model {
             CK(cudaGraphDestroy(g));
         }
         CK(cudaGraphLaunch(graph, st));
+        static const bool check = std::getenv("FLINT_CHECK") != nullptr;
+        if (check) { CK(cudaStreamSynchronize(st)); CK(cudaGetLastError()); }
         ++pos;
     }
     // the next token as the last step chose it
@@ -538,10 +571,34 @@ struct Model {
         k_mv_in<<<total / kMvRows, 256, n_in * 4, st>>>(J);
     }
     // one step: 8 launches a MoE layer
+    // the next layer's fixed weights (attention, shared expert, router; its experts are not known yet) read on the side
+    // stream while this layer runs, so they come from the memory-side cache. FLINT_PREFETCH=0 off, =N blocks.
+    void prefetch(int i) {
+        const Layer& l = L[i];
+        Touch T{};
+        auto add = [&](const void* p, size_t bytes) { T.p[T.n] = (const uint4*) p; T.n16[T.n] = uint32_t(bytes / 16); ++T.n; };
+        const size_t r2k = size_t(kHidden / 32) * 20;
+        add(l.wq, kQDim * r2k); add(l.wk, kKvDim * r2k); add(l.wv, kKvDim * r2k);
+        add(l.wo, size_t(kHidden) * (kQDim / 32) * 20);
+        if (i < kDense) {
+            add(l.gate, kFfDense * r2k); add(l.up, kFfDense * r2k); add(l.down, size_t(kHidden) * (kFfDense / 32) * 20);
+        } else {
+            add(l.router, size_t(kExperts) * kHidden * 2);
+            add(l.gate_s, kFfShared * r2k); add(l.up_s, kFfShared * r2k); add(l.down_s, size_t(kHidden) * (kFfShared / 32) * 20);
+        }
+        static const int nb = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : 16;
+        k_touch<<<nb, 256, 0, side>>>(T, sink);
+    }
     void record() {
+        static const int pf = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : 16;
         k_embed<<<kHidden / 256, 256, 0, st>>>(embed, state, h);
         for (int i = 0; i < kLayers; ++i) {
             Layer& l = L[i];
+            if (pf && i + 1 < kLayers) {   // layer i + 1's weights, from the start of layer i
+                CK(cudaEventRecord(ev[i], st));
+                CK(cudaStreamWaitEvent(side, ev[i], 0));
+                prefetch(i + 1);
+            }
             mv_in({{l.wq, q}, {l.wk, k}, {l.wv, v}}, {kQDim, kKvDim, kKvDim}, h, kHidden, l.attn_norm);
             k_qkv_post<<<kHeads + kKv, kHd, 0, st>>>(q, k, v, l.q_norm, l.k_norm, l.K, l.V, state, l.swa);
             k_attn_part<<<dim3(kHeads, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa);
@@ -555,6 +612,10 @@ struct Model {
             k_router<<<kExperts / 4, 128, 0, st>>>(h, l.ffn_norm, l.router, rl, idx, wts, done);
             k_moe_gu<<<kActRows / kMvRows, 256, kHidden * 4, st>>>(h, l.ffn_norm, l.gate_e, l.up_e, l.gate_s, l.up_s, idx, act);
             k_moe_down<<<kHidden / kMvRows, 256, 0, st>>>(h, act, l.down_e, l.down_s, idx, wts);
+        }
+        if (pf) {   // join the side stream back (the capture must end on one stream)
+            CK(cudaEventRecord(ev[kLayers], side));
+            CK(cudaStreamWaitEvent(st, ev[kLayers], 0));
         }
         mv_in({{head, logits}}, {vocab}, h, kHidden, out_norm);
         k_argmax64<<<64, 1024, 0, st>>>(logits, vocab, state, best, done2);
@@ -599,10 +660,9 @@ int main(int argc, char** argv) {
     std::vector<float> lg(m.vocab);
     const auto t1 = std::chrono::steady_clock::now();
     FILE* lf = logits_path.empty() ? nullptr : std::fopen(logits_path.c_str(), "wb");
-    for (int t : ids) {
-        m.step(t);
+    m.feed(ids, [&]() {
         if (lf) { CK(cudaMemcpy(lg.data(), m.logits, lg.size() * 4, cudaMemcpyDeviceToHost)); std::fwrite(lg.data(), 4, lg.size(), lf); }
-    }
+    });
     if (lf) std::fclose(lf);
     CK(cudaStreamSynchronize(m.st));
     const double read_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
