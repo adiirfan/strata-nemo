@@ -645,8 +645,54 @@ struct MoeGu {
     float clamp_e, clamp_s;
     float* act;
 };
+// a block's quants and dot for a format known only at run time (the four 32-value block formats)
+__device__ __forceinline__ float blk_any(int fmt, const uint8_t* row, int b, int nb, const float* xv) {
+    if (fmt == AQ4_0) return blk_dot<AQ4_0>(blk_load<AQ4_0>(row, b), row, b, nb, xv);
+    if (fmt == AQ8_0) return blk_dot<AQ8_0>(blk_load<AQ8_0>(row, b), row, b, nb, xv);
+    if (fmt == AQ4_1) return blk_dot<AQ4_1>(blk_load<AQ4_1>(row, b), row, b, nb, xv);
+    return blk_dot<AQ5_0>(blk_load<AQ5_0>(row, b), row, b, nb, xv);
+}
+__device__ __forceinline__ bool is_blk(int fmt) { return fmt == AQ4_0 || fmt == AQ8_0 || fmt == AQ4_1 || fmt == AQ5_0; }
+// R rows of one block format against xt (rearranged by block, stride ld), the rows' first blocks loaded first
+template <int F, int R>
+__device__ __forceinline__ void blk_rows_from(const uint8_t* W, size_t rbytes, int nb, int ld, const float* xt, int lane, float* acc) {
+    Blk q[R];
+    if (lane < nb)
+#pragma unroll
+        for (int r = 0; r < R; ++r) q[r] = blk_load<F>(W + size_t(r) * rbytes, lane);
+    blk_rows<F, R>(W, rbytes, nb, ld, xt, lane, q, acc);
+}
+template <int R>
+__device__ __forceinline__ void any_rows(int fmt, const uint8_t* W, size_t rbytes, int nb, int ld, const float* xt, int lane, float* acc) {
+    if (fmt == AQ4_0) blk_rows_from<AQ4_0, R>(W, rbytes, nb, ld, xt, lane, acc);
+    else if (fmt == AQ8_0) blk_rows_from<AQ8_0, R>(W, rbytes, nb, ld, xt, lane, acc);
+    else if (fmt == AQ4_1) blk_rows_from<AQ4_1, R>(W, rbytes, nb, ld, xt, lane, acc);
+    else blk_rows_from<AQ5_0, R>(W, rbytes, nb, ld, xt, lane, acc);
+}
+// act = silu(gate . x) * (up . x) with x = rmsnorm(h) * nw, for the chosen experts the card holds (an expert's 768 rows
+// at k * 768) and the shared expert (at 6144); kGuR rows of gate and of up a warp, 8 warps a block
+constexpr int kGuR = 2;
 __global__ void __launch_bounds__(256) k_moe_gu(MoeGu J) {
-    __shared__ float xs[kHidden], red[8];
+    constexpr int nb = kHidden / 32, ld = nb | 1;
+    __shared__ float xs[kHidden], xt[32 * ld], red[8];
+    const int lane = threadIdx.x & 31, row = (blockIdx.x * 8 + (threadIdx.x >> 5)) * kGuR;
+    const uint8_t *G = nullptr, *U = nullptr;
+    int fmt;
+    float cl;
+    size_t rb;
+    if (row < kTopK * kFfExp) {
+        const int sl = J.slot[J.idx[row / kFfExp]];
+        fmt = J.fmt_e;
+        cl = J.clamp_e;
+        rb = row_bytes(fmt, kHidden);
+        if (sl >= 0) { G = J.ge + (size_t(sl) * kFfExp + row % kFfExp) * rb; U = J.ue + (size_t(sl) * kFfExp + row % kFfExp) * rb; }
+    } else {
+        fmt = J.fmt_s;
+        cl = J.clamp_s;
+        rb = row_bytes(fmt, kHidden);
+        G = J.gs + size_t(row - kTopK * kFfExp) * rb;
+        U = J.us + size_t(row - kTopK * kFfExp) * rb;
+    }
     for (int i = threadIdx.x; i < kHidden; i += 256) xs[i] = J.h[i];
     __syncthreads();
     float ss = 0;
@@ -657,31 +703,31 @@ __global__ void __launch_bounds__(256) k_moe_gu(MoeGu J) {
     float t = 0;
     for (int i = 0; i < 8; ++i) t += red[i];
     const float r = rsqrtf(t / kHidden + kEps);
-    __syncthreads();
-    for (int i = threadIdx.x; i < kHidden; i += 256) xs[i] = xs[i] * r * J.nw[i];
-    __syncthreads();
-    const int lane = threadIdx.x & 31, row = blockIdx.x * 8 + (threadIdx.x >> 5);
-    const uint8_t *G, *U;
-    int fmt;
-    float cl;
-    if (row < kTopK * kFfExp) {
-        const int sl = J.slot[J.idx[row / kFfExp]];
-        if (sl < 0) { if (lane == 0) J.act[row] = 0.f; return; }
-        const size_t rb = row_bytes(J.fmt_e, kHidden);
-        G = J.ge + (size_t(sl) * kFfExp + row % kFfExp) * rb;
-        U = J.ue + (size_t(sl) * kFfExp + row % kFfExp) * rb;
-        fmt = J.fmt_e;
-        cl = J.clamp_e;
-    } else {
-        const size_t rb = row_bytes(J.fmt_s, kHidden);
-        G = J.gs + size_t(row - kTopK * kFfExp) * rb;
-        U = J.us + size_t(row - kTopK * kFfExp) * rb;
-        fmt = J.fmt_s;
-        cl = J.clamp_s;
+    for (int i = threadIdx.x; i < kHidden; i += 256) {
+        const float v = xs[i] * r * J.nw[i];
+        xs[i] = v;
+        xt[(i & 31) * ld + (i >> 5)] = v;
     }
-    float g = row_dot(fmt, G, xs, kHidden, lane), u = row_dot(fmt, U, xs, kHidden, lane);
-    if (cl > 0.f) { g = fminf(g, cl); u = fmaxf(-cl, fminf(u, cl)); }
-    if (lane == 0) J.act[row] = siluf(g) * u;
+    __syncthreads();
+    if (!G) {   // (an expert the card does not hold: the CPU computes it)
+        if (lane < kGuR) J.act[row + lane] = 0.f;
+        return;
+    }
+    float g[kGuR] = {}, u[kGuR] = {};
+    if (is_blk(fmt) && (rb & 15) == 0) {
+        any_rows<kGuR>(fmt, G, rb, nb, ld, xt, lane, g);
+        any_rows<kGuR>(fmt, U, rb, nb, ld, xt, lane, u);
+    } else
+        for (int k = 0; k < kGuR; ++k) {
+            g[k] = row_dot(fmt, G + size_t(k) * rb, xs, kHidden, lane);
+            u[k] = row_dot(fmt, U + size_t(k) * rb, xs, kHidden, lane);
+        }
+#pragma unroll
+    for (int k = 0; k < kGuR; ++k) {
+        float gv = warp_sum(g[k]), uv = warp_sum(u[k]);
+        if (cl > 0.f) { gv = fminf(gv, cl); uv = fmaxf(-cl, fminf(uv, cl)); }
+        if (lane == 0) J.act[row + k] = siluf(gv) * uv;
+    }
 }
 struct MoeDown {
     float* h;
@@ -691,21 +737,56 @@ struct MoeDown {
     const int *idx, *slot;
     const float* wts;
 };
-// h[r] += sum_k w_k down_k(act_k)[r] (the card's experts) + down_shared(act_s)[r]; one warp a row
+// h[r] += sum_k w_k down_k(act_k)[r] (the card's experts) + down_shared(act_s)[r]; kDnR rows a warp. A row's 8 x 24
+// expert blocks and the shared expert's 24 are spread over the lanes (a block a lane), act rearranged by block
+constexpr int kDnR = 2;
 __global__ void __launch_bounds__(256) k_moe_down(MoeDown J) {
-    __shared__ float xs[kActRows];
-    for (int i = threadIdx.x; i < kActRows; i += 256) xs[i] = J.act[i];
-    __syncthreads();
-    const int lane = threadIdx.x & 31, row = blockIdx.x * 8 + (threadIdx.x >> 5);
-    float tot = 0;
-    const size_t rbe = row_bytes(J.fmt_e, kFfExp), rbs = row_bytes(J.fmt_s, kFfShared);
-    for (int k = 0; k < kTopK; ++k) {
-        const int sl = J.slot[J.idx[k]];
-        if (sl < 0) continue;
-        tot += J.wts[k] * row_dot(J.fmt_e, J.de + (size_t(sl) * kHidden + row) * rbe, xs + k * kFfExp, kFfExp, lane);
+    constexpr int nbe = kFfExp / 32, nbt = kActRows / 32, ld = nbt | 1;   // 24 a row, 216 in all
+    __shared__ float xt[32 * ld];
+    __shared__ const uint8_t* base[kTopK + 1];
+    __shared__ float wk[kTopK + 1];
+    for (int i = threadIdx.x; i < kActRows; i += 256) xt[(i & 31) * ld + (i >> 5)] = J.act[i];
+    if (threadIdx.x <= kTopK) {
+        const int k = threadIdx.x;
+        if (k < kTopK) {
+            const int sl = J.slot[J.idx[k]];
+            base[k] = sl < 0 ? nullptr : J.de + size_t(sl) * kHidden * row_bytes(J.fmt_e, kFfExp);
+            wk[k] = J.wts[k];
+        } else { base[k] = J.ds; wk[k] = 1.f; }
     }
-    tot += row_dot(J.fmt_s, J.ds + size_t(row) * rbs, xs + kTopK * kFfExp, kFfShared, lane);
-    if (lane == 0) J.h[row] += tot;
+    __syncthreads();
+    const int lane = threadIdx.x & 31, r0 = (blockIdx.x * 8 + (threadIdx.x >> 5)) * kDnR;
+    const size_t rbe = row_bytes(J.fmt_e, kFfExp), rbs = row_bytes(J.fmt_s, kFfShared);
+    float tot[kDnR] = {};
+    if (is_blk(J.fmt_e) && is_blk(J.fmt_s) && (rbe & 15) == 0 && (rbs & 15) == 0) {
+        for (int p = lane; p < nbt; p += 32) {
+            const int k = p / nbe, b = p - k * nbe;
+            const uint8_t* B = base[k];
+            if (!B) continue;
+            const int fmt = k < kTopK ? J.fmt_e : J.fmt_s;
+            const size_t rbk = k < kTopK ? rbe : rbs;
+            float xv[32];
+#pragma unroll
+            for (int i = 0; i < 32; ++i) xv[i] = xt[i * ld + p];
+#pragma unroll
+            for (int r = 0; r < kDnR; ++r) tot[r] += wk[k] * blk_any(fmt, B + size_t(r0 + r) * rbk, b, nbe, xv);
+        }
+    } else {   // (other formats: a row at a time, act read back in order)
+        __shared__ float xs[kActRows];
+        for (int i = threadIdx.x; i < kActRows; i += 256) xs[i] = J.act[i];
+        __syncthreads();
+        for (int k = 0; k <= kTopK; ++k) {
+            if (!base[k]) continue;
+            for (int r = 0; r < kDnR; ++r)
+                tot[r] += wk[k] * row_dot(k < kTopK ? J.fmt_e : J.fmt_s, base[k] + size_t(r0 + r) * (k < kTopK ? rbe : rbs),
+                                          xs + k * kFfExp, k < kTopK ? kFfExp : kFfShared, lane);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kDnR; ++r) {
+        const float v = warp_sum(tot[r]);
+        if (lane == 0) J.h[r0 + r] += v;
+    }
 }
 
 __global__ void k_embed(const uint8_t* table, int fmt, const int* state, float* h) {
@@ -1115,9 +1196,9 @@ struct Model {
             mv({{Tensor{(const uint8_t*) l.router, F32}, rl}}, {kExperts}, h, kHidden, l.ffn_norm);
             k_route<<<1, kExperts, 0, st>>>(rl, l.bias, idx, wts);
             k_hy_post<<<1, 256, 0, st>>>(h, idx, wts, hy_s_dev, hy_ctr);
-            k_moe_gu<<<kActRows / 8, 256, 0, st>>>(MoeGu{h, l.ffn_norm, l.ge, l.ue, l.gs.d, l.us.d, aligned_fmt(l.fmt_eg), l.gs.fmt, idx,
+            k_moe_gu<<<kActRows / (8 * kGuR), 256, 0, st>>>(MoeGu{h, l.ffn_norm, l.ge, l.ue, l.gs.d, l.us.d, aligned_fmt(l.fmt_eg), l.gs.fmt, idx,
                                                          l.slot, l.clamp_e, l.clamp_s, act});
-            k_moe_down<<<kHidden / 8, 256, 0, st>>>(MoeDown{h, act, l.de, l.ds.d, aligned_fmt(l.fmt_ed), l.ds.fmt, idx, l.slot, wts});
+            k_moe_down<<<kHidden / (8 * kDnR), 256, 0, st>>>(MoeDown{h, act, l.de, l.ds.d, aligned_fmt(l.fmt_ed), l.ds.fmt, idx, l.slot, wts});
             k_hy_wait_add<<<kHidden / 256, 256, 0, st>>>(h, hy_s_dev, hy_ctr);
         }
         mv({{head, logits}}, {157184}, h, kHidden, out_norm);
@@ -1214,9 +1295,9 @@ struct Model {
             CK(cudaMemcpyAsync(hy_h, h, kHidden * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaMemcpyAsync(hy_idx, idx, kTopK * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaMemcpyAsync(hy_w, wts, kTopK * 4, cudaMemcpyDeviceToHost, st));
-            k_moe_gu<<<kActRows / 8, 256, 0, st>>>(MoeGu{h, l.ffn_norm, l.ge, l.ue, l.gs.d, l.us.d, aligned_fmt(l.fmt_eg), l.gs.fmt, idx,
+            k_moe_gu<<<kActRows / (8 * kGuR), 256, 0, st>>>(MoeGu{h, l.ffn_norm, l.ge, l.ue, l.gs.d, l.us.d, aligned_fmt(l.fmt_eg), l.gs.fmt, idx,
                                                          l.slot, l.clamp_e, l.clamp_s, act});
-            k_moe_down<<<kHidden / 8, 256, 0, st>>>(MoeDown{h, act, l.de, l.ds.d, aligned_fmt(l.fmt_ed), l.ds.fmt, idx, l.slot, wts});
+            k_moe_down<<<kHidden / (8 * kDnR), 256, 0, st>>>(MoeDown{h, act, l.de, l.ds.d, aligned_fmt(l.fmt_ed), l.ds.fmt, idx, l.slot, wts});
             CK(cudaStreamSynchronize(st));
             // LING_ROUTE_DUMP=FILE: each token's 8 experts a layer, as int16 records [layer, 1, 8 ids] (tools/flint/make_plan.py)
             static FILE* route_f = std::getenv("LING_ROUTE_DUMP") ? std::fopen(std::getenv("LING_ROUTE_DUMP"), "ab") : nullptr;
