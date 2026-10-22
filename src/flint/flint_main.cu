@@ -338,23 +338,66 @@ __device__ inline float4 h4(const __half* p) {
     const float2 a = __half22float2(__builtin_bit_cast(__half2, u.x)), b = __half22float2(__builtin_bit_cast(__half2, u.y));
     return make_float4(a.x, a.y, b.x, b.y);
 }
+// The writing path's attention also does what k_qkv_post did when F.qn is set: q (its head) and this position's k
+// RMSNorm (+ RoPE on sliding layers) from the raw products, k / v of this position into the cache (one block a K/V
+// head writes them), and that position's key used from LDS (other blocks may not have written it yet).
+struct AttnFuse { const float *k, *v, *qn, *kn; kc_t* Kw; vc_t* Vw; };
+// rmsnorm * w (+ NEOX RoPE at pos) of 128 values in place, by one warp (4 a lane)
+__device__ inline void head_norm_warp(float* t, const float* w, int pos, bool rope, int lane) {
+    float y[4], ss = 0;
+    for (int j = 0; j < 4; ++j) { y[j] = t[lane + 32 * j]; ss += y[j] * y[j]; }
+    ss = warp_sum(ss);
+    const float r = rsqrtf(ss / kHd + kEps);
+    for (int j = 0; j < 4; ++j) y[j] = y[j] * r * w[lane + 32 * j];
+    if (rope) {
+        float o4[4];
+        for (int j = 0; j < 2; ++j) {
+            const int i = lane + 32 * j;
+            const float ang = float(pos) * powf(kRopeBase, -2.f * i / kHd);
+            float sn, cs;
+            sincosf(ang, &sn, &cs);
+            o4[j] = y[j] * cs - y[j + 2] * sn;
+            o4[j + 2] = y[j] * sn + y[j + 2] * cs;
+        }
+        for (int j = 0; j < 4; ++j) y[j] = o4[j];
+    }
+    for (int j = 0; j < 4; ++j) t[lane + 32 * j] = y[j];
+}
 __global__ void __launch_bounds__(256) k_attn_part(const float* q, const kc_t* K, const vc_t* V, float* part,
-                                                   const int* state, bool swa, int kv_mask, int zs = 0) {
+                                                   const int* state, bool swa, int kv_mask, int zs = 0, AttnFuse F = {}) {
     q += blockIdx.z * zs;
     part += size_t(blockIdx.z) * kHeads * kAttnChunks * kPart;
     const int h = blockIdx.x, c = blockIdx.y, kh = h / (kHeads / kKv);
     const int pos = state[0] + blockIdx.z, lo = swa ? max(0, pos - (kWindow - 1)) : 0, n = pos - lo + 1;
     const int per = max(kMinChunk, (n + kAttnChunks - 1) / kAttnChunks), a = lo + c * per, b = min(pos + 1, a + per);
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
-    const float4 qv = *(const float4*) (q + h * kHd + lane * 4);
+    __shared__ __align__(16) float qf[kHd], kf[kHd], vf[kHd];
+    const bool fused = F.qn != nullptr;
+    if (fused) {
+        if (threadIdx.x < kHd) { qf[threadIdx.x] = q[h * kHd + threadIdx.x]; kf[threadIdx.x] = F.k[kh * kHd + threadIdx.x]; vf[threadIdx.x] = F.v[kh * kHd + threadIdx.x]; }
+        __syncthreads();
+        if (w == 0) head_norm_warp(qf, F.qn, pos, swa, lane);
+        else if (w == 1) head_norm_warp(kf, F.kn, pos, swa, lane);
+        __syncthreads();
+        if (c == 0 && h % (kHeads / kKv) == 0 && threadIdx.x < kHd) {
+            const size_t r = size_t(pos & kv_mask) * kKvDim + kh * kHd + threadIdx.x;
+            F.Kw[r] = f2c<kc_t>(kf[threadIdx.x]);
+            F.Vw[r] = f2c<vc_t>(vf[threadIdx.x]);
+        }
+    }
+    const float4 qv = fused ? *(const float4*) (qf + lane * 4) : *(const float4*) (q + h * kHd + lane * 4);
     const float scale = rsqrtf(float(kHd));
     float m = -INFINITY, l = 0;
     float4 o = make_float4(0, 0, 0, 0);
     for (int p = a + w; p < b; p += 8) {
-        const float4 kv = h4(K + size_t(p & kv_mask) * kKvDim + kh * kHd + lane * 4);
+        // (this position, fused: its k / v rounded as the cache will hold them)
+        const bool here = fused && p == pos;
+        const float4 kv = here ? make_float4(c2f(f2c<kc_t>(kf[lane * 4])), c2f(f2c<kc_t>(kf[lane * 4 + 1])), c2f(f2c<kc_t>(kf[lane * 4 + 2])), c2f(f2c<kc_t>(kf[lane * 4 + 3])))
+                               : h4(K + size_t(p & kv_mask) * kKvDim + kh * kHd + lane * 4);
         const float d = warp_sum(qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w) * scale;
         const float mn = fmaxf(m, d), cf = expf(m - mn), e = expf(d - mn);
-        const float4 vv = h4(V + size_t(p & kv_mask) * kKvDim + kh * kHd + lane * 4);
+        const float4 vv = here ? make_float4(c2f(f2c<vc_t>(vf[lane * 4])), c2f(f2c<vc_t>(vf[lane * 4 + 1])), c2f(f2c<vc_t>(vf[lane * 4 + 2])), c2f(f2c<vc_t>(vf[lane * 4 + 3])))
+                               : h4(V + size_t(p & kv_mask) * kKvDim + kh * kHd + lane * 4);
         o.x = o.x * cf + e * vv.x; o.y = o.y * cf + e * vv.y; o.z = o.z * cf + e * vv.z; o.w = o.w * cf + e * vv.w;
         l = l * cf + e;
         m = mn;
@@ -387,9 +430,12 @@ __global__ void __launch_bounds__(256) k_attn_part(const float* q, const kc_t* K
 // LDS and the chunk's record per query head goes to part (k_attn_merge adds the chunks and the sink, as before).
 __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q, const kc_t* __restrict__ K,
                                                     const vc_t* __restrict__ V, float* __restrict__ part,
-                                                    const int* __restrict__ state, int swa, int kv_mask, int zs = 0) {
+                                                    const int* __restrict__ state, int swa, int kv_mask, int zs = 0,
+                                                    AttnFuse F = {}) {
     q += blockIdx.z * zs;
     part += size_t(blockIdx.z) * kHeads * kAttnChunks * kPart;
+    __shared__ __align__(16) float qf8[8][kHd], kf[kHd], vf[kHd];
+    const bool fused = F.qn != nullptr;
     // a warp's V tile (transposed) during the loop; the same LDS holds the warps' outputs for the merge after it
     __shared__ __align__(16) char lds[8 * kHd * (16 + 8) * 2];
     _Float16 (*vt)[kHd][16 + 8] = (_Float16 (*)[kHd][16 + 8]) lds;
@@ -400,11 +446,24 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
     const int pos = state[0] + blockIdx.z, lo = swa ? max(0, pos - (kWindow - 1)) : 0, n = pos - lo + 1;
     const int per = max(kMinChunk, (n + kAttnChunks - 1) / kAttnChunks), a0 = lo + c * per, b0 = min(pos + 1, a0 + per);
     const int hq = kh * (kHeads / kKv) + l16;                // this lane's query head (columns 8-15: none)
+    if (fused) {   // the 8 query heads (warp w: head kh * 8 + w) and this position's k, normed; k / v into the cache
+        for (int i = lane; i < kHd; i += 32) qf8[warp][i] = q[(kh * 8 + warp) * kHd + i];
+        if (warp == 0) for (int i = lane; i < kHd; i += 32) { kf[i] = F.k[kh * kHd + i]; vf[i] = F.v[kh * kHd + i]; }
+        __syncthreads();
+        head_norm_warp(qf8[warp], F.qn, pos, false, lane);
+        if (warp == 0) head_norm_warp(kf, F.kn, pos, false, lane);
+        __syncthreads();
+        if (c == 0 && tid < kHd) {
+            const size_t r = size_t(pos & kv_mask) * kKvDim + kh * kHd + tid;
+            F.Kw[r] = f2c<kc_t>(kf[tid]);
+            F.Vw[r] = f2c<vc_t>(vf[tid]);
+        }
+    }
     pf_v8h qb[8];
 #pragma unroll
     for (int s8 = 0; s8 < 8; ++s8)
 #pragma unroll
-        for (int i = 0; i < 8; ++i) qb[s8][i] = (_Float16) (l16 < 8 ? q[hq * kHd + s8 * 16 + g * 8 + i] : 0.f);
+        for (int i = 0; i < 8; ++i) qb[s8][i] = (_Float16) (l16 < 8 ? (fused ? qf8[l16][s8 * 16 + g * 8 + i] : q[hq * kHd + s8 * 16 + g * 8 + i]) : 0.f);
     const float scale = rsqrtf(float(kHd));
     float m = -INFINITY, l = 0;
     pf_v8f o[8];
@@ -416,7 +475,9 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
             const int p = t0 + l16;
             const bool ok = p < b0;
             const vc_t* vr = V + size_t(p & kv_mask) * kKvDim + kh * kHd + g * 64;
-            if constexpr (sizeof(vc_t) == 2) {
+            if (fused && p == pos)
+                for (int d = 0; d < 64; ++d) vt[warp][g * 64 + d][l16] = (_Float16) c2f(f2c<vc_t>(vf[g * 64 + d]));
+            else if constexpr (sizeof(vc_t) == 2) {
 #pragma unroll
                 for (int d8 = 0; d8 < 8; ++d8) {
                     const pf_v8h vv = ok ? __builtin_bit_cast(pf_v8h, *(const uint4*) (vr + d8 * 8)) : pf_v8h{};
@@ -432,10 +493,14 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
             const int p = t0 + l16;
             const bool ok = p < b0;
             const kc_t* kr = K + size_t(p & kv_mask) * kKvDim + kh * kHd;
+            const bool here = fused && p == pos;
 #pragma unroll
             for (int s8 = 0; s8 < 8; ++s8) {
                 pf_v8h ka;
-                if constexpr (sizeof(kc_t) == 2) ka = ok ? __builtin_bit_cast(pf_v8h, *(const uint4*) (kr + s8 * 16 + g * 8)) : pf_v8h{};
+                if (here)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) ka[i] = (_Float16) c2f(f2c<kc_t>(kf[s8 * 16 + g * 8 + i]));
+                else if constexpr (sizeof(kc_t) == 2) ka = ok ? __builtin_bit_cast(pf_v8h, *(const uint4*) (kr + s8 * 16 + g * 8)) : pf_v8h{};
                 else
 #pragma unroll
                     for (int i = 0; i < 8; ++i) ka[i] = (_Float16) (ok ? c2f(kr[s8 * 16 + g * 8 + i]) : 0.f);
@@ -2158,12 +2223,13 @@ struct Model {
                 k_router<<<kExperts / 4, 128, 0, st>>>(h, l.ffn_norm, l.router, prl, pidx, pw, pdone);
             }
             mv_in({{l.wq, q}, {l.wk, k}, {l.wv, v}}, {kQDim, kKvDim, kKvDim}, h, kHidden, l.attn_norm);
-            k_qkv_post<<<kHeads + kKv, kHd, 0, st>>>(q, k, v, l.q_norm, l.k_norm, l.K, l.V, state, l.swa, l.kv_mask);
+            // (q / k norm, RoPE and the cache write happen inside the attention kernels: AttnFuse)
+            const AttnFuse F{k, v, l.q_norm, l.k_norm, l.K, l.V};
             // the sliding layers (at most 513 keys) keep the per-head kernel; the full layers, whose keys grow with the
             // context, read each key once for the 8 heads sharing it
             static const bool attn_old = std::getenv("FLINT_ATTN_OLD") != nullptr;
-            if (attn_old || l.swa) k_attn_part<<<dim3(kHeads, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask);
-            else k_attn_dec_w<<<dim3(kKv, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask);
+            if (attn_old || l.swa) k_attn_part<<<dim3(kHeads, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask, 0, F);
+            else k_attn_dec_w<<<dim3(kKv, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask, 0, F);
             k_attn_merge<<<kHeads, kHd, 0, st>>>(part, l.sinks, att);
             mv_in({{l.wo, h}}, {kHidden}, att, kQDim, nullptr, nullptr, true);
             if (i < kDense) {
