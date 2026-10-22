@@ -1262,6 +1262,35 @@ __global__ void __launch_bounds__(256) k_pf_router(const float* H, const float* 
     }
     for (int t = 0; t < 16; ++t) if (t0 + t < T) logits[size_t(t0 + t) * kExperts + e] = acc[t];
 }
+// The prompt path's router on the matrix cores: logits (T x 256) = W . x with W the fp16 router copy (exact, scaled by
+// 2^we) and x the split rows already made for the shared expert (xh + xl, times xs: the normed input). Block: 16 tokens;
+// warp w: experts w * 32 .. + 31 (two tiles of 16), A = router rows, B = the tokens' x^T.
+__global__ void __launch_bounds__(256) k_pf_router_w(const uint16_t* __restrict__ xh, const uint16_t* __restrict__ xl,
+                                                     const float* __restrict__ xs, const __half* __restrict__ W, int we,
+                                                     int T, float* __restrict__ logits) {
+    const int t0 = blockIdx.x * 16, lane = threadIdx.x & 31, warp = threadIdx.x >> 5, l16 = lane & 15, g = lane >> 4;
+    const int t = t0 + l16;
+    const bool live = t < T;
+    const uint16_t* bh = xh + size_t(min(t, T - 1)) * kHidden + g * 8;
+    const uint16_t* bl = xl + size_t(min(t, T - 1)) * kHidden + g * 8;
+    const __half* a0 = W + size_t(warp * 32 + l16) * kHidden + g * 8;
+    const __half* a1 = a0 + size_t(16) * kHidden;
+    pf_v8f c0 = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0}, c1 = c0;
+#pragma unroll 4
+    for (int k0 = 0; k0 < kHidden; k0 += 16) {
+        const pf_v8h xb = live ? __builtin_bit_cast(pf_v8h, *(const uint4*) (bh + k0)) : pf_v8h{};
+        const pf_v8h xc = live ? __builtin_bit_cast(pf_v8h, *(const uint4*) (bl + k0)) : pf_v8h{};
+        const pf_v8h w0 = __builtin_bit_cast(pf_v8h, *(const uint4*) (a0 + k0)), w1 = __builtin_bit_cast(pf_v8h, *(const uint4*) (a1 + k0));
+        c0 = pf_wmma(w0, xb, c0); c0 = pf_wmma(w0, xc, c0);
+        c1 = pf_wmma(w1, xb, c1); c1 = pf_wmma(w1, xc, c1);
+    }
+    if (!live) return;
+    // lane: token t, experts warp * 32 + j * 16 + g * 8 + i
+    const float sc = ldexpf(xs[t], -we);
+    float* o = logits + size_t(t) * kExperts + warp * 32 + g * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { o[i] = c0[i] * sc; o[16 + i] = c1[i] * sc; }
+}
 // each token's 1 / rms over the hidden size (one warp a token)
 __global__ void k_pf_rms(const float* H, int T, float* rn) {
     const int t = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
@@ -2658,6 +2687,8 @@ struct Layer {
     kc_t* K = nullptr;   // [slot][K/V head][128]
     vc_t* V = nullptr;
     int kv_mask = 0x7fffffff;              // slot = position & kv_mask (a ring on the sliding layers)
+    const __half* router16 = nullptr;      // the router as fp16, times 2^router_e (every bf16 value exact): prompt path
+    int router_e = 0;
     V8 v8{};                               // the full layers' 8-bit V (then V is unused)
 };
 
@@ -2690,6 +2721,7 @@ struct Model {
     int* host_state;     // pinned copy
     cudaGraphExec_t graph = nullptr;
 
+    int last_router_e = 0;   // (up_tensor's last router: its fp16 copy's power-of-two scale)
     const void* up_tensor(const std::string& name, int type) {
         const strata::TensorInfo* t = g->find(name);
         if (!t) { std::fprintf(stderr, "strata-flint: %s is missing\n", name.c_str()); std::exit(1); }
@@ -2709,6 +2741,14 @@ struct Model {
             }
             CK(cudaMemcpy(d, v.data(), v.size() * 2, cudaMemcpyHostToDevice));
             loaded += v.size() * 2;
+            // and as fp16 in the allocation's other half, scaled by a power of two so the largest is near 2^14 (each
+            // bf16 value then lands exactly): the prompt path's matrix-core router
+            float mx = 0.f;
+            for (size_t i = 0; i < v.size(); ++i) mx = std::max(mx, std::fabs(f[i]));
+            last_router_e = mx > 0.f ? 14 - std::ilogb(mx) : 0;
+            std::vector<__half> hv(v.size());
+            for (size_t i = 0; i < v.size(); ++i) hv[i] = __float2half(std::ldexp(f[i], last_router_e));
+            CK(cudaMemcpy((char*) d + v.size() * 2, hv.data(), v.size() * 2, cudaMemcpyHostToDevice));
             return d;
         }
         CK(cudaMemcpy(d, g->tensor_data(*t), bytes, cudaMemcpyHostToDevice));
@@ -2765,6 +2805,8 @@ struct Model {
                 l.down = (const uint8_t*) up_tensor(b + "ffn_down.weight", kQ4_1);
             } else {
                 l.router = (const uint16_t*) up_tensor(b + "ffn_gate_inp.weight", kF32);
+                l.router16 = (const __half*) (l.router + size_t(kExperts) * kHidden);
+                l.router_e = last_router_e;
                 l.gate_e = (const uint8_t*) up_tensor(b + "ffn_gate_exps.weight", kQ4_1);
                 l.up_e = (const uint8_t*) up_tensor(b + "ffn_up_exps.weight", kQ4_1);
                 l.down_e = (const uint8_t*) up_tensor(b + "ffn_down_exps.weight", kQ4_1);
@@ -3217,8 +3259,11 @@ struct Model {
             pf_gemm(l.gate_s, kFfShared, kHidden, T, pG, kFfShared, 0);
             pf_gemm(l.up_s, kFfShared, kHidden, T, pU, kFfShared, 0);
             // routing (fp32 router on rmsnorm(h))
-            k_pf_rms<<<(T + 7) / 8, 256, 0, st>>>(pH, T, pRN);
-            k_pf_router<<<(T + 15) / 16, 256, 0, st>>>(pH, pRN, l.ffn_norm, l.router, T, pRL);
+            static const bool router_old = std::getenv("FLINT_PF_ROUTER_OLD") != nullptr;
+            if (router_old) {
+                k_pf_rms<<<(T + 7) / 8, 256, 0, st>>>(pH, T, pRN);
+                k_pf_router<<<(T + 15) / 16, 256, 0, st>>>(pH, pRN, l.ffn_norm, l.router, T, pRL);
+            } else k_pf_router_w<<<(T + 15) / 16, 256, 0, st>>>(pXH, pXL, pXS, l.router16, l.router_e, T, pRL);
             CK(cudaMemsetAsync(pCount, 0, kExperts * 4, st));
             k_pf_topk<<<(T + 7) / 8, 256, 0, st>>>(pRL, T, pIdx, pW, pCount);
             k_pf_bounds<<<1, kExperts, 0, st>>>(pCount, pBounds, pFill, pTiles, pNT);
