@@ -87,7 +87,14 @@ class Tokenizer:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
         # pattern: the pre-tokenizer's split (another model family's, from its exported tokenizer.json)
-        self._re = regex.compile(pattern or QWEN35_PATTERN)
+        # a list of patterns: Hugging Face's Sequence of Split(Isolated) pre-tokenizers, applied one after another,
+        # each to every piece the previous one left (matched and unmatched spans both kept, as HF does)
+        if isinstance(pattern, list):
+            self._res = [regex.compile(p) for p in pattern]
+            self._re = None
+        else:
+            self._res = None
+            self._re = regex.compile(pattern or QWEN35_PATTERN)
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -220,7 +227,7 @@ class Tokenizer:
         # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
         # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
         cache = self._piece_ids
-        for piece in self._re.findall(text):
+        for piece in (self._re.findall(text) if self._re is not None else self._isolated_splits(text)):
             got = cache.get(piece)
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
@@ -273,6 +280,24 @@ class Tokenizer:
         if pos < len(text):
             out.extend(self._encode_plain(text[pos:]))
         return out
+
+    def _isolated_splits(self, text: str) -> list[str]:
+        pieces = [text]
+        for rx in self._res:
+            out = []
+            for s in pieces:
+                last = 0
+                for m in rx.finditer(s):
+                    if m.end() == m.start():
+                        continue
+                    if m.start() > last:
+                        out.append(s[last:m.start()])
+                    out.append(m.group())
+                    last = m.end()
+                if last < len(s):
+                    out.append(s[last:])
+            pieces = out
+        return pieces
 
     def encode(self, text: str, parse_special: bool = False, plain=()) -> list[int]:
         """Tokenize `text`.

@@ -18,5 +18,5 @@ cmake -S . -B "$B" -DCMAKE_BUILD_TYPE=Release \
   "-DCMAKE_HIP_FLAGS=-isystem $SDK/include --rocm-path=$SDK --rocm-device-lib-path=$SDK/lib/llvm/amdgcn/bitcode" \
   "-DCMAKE_CXX_FLAGS=-isystem $SDK/include"
 cmake --build "$B" --target strata-flint -j "$(nproc)"
-mkdir -p engine && cp "$B/strata-flint" "engine/$NAME"
+mkdir -p engine && rm -f "engine/$NAME" && cp "$B/strata-flint" "engine/$NAME"   # (rm first: a running server keeps the old file)
 echo "built engine/$NAME"

@@ -798,6 +798,7 @@ class OutputParser:
                  recover: bool = False):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
+        self.opened = False          # a model that writes its own <think> first (Flint): that tag is dropped
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
@@ -1071,6 +1072,13 @@ class OutputParser:
 
     def feed(self, delta: str) -> list[Event]:
         self.buf += delta
+        if self.state == "reasoning" and not self.opened:
+            head = self.buf.lstrip()
+            if head and "<think>".startswith(head) and head != "<think>":
+                return []                            # (perhaps the start of the tag: wait for the rest)
+            if head.startswith("<think>"):
+                self.buf = head[len("<think>"):].lstrip("\n")
+            self.opened = bool(head)
         out: list[Event] = []
         while True:
             if self.state == "rcall":

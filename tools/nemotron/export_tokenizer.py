@@ -13,10 +13,13 @@ if m["type"] != "BPE":
     sys.exit(f"a {m['type']} tokenizer: only byte-level BPE is supported")
 pre = t.get("pre_tokenizer") or {}
 parts = pre.get("pretokenizers", [pre])
-split = next((p for p in parts if p.get("type") == "Split"), None)
-if not split or not any(p.get("type") == "ByteLevel" for p in parts):
-    sys.exit("expected a Split pre-tokenizer followed by ByteLevel")
-pattern = split["pattern"]["Regex"]
+splits = [p for p in parts if p.get("type") == "Split"]
+if not splits or not any(p.get("type") == "ByteLevel" for p in parts):
+    sys.exit("expected Split pre-tokenizers followed by ByteLevel")
+if any(p.get("behavior") != "Isolated" or p.get("invert") for p in splits) and len(splits) > 1:
+    sys.exit("several Split pre-tokenizers: only the Isolated kind is supported")
+pattern = splits[0]["pattern"]["Regex"]
+patterns = [p["pattern"]["Regex"] for p in splits]   # (more than one: applied in order, see strata_tokenizer)
 vocab = dict(m["vocab"])
 types = [1] * (max(vocab.values()) + 1)
 special_ids = {}
@@ -34,7 +37,8 @@ out.mkdir(parents=True, exist_ok=True)
 (out / "token_type.json").write_text(json.dumps(types), encoding="utf-8")
 (out / "tokenizer.json").write_text(json.dumps({
     "model": "gpt2", "pre": "nemotron", "vocab_size": len(types), "n_merges": len(merges), "special_ids": special_ids,
-    "add_bos_token": False, "pre_pattern": pattern, "pre_pattern_source": "the model's tokenizer.json (Split)"},
+    "add_bos_token": False, "pre_pattern": pattern if len(patterns) == 1 else None,
+    **({"pre_patterns": patterns} if len(patterns) > 1 else {}), "pre_pattern_source": "the model's tokenizer.json (Split)"},
     ensure_ascii=False, indent=1), encoding="utf-8")
 shutil.copy(src / "chat_template.jinja", out / "chat_template.jinja")
 print(f"{len(types)} tokens, {len(merges)} merges -> {out}")

@@ -2923,7 +2923,8 @@ class Service:
         # the end markers this tokenizer has as one token: Nemotron has no <|endoftext|>, and spelled out its '<', '|'
         # and '>' each ended a reply; its </s> is one (Qwen's is three, and stays out)
         self.stop_ids = set()
-        for marker in (IM_END, "<|endoftext|>", "</s>"):
+        # (Flint ends a turn with <|end_of_text|> or by starting the next one: <|user|>, <|observation|>, <|developer|>)
+        for marker in (IM_END, "<|endoftext|>", "</s>", "<|end_of_text|>", "<|user|>", "<|observation|>", "<|developer|>"):
             ids = tokenizer.encode(marker, parse_special=True)
             if len(ids) == 1:
                 self.stop_ids.update(ids)
@@ -6318,7 +6319,8 @@ def main() -> int:
         types = json.loads((tpath / "token_type.json").read_text())
         # another model family's split pattern, when its exported tokenizer.json names one (Qwen's is the default)
         tcfg = tpath / "tokenizer.json"
-        pattern = json.loads(tcfg.read_text(encoding="utf-8")).get("pre_pattern") if tcfg.exists() else None
+        tj = json.loads(tcfg.read_text(encoding="utf-8")) if tcfg.exists() else {}
+        pattern = tj.get("pre_patterns") or tj.get("pre_pattern")   # (a list: several splits in order)
         tok = ST.Tokenizer(tokens, merges, types, pattern=pattern)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":

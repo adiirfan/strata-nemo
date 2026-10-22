@@ -1205,6 +1205,17 @@ struct Model {
         if (check) { CK(cudaStreamSynchronize(st)); CK(cudaGetLastError()); }
         ++pos;
     }
+    // the position the next token goes to (a request reusing a shorter prefix than the cache holds)
+    void set_pos(int p) {
+        pos = p;
+        const int v[1] = {p};
+        CK(cudaMemcpyAsync(state, v, 4, cudaMemcpyHostToDevice, st));
+        CK(cudaStreamSynchronize(st));
+    }
+    int ring_rows() const {
+        for (const Layer& l : L) if (l.swa && l.kv_mask != 0x7fffffff) return l.kv_mask + 1;
+        return max_ctx;
+    }
     // the next token as the last step chose it
     int next_token() {
         CK(cudaMemcpyAsync(host_state, state, 8, cudaMemcpyDeviceToHost, st));
@@ -1431,6 +1442,8 @@ struct Model {
 };
 
 
+#include "flint_serve.cuh"
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1438,6 +1451,8 @@ int main(int argc, char** argv) {
     setenv("GPU_MAX_HW_QUEUES", "2", 0);
     std::string path, ids_s, top_path, logits_path;
     int n_new = 0, ctx = 4096;
+    bool serve_mode = false;
+    std::vector<int> eos_ids = {150001, 150003, 150005, 150018};   // <|end_of_text|>, <|user|>, <|observation|>, <|developer|>
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() { if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); } return std::string(argv[++i]); };
@@ -1453,9 +1468,18 @@ int main(int argc, char** argv) {
         else if (a == "--top") top_path = next();
         else if (a == "--logits") logits_path = next();   // every prompt position's logits, fp32
         else if (a == "--max-ctx" || a == "--max-context") ctx = std::stoi(next());
+        else if (a == "--serve") serve_mode = true;
+        else if (a == "--eos-ids") {
+            eos_ids.clear();
+            std::stringstream es(next());
+            for (std::string v; std::getline(es, v, ',');) eos_ids.push_back(std::stoi(v));
+        }
+        // flags Strata's server adds for its own engine (no images; the cache needs no reserve)
+        else if (a == "--vision") {}
+        else if (a == "--vram-reserve-mib") next();
         else { std::fprintf(stderr, "usage: strata-flint --model FILE.gguf --ids 1,2,3|@FILE [--new N] [--top FILE] [--max-ctx N]\n"); return 2; }
     }
-    if (path.empty() || ids_s.empty()) { std::fprintf(stderr, "strata-flint: --model and --ids are needed\n"); return 2; }
+    if (path.empty() || (ids_s.empty() && !serve_mode)) { std::fprintf(stderr, "strata-flint: --model and --ids (or --serve) are needed\n"); return 2; }
     std::vector<int> ids;
     std::stringstream ss(ids_s);
     for (std::string v; std::getline(ss, v, ',');) ids.push_back(std::stoi(v));
@@ -1463,6 +1487,12 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     Model m(path, ctx);
     if (std::getenv("FLINT_GEMM_TEST")) { m.gemm_test(); return 0; }
+    if (serve_mode) {
+        std::fprintf(stderr, "strata-flint: K/V for %d positions: %.2f GB\n", ctx, m.kv_bytes / 1e9);
+        const int ch = std::min(8192, std::getenv("FLINT_CHUNK") ? std::atoi(std::getenv("FLINT_CHUNK")) : 8192);
+        m.pf_alloc(ch);                                   // the prompt path's buffers before READY
+        return serve(m, eos_ids, ch);
+    }
     std::fprintf(stderr, "strata-flint: K/V for %d positions: %.2f GB\n", ctx, m.kv_bytes / 1e9);
     std::fprintf(stderr, "strata-flint: %.1f GB on the card in %.1f s\n", m.loaded / 1e9,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
