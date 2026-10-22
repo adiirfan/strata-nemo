@@ -109,9 +109,11 @@ __device__ inline float4 ld_ntf(const void* p) {
     return make_float4(v.x, v.y, v.z, v.w);
 }
 __device__ inline int k8_perm(int d) { return ((d >> 3) & 1) * 64 + (d >> 4) * 8 + (d & 7); }
+// a key row's 128 bytes (head kh, position slot): the 16 rows of a group and head side by side, as V's groups
+__device__ inline size_t k8_row(size_t slot, int kh) { return ((slot >> 4) * kKv + kh) * (kHd * 16) + (slot & 15) * kHd; }
 __device__ inline void k8_put(V8 st, size_t slot, int kh, int i, float k, float amax) {
     const float d = amax > 0.f ? amax / 127.f : 1.f;
-    st.kq[(slot * kKv + kh) * kHd + k8_perm(i)] = int8_t(max(-127.f, min(127.f, rintf(k / d))));
+    st.kq[k8_row(slot, kh) + k8_perm(i)] = int8_t(max(-127.f, min(127.f, rintf(k / d))));
     if (i == 0) st.ks[v8_si(slot, kh)] = d;
 }
 template <class T> __device__ inline T f2c(float v);
@@ -594,7 +596,7 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
             const bool ok = pk < b0;
             const size_t sk = size_t(pk & kv_mask);
             if (v8.kq) {   // (8-bit K: the lane's 64 bytes, and the scales of keys pk ..)
-                const uint4* kr = (const uint4*) (v8.kq + (size_t(p & kv_mask) * kKv + kh) * kHd + g * 64);
+                const uint4* kr = (const uint4*) (v8.kq + k8_row(size_t(p & kv_mask), kh) + g * 64);
 #pragma unroll
                 for (int s4 = 0; s4 < 4; ++s4) kn[s4] = p < b0 ? ld_nt(kr + s4) : make_uint4(0, 0, 0, 0);
                 const float* kp = v8.ks + v8_si(sk, kh);
@@ -2339,7 +2341,7 @@ __global__ void __launch_bounds__(256) k_pf_attn_w2(const float* __restrict__ QK
             rk[0] = __builtin_bit_cast(uint4, a); rk[1] = __builtin_bit_cast(uint4, b);
             rks = 1.f;
         } else if (v8.kq) {   // stored positions lc .. + 15: dims s * 16 + h * 8 + i and (s + 1) * 16 + h * 8 + i
-            const uint4 u = ok ? *(const uint4*) (v8.kq + (size_t(p & kv_mask) * kKv + kh) * kHd + lc) : make_uint4(0, 0, 0, 0);
+            const uint4 u = ok ? *(const uint4*) (v8.kq + k8_row(size_t(p & kv_mask), kh) + lc) : make_uint4(0, 0, 0, 0);
             const int8_t* b8 = (const int8_t*) &u;
             pf_v8h a, b;
             for (int i = 0; i < 8; ++i) { a[i] = (_Float16) b8[i]; b[i] = (_Float16) b8[8 + i]; }
