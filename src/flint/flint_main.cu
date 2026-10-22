@@ -1123,18 +1123,71 @@ __device__ inline void q4_rows_s(const uint8_t* W, size_t rowb, int nb, const fl
             *(float4*) (sb + t * 256 + c) = xp[t] ? *(const float4*) (xp[t] + kc + c) : make_float4(0, 0, 0, 0);
         }
         __syncthreads();
+        // each row's 8 weights unpacked once (d * q + m, fp32), then 8 products a token
+        float wv[R][8];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint32_t dm = dmv[r], q = qv[r];
+            const float d = __half2float(__ushort_as_half(uint16_t(dm))), m = __half2float(__ushort_as_half(uint16_t(dm >> 16)));
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { wv[r][i] = d * float((q >> (8 * i)) & 15) + m; wv[r][4 + i] = d * float((q >> (8 * i + 4)) & 15) + m; }
+        }
 #pragma unroll
         for (int t = 0; t < T; ++t) {
             const float* xs = sb + t * 256 + bl * 32;
             const float4 xa = *(const float4*) (xs + qd * 4), xb = *(const float4*) (xs + 16 + qd * 4);
-            const float sx = xa.x + xa.y + xa.z + xa.w + xb.x + xb.y + xb.z + xb.w;
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+                acc[r][t] += wv[r][0] * xa.x + wv[r][1] * xa.y + wv[r][2] * xa.z + wv[r][3] * xa.w
+                           + wv[r][4] * xb.x + wv[r][5] * xb.y + wv[r][6] * xb.z + wv[r][7] * xb.w;
+        }
+        __syncthreads();
+    }
+}
+
+// R rows (each its own pointer: gate and up rows can share a pass) against nt <= T inputs xp[0..nt), staged through LDS
+// 1024 values at a time (sb: T x 1024 floats); each weight is unpacked once for all nt. acc[r][i]: input i's partial.
+constexpr int kVSl = 1024;
+template <int R, int T>
+__device__ inline void q4_rows_p(const uint8_t* const* W, int nb, const float* const* xp, int nt, float* sb, int lane,
+                                 float (*acc)[T]) {
+    const int qd = lane & 3, bl = lane >> 2;
+    for (int kc = 0; kc < nb * 32; kc += kVSl) {
+        const int kn = min(kVSl, nb * 32 - kc);
+        for (int i = threadIdx.x; i < nt * (kn / 4); i += 256) {
+            const int t = i / (kn / 4), c = (i % (kn / 4)) * 4;
+            *(float4*) (sb + t * kVSl + c) = *(const float4*) (xp[t] + kc + c);
+        }
+        __syncthreads();
+        for (int b = kc / 32 + bl; b < kc / 32 + kn / 32; b += 8) {
+            uint32_t dmv[R], qv[R];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
-                const uint32_t dm = dmv[r], q = qv[r];
-                const float d = __half2float(__ushort_as_half(uint16_t(dm))), m = __half2float(__ushort_as_half(uint16_t(dm >> 16)));
-                const float tt = float(q & 15) * xa.x + float((q >> 8) & 15) * xa.y + float((q >> 16) & 15) * xa.z + float((q >> 24) & 15) * xa.w
-                               + float((q >> 4) & 15) * xb.x + float((q >> 12) & 15) * xb.y + float((q >> 20) & 15) * xb.z + float(q >> 28) * xb.w;
-                acc[r][t] += d * tt + m * sx;
+                const uint8_t* B = W[r] + size_t(b) * 20;
+                dmv[r] = *(const uint32_t*) B;
+                qv[r] = *(const uint32_t*) (B + 4 + qd * 4);
+            }
+            const int off = b * 32 - kc;
+#pragma unroll
+            for (int r0 = 0; r0 < R; r0 += 4) {   // (4 rows unpacked at a time: registers)
+                float wv[4][8];
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    const uint32_t dm = dmv[r0 + r], q = qv[r0 + r];
+                    const float d = __half2float(__ushort_as_half(uint16_t(dm))), m = __half2float(__ushort_as_half(uint16_t(dm >> 16)));
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) { wv[r][i] = d * float((q >> (8 * i)) & 15) + m; wv[r][4 + i] = d * float((q >> (8 * i + 4)) & 15) + m; }
+                }
+#pragma unroll
+                for (int t = 0; t < T; ++t) {
+                    if (t >= nt) break;
+                    const float* xs = sb + t * kVSl + off;
+                    const float4 xa = *(const float4*) (xs + qd * 4), xb = *(const float4*) (xs + 16 + qd * 4);
+#pragma unroll
+                    for (int r = 0; r < 4; ++r)
+                        acc[r0 + r][t] += wv[r][0] * xa.x + wv[r][1] * xa.y + wv[r][2] * xa.z + wv[r][3] * xa.w
+                                        + wv[r][4] * xb.x + wv[r][5] * xb.y + wv[r][6] * xb.z + wv[r][7] * xb.w;
+                }
             }
         }
         __syncthreads();
@@ -1152,16 +1205,19 @@ struct MvV {
 };
 template <int T>
 __global__ void __launch_bounds__(256) k_v_mv(MvV J) {
-    __shared__ __align__(16) float sb[T * 256];
+    __shared__ __align__(16) float sb[T * kVSl];
     int rb = blockIdx.x * kMvRows, j = 0;
     while (j < J.nmat - 1 && rb >= J.rows[j]) rb -= J.rows[j++];
     const int lane = threadIdx.x & 31, r0 = rb + (threadIdx.x >> 5) * kMvRpw, nb = J.n_in / 32;
     const size_t rowb = size_t(nb) * 20;
-    float acc[kMvRpw][kVMax] = {};
+    float acc[kMvRpw][T] = {};
     const float* xp[T];
 #pragma unroll
     for (int t = 0; t < T; ++t) xp[t] = J.X + size_t(t) * J.ldx;
-    q4_rows_s<kMvRpw, T>(J.w[j] + size_t(r0) * rowb, rowb, nb, xp, sb, lane, acc);
+    const uint8_t* wr[kMvRpw];
+#pragma unroll
+    for (int r = 0; r < kMvRpw; ++r) wr[r] = J.w[j] + size_t(r0 + r) * rowb;
+    q4_rows_p<kMvRpw, T>(wr, nb, xp, T, sb, lane, acc);
 #pragma unroll
     for (int t = 0; t < T; ++t)
 #pragma unroll
@@ -1238,7 +1294,7 @@ template <int T>
 __global__ void __launch_bounds__(256) k_v_moe_gu(const float* X, const uint8_t* ge, const uint8_t* ue_, const uint8_t* gs,
                                                   const uint8_t* us, const int* ue, const int* um, const int* vu,
                                                   const int* un, float* act) {
-    __shared__ __align__(16) float sb[T * 256];
+    __shared__ __align__(16) float sb[T * kVSl];
     const int u = blockIdx.y;
     const bool shared = u == kVUniq;
     if (!shared && (u >= *un || blockIdx.x * kMvRows >= kFfExp)) return;
@@ -1251,12 +1307,15 @@ __global__ void __launch_bounds__(256) k_v_moe_gu(const float* X, const uint8_t*
     int tl[kVMax], nt = 0;
     const int mask = shared ? (1 << T) - 1 : um[u];
     for (int t = 0; t < T; ++t) if (mask >> t & 1) tl[nt++] = t;
-    float g[kMvRpw][kVMax] = {}, uu[kMvRpw][kVMax] = {};
+    // gate rows 0-3 and up rows 4-7 in one pass over the masked tokens' inputs only (packed: input i is token tl[i])
+    float acc[2 * kMvRpw][T] = {};
     const float* xp[T];
 #pragma unroll
-    for (int t = 0; t < T; ++t) xp[t] = (mask >> t & 1) ? X + size_t(t) * kHidden : nullptr;
-    q4_rows_s<kMvRpw, T>(G, rowb, kHidden / 32, xp, sb, lane, g);
-    q4_rows_s<kMvRpw, T>(U, rowb, kHidden / 32, xp, sb, lane, uu);
+    for (int i = 0; i < T; ++i) xp[i] = i < nt ? X + size_t(tl[i]) * kHidden : nullptr;
+    const uint8_t* wr[2 * kMvRpw];
+#pragma unroll
+    for (int r = 0; r < kMvRpw; ++r) { wr[r] = G + size_t(r) * rowb; wr[kMvRpw + r] = U + size_t(r) * rowb; }
+    q4_rows_p<2 * kMvRpw, T>(wr, kHidden / 32, xp, nt, sb, lane, acc);
     for (int i = 0; i < nt; ++i) {
         const int t = tl[i];
         int k = 0;
@@ -1264,7 +1323,7 @@ __global__ void __launch_bounds__(256) k_v_moe_gu(const float* X, const uint8_t*
         float* a = act + size_t(t) * kActRows + (shared ? kTopK * kFfExp : k * kFfExp);
 #pragma unroll
         for (int r = 0; r < kMvRpw; ++r) {
-            const float gv = warp_sum(g[r][t]), uv = warp_sum(uu[r][t]);
+            const float gv = warp_sum(acc[r][i]), uv = warp_sum(acc[kMvRpw + r][i]);
             if (lane == 0) a[row + r] = silu(gv) * uv;
         }
     }
@@ -1274,36 +1333,43 @@ template <int T>
 __global__ void __launch_bounds__(256) k_v_moe_down(float* H, const float* act, const uint8_t* de, const uint8_t* ds,
                                                     const int* ue, const int* um, const int* vu, const float* wts,
                                                     const int* un) {
-    __shared__ __align__(16) float sb[T * 256];
+    __shared__ __align__(16) float sb[T * kVSl];
     const int lane = threadIdx.x & 31, r0 = blockIdx.x * kMvRows + (threadIdx.x >> 5) * kMvRpw;
     constexpr size_t rowe = size_t(kFfExp / 32) * 20, rows_ = size_t(kFfShared / 32) * 20;
-    float tot[kMvRpw][kVMax] = {};
+    float tot[kMvRpw][T] = {};
     const int n = *un;
     for (int u = 0; u < n; ++u) {
         const int e = ue[u], mask = um[u];
         const float* xp[T];
         float wk[T];
+        int tl[T], nt = 0;
 #pragma unroll
         for (int t = 0; t < T; ++t) {
-            xp[t] = nullptr; wk[t] = 0.f;
+            xp[t] = nullptr; wk[t] = 0.f; tl[t] = 0;
             if (mask >> t & 1) {
                 int k = 0;
                 while (vu[t * kTopK + k] != u) ++k;
-                xp[t] = act + size_t(t) * kActRows + k * kFfExp;
-                wk[t] = wts[t * kTopK + k];
+                xp[nt] = act + size_t(t) * kActRows + k * kFfExp;
+                wk[nt] = wts[t * kTopK + k];
+                tl[nt++] = t;
             }
         }
-        float a[kMvRpw][kVMax] = {};
-        q4_rows_s<kMvRpw, T>(de + (size_t(e) * kHidden + r0) * rowe, rowe, kFfExp / 32, xp, sb, lane, a);
+        float a[kMvRpw][T] = {};
+        const uint8_t* wr[kMvRpw];
 #pragma unroll
-        for (int t = 0; t < T; ++t)
+        for (int r = 0; r < kMvRpw; ++r) wr[r] = de + (size_t(e) * kHidden + r0 + r) * rowe;
+        q4_rows_p<kMvRpw, T>(wr, kFfExp / 32, xp, nt, sb, lane, a);
+        for (int i = 0; i < nt; ++i)
 #pragma unroll
-            for (int r = 0; r < kMvRpw; ++r) tot[r][t] += wk[t] * a[r][t];
+            for (int r = 0; r < kMvRpw; ++r) tot[r][tl[i]] += wk[i] * a[r][i];
     }
     const float* xs_[T];
 #pragma unroll
     for (int t = 0; t < T; ++t) xs_[t] = act + size_t(t) * kActRows + kTopK * kFfExp;
-    q4_rows_s<kMvRpw, T>(ds + size_t(r0) * rows_, rows_, kFfShared / 32, xs_, sb, lane, tot);
+    const uint8_t* wsr[kMvRpw];
+#pragma unroll
+    for (int r = 0; r < kMvRpw; ++r) wsr[r] = ds + size_t(r0 + r) * rows_;
+    q4_rows_p<kMvRpw, T>(wsr, kFfShared / 32, xs_, T, sb, lane, tot);
 #pragma unroll
     for (int t = 0; t < T; ++t)
 #pragma unroll
@@ -1497,21 +1563,22 @@ __global__ void __launch_bounds__(128) k_vr_pick(const float* logits, int T, int
         }
         if (lane == 0) for (int k = 0; k < kTopK; ++k) { sidx[t * kTopK + k] = pi[k]; idx[t * kTopK + k] = pi[k]; wts[t * kTopK + k] = pv[k] / tot; }
     }
+    // the distinct experts in parallel (a serial loop here took 60 us): each expert's token mask, then their order
+    __shared__ int emask[kExperts], epos[kExperts], cnt;
+    for (int e = threadIdx.x; e < kExperts; e += 128) emask[e] = 0;
     __syncthreads();
-    if (threadIdx.x == 0) {   // (in LDS: a loop over global memory here took 60 us)
+    if (threadIdx.x < T * kTopK) atomicOr(&emask[sidx[threadIdx.x]], 1 << (threadIdx.x / kTopK));
+    __syncthreads();
+    if (threadIdx.x == 0) {
         int n = 0;
-        for (int t = 0; t < T; ++t)
-            for (int k = 0; k < kTopK; ++k) {
-                const int x = sidx[t * kTopK + k];
-                int u = 0;
-                while (u < n && sue[u] != x) ++u;
-                if (u == n) { sue[n] = x; sum_[n] = 0; ++n; }
-                sum_[u] |= 1 << t;
-                vu[t * kTopK + k] = u;
-            }
-        for (int u = 0; u < n; ++u) { ue[u] = sue[u]; um[u] = sum_[u]; }
-        *un = n;
+        for (int e = 0; e < kExperts; ++e) if (emask[e]) { epos[e] = n; sue[n] = e; sum_[n] = emask[e]; ++n; }
+        cnt = n;
     }
+    __syncthreads();
+    const int n = cnt;
+    for (int u = threadIdx.x; u < n; u += 128) { ue[u] = sue[u]; um[u] = sum_[u]; }
+    if (threadIdx.x < T * kTopK) vu[threadIdx.x] = epos[sidx[threadIdx.x]];
+    if (threadIdx.x == 0) *un = n;
 }
 
 // ---------------------------------------------------------------------------------------------------- the model
@@ -1778,8 +1845,8 @@ struct Model {
         k_argmax_rows<<<T, 1024, 0, st>>>(vLG, vocab, vBest);
     }
     void v_record(int T) {
-        static const bool simt = std::getenv("FLINT_VSIMT") != nullptr;
-        if (!simt) { v_record_mu(T); return; }
+        static const bool mu = std::getenv("FLINT_VMU") != nullptr;
+        if (mu) { v_record_mu(T); return; }
         const int NQKV = kQDim + 2 * kKvDim;
         k_v_embed<<<T, 256, 0, st>>>(embed, vToks, vH);
         for (int i = 0; i < kLayers; ++i) {
@@ -1798,7 +1865,8 @@ struct Model {
                 v_mv({{l.down, vH}}, {kHidden}, vG, kFfDense, kFfDense, T, kHidden, true);
                 continue;
             }
-            k_v_router<<<kExperts / 4, 128, 0, st>>>(vX, l.router, T, vRL, vIdx, vW, vUe, vUm, vVu, vUn, vDone);
+            vdispatch(T, [&](auto tc) { k_vr<decltype(tc)::value><<<kExperts / 4, 128, 0, st>>>(vX, l.router, vRL); });
+            k_vr_pick<<<1, 128, 0, st>>>(vRL, T, vIdx, vW, vUe, vUm, vVu, vUn);
             vdispatch(T, [&](auto tc) {
                 constexpr int TT = decltype(tc)::value;
                 k_v_moe_gu<TT><<<dim3(kFfShared / kMvRows, kVUniq + 1), 256, 0, st>>>(vX, l.gate_e, l.up_e, l.gate_s, l.up_s, vUe, vUm, vVu, vUn, vACT);
@@ -2133,6 +2201,20 @@ int main(int argc, char** argv) {
             for (int i = 0; i < 8; ++i) { same += m.vBestHost[i] == seq[start + i + 1]; ++total; }
         }
         std::printf("checking pass agrees with plain writing on %d of %d next tokens\n", same, total);
+        {   // how many distinct experts T tokens use in a layer (the last layer's count after a pass)
+            for (int T : {1, 2, 4, 8}) {
+                double sum = 0;
+                int n = 0;
+                for (int start = 0; start + T <= 40; start += T) {
+                    m.set_pos(p0 + start);
+                    m.verify(seq.data() + start, T);
+                    int un = 0;
+                    CK(cudaMemcpy(&un, m.vUn, 4, cudaMemcpyDeviceToHost));
+                    sum += un; ++n;
+                }
+                std::printf("%d tokens: %.1f distinct experts in the last layer (of %d chosen)\n", T, sum / n, 6 * T);
+            }
+        }
         for (int T = 1; T <= kVMax; ++T) {
             m.set_pos(p0);
             for (int r = 0; r < 3; ++r) m.verify(seq.data(), T);
