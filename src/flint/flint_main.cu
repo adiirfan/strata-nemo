@@ -44,6 +44,9 @@ constexpr int kWindow = 513;
 #ifndef FLINT_SELFROUND
 #define FLINT_SELFROUND 0   // (the current position's V rounded as stored, in its own attention)
 #endif
+#ifndef FLINT_CHUNKS
+#define FLINT_CHUNKS 16   // attention: a query's keys in up to this many parts
+#endif
 #ifndef FLINT_MINCHUNK
 #define FLINT_MINCHUNK 64   // attention: at least this many keys a chunk (short contexts: fewer chunks to merge)
 #endif
@@ -368,7 +371,7 @@ __global__ void k_qkv_post(float* q, const float* k, const float* v, const float
 // Split attention for one query position: block (h, c) takes chunk c of the keys lo..pos (kAttnChunks equal parts)
 // for query head h; each warp walks its keys with an online softmax (lane = 4 of the 128 dims), the 8 warps merge in
 // LDS, and the chunk's (max, sum, unnormalized output) goes to part. k_attn_merge adds the chunks and the sink.
-constexpr int kAttnChunks = 16, kPart = kHd + 4, kMinChunk = FLINT_MINCHUNK;   // a chunk's record: max, sum, 2 spare, 128 outputs
+constexpr int kAttnChunks = FLINT_CHUNKS, kPart = kHd + 4, kMinChunk = FLINT_MINCHUNK;   // a chunk's record: max, sum, 2 spare, 128 outputs
 __device__ inline float4 h4(const float* p) { return *(const float4*) p; }
 __device__ inline float4 h4(const __half* p) {
     const uint2 u = *(const uint2*) p;
@@ -2174,12 +2177,15 @@ __global__ void __launch_bounds__(256) k_pf_attn_w2(const float* __restrict__ QK
         qpos[j] = p0 + min(tq, T - 1);
         qlo[j] = swa ? max(0, qpos[j] - (kWindow - 1)) : 0;
         const float* qr = QKV + size_t(min(tq, T - 1)) * LDQ + h * kHd;
+        // (1 / sqrt(128) and log2(e) folded into q: the scores come out in the log2 domain, for the bare exp2)
+        const float qs = rsqrtf(float(kHd)) * 1.4426950408889634f;
 #pragma unroll
         for (int s8 = 0; s8 < 8; ++s8)
 #pragma unroll
-            for (int i = 0; i < 8; ++i) qb[j][s8][i] = (_Float16) qr[s8 * 16 + g * 8 + i];
+            for (int i = 0; i < 8; ++i) qb[j][s8][i] = (_Float16) (qr[s8 * 16 + g * 8 + i] * qs);
     }
-    const float scale = rsqrtf(float(kHd));
+    // the tiles every query of this block sees whole (no mask needed): keys [all_lo, all_hi]
+    const int all_hi = p0 + q0, all_lo = swa ? p0 + min(q0 + NQ - 1, T - 1) - (kWindow - 1) : 0;
     float m[QT], l[QT];
     pf_v8f o[QT][8];
 #pragma unroll
@@ -2251,32 +2257,48 @@ __global__ void __launch_bounds__(256) k_pf_attn_w2(const float* __restrict__ QK
             }
             pf_v8h pb[QT];
             float cf[QT];
+            const int kb0 = k0 + sub * 16;
+            const bool whole = kb0 >= all_lo && kb0 + 15 <= all_hi;   // (masks only on the edge tiles)
 #pragma unroll
             for (int j = 0; j < QT; ++j) {
                 float mx = -INFINITY, v[8];
+                if (whole && live[j]) {
 #pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    const int p = k0 + sub * 16 + g * 8 + i;
-                    v[i] = (live[j] && p >= qlo[j] && p <= qpos[j]) ? sc[j][i] * scale : -INFINITY;
-                    mx = fmaxf(mx, v[i]);
+                    for (int i = 0; i < 8; ++i) { v[i] = sc[j][i]; mx = fmaxf(mx, v[i]); }
+                } else {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        const int p = kb0 + g * 8 + i;
+                        v[i] = (live[j] && p >= qlo[j] && p <= qpos[j]) ? sc[j][i] : -INFINITY;
+                        mx = fmaxf(mx, v[i]);
+                    }
                 }
-                mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+                mx = fmaxf(mx, __int_as_float((int) __builtin_amdgcn_permlanex16((unsigned) __float_as_int(mx), (unsigned) __float_as_int(mx),
+                                                                                    0x76543210u, 0xfedcba98u, false, false)));
                 const float mn = fmaxf(m[j], mx), ref = mn == -INFINITY ? 0.f : mn;
-                cf[j] = expf(m[j] - ref);
+                cf[j] = __builtin_amdgcn_exp2f(m[j] - ref);
                 m[j] = mn;
                 float ps = 0;
+                uint32_t w[4];
 #pragma unroll
-                for (int i = 0; i < 8; ++i) { const float e = expf(v[i] - ref); ps += e; pb[j][i] = (_Float16) e; }
+                for (int i = 0; i < 8; i += 2) {
+                    const float e0 = __builtin_amdgcn_exp2f(v[i] - ref), e1 = __builtin_amdgcn_exp2f(v[i + 1] - ref);
+                    ps += e0 + e1;
+                    w[i / 2] = __builtin_bit_cast(uint32_t, pf_v2h{(_Float16) e0, (_Float16) e1});   // (round to nearest: rtz cost KL)
+                }
+                pb[j] = __builtin_bit_cast(pf_v8h, make_uint4(w[0], w[1], w[2], w[3]));
                 l[j] = l[j] * cf[j] + ps;
             }
+#pragma unroll
+            for (int j = 0; j < QT; ++j)
+                if (__any(cf[j] != 1.f))   // (rare after the first tiles)
+#pragma unroll
+                    for (int d = 0; d < 8; ++d) o[j][d] = o[j][d] * cf[j];
 #pragma unroll
             for (int d = 0; d < 8; ++d) {
                 const pf_v8h va = *(const pf_v8h*) &vt[buf][d * 16 + l16][sub * 16 + g * 8];
 #pragma unroll
-                for (int j = 0; j < QT; ++j) {
-                    o[j][d] = o[j][d] * cf[j];
-                    o[j][d] = pf_wmma(va, pb[j], o[j][d]);
-                }
+                for (int j = 0; j < QT; ++j) o[j][d] = pf_wmma(va, pb[j], o[j][d]);
             }
         }
         if (more) store(buf ^ 1);
@@ -2287,8 +2309,8 @@ __global__ void __launch_bounds__(256) k_pf_attn_w2(const float* __restrict__ QK
     for (int j = 0; j < QT; ++j) {
         const float lt = l[j] + __shfl_xor(l[j], 16, 32);
         if (!live[j]) continue;
-        const float sk = sinks[h], M = fmaxf(m[j], sk);
-        const float f = expf(m[j] - M), L = lt * f + expf(sk - M);
+        const float sk = sinks[h] * 1.4426950408889634f, M = fmaxf(m[j], sk);   // (log2 domain)
+        const float f = exp2f(m[j] - M), L = lt * f + exp2f(sk - M);
         float* out = ATT + size_t(q0 + j * 16 + l16) * kQDim + h * kHd;
 #pragma unroll
         for (int d = 0; d < 8; ++d)
