@@ -81,6 +81,24 @@ __device__ inline float block_sum(float v, float* sh) {
     return r;
 }
 
+// the matrix units (gfx12 WMMA 16x16x16, fp16 in, fp32 sums)
+typedef _Float16 pf_v8h __attribute__((ext_vector_type(8)));
+typedef float pf_v8f __attribute__((ext_vector_type(8)));
+typedef _Float16 pf_v2h __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ pf_v8f pf_wmma(const pf_v8h& a, const pf_v8h& b, const pf_v8f& c) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#else
+    __trap();
+    return c;
+#endif
+}
+// LDS-only barrier (a __syncthreads' fence also covers global memory and invalidates the vector caches on gfx12)
+__device__ __forceinline__ void pf_sync() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
 constexpr int kMvRows = 32, kMvRpw = 4;
 // Stage n_in inputs into LDS: x, or rmsnorm(x) * nw when nw, or silu(x) * x2 when x2. 256 threads.
 __device__ inline void stage_in(float* xs, const float* x, const float* nw, const float* x2, int n_in) {
@@ -354,6 +372,119 @@ __global__ void __launch_bounds__(256) k_attn_part(const float* q, const kc_t* K
         *(float4*) (P + 4 + lane * 4) = O;
     }
 }
+
+// Writing-path attention on the matrix units: the 8 query heads of a K/V head stand in for the "queries" of the prompt
+// kernel (columns 0-7 of the 16), so each key and value is read once for all 8. Block (K/V head, chunk c of
+// kAttnChunks): its 8 warps take the chunk's 16-key tiles in turn, each keeping its own online softmax; they merge in
+// LDS and the chunk's record per query head goes to part (k_attn_merge adds the chunks and the sink, as before).
+__global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q, const kc_t* __restrict__ K,
+                                                    const vc_t* __restrict__ V, float* __restrict__ part,
+                                                    const int* __restrict__ state, int swa, int kv_mask) {
+    // a warp's V tile (transposed) during the loop; the same LDS holds the warps' outputs for the merge after it
+    __shared__ __align__(16) char lds[8 * kHd * (16 + 8) * 2];
+    _Float16 (*vt)[kHd][16 + 8] = (_Float16 (*)[kHd][16 + 8]) lds;
+    float (*wo)[8][kHd] = (float (*)[8][kHd]) lds;
+    __shared__ float wm[8][8], wl[8][8];
+    const int kh = blockIdx.x, c = blockIdx.y;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, l16 = lane & 15, g = lane >> 4;
+    const int pos = state[0], lo = swa ? max(0, pos - (kWindow - 1)) : 0, n = pos - lo + 1;
+    const int per = (n + kAttnChunks - 1) / kAttnChunks, a0 = lo + c * per, b0 = min(pos + 1, a0 + per);
+    const int hq = kh * (kHeads / kKv) + l16;                // this lane's query head (columns 8-15: none)
+    pf_v8h qb[8];
+#pragma unroll
+    for (int s8 = 0; s8 < 8; ++s8)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) qb[s8][i] = (_Float16) (l16 < 8 ? q[hq * kHd + s8 * 16 + g * 8 + i] : 0.f);
+    const float scale = rsqrtf(float(kHd));
+    float m = -INFINITY, l = 0;
+    pf_v8f o[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) o[j] = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    for (int t0 = a0 + warp * 16; t0 < b0; t0 += 8 * 16) {
+        // V tile: lane takes key t0 + l16, dims g * 64 .. + 63, into vt transposed
+        {
+            const int p = t0 + l16;
+            const bool ok = p < b0;
+            const vc_t* vr = V + size_t(p & kv_mask) * kKvDim + kh * kHd + g * 64;
+            if constexpr (sizeof(vc_t) == 2) {
+#pragma unroll
+                for (int d8 = 0; d8 < 8; ++d8) {
+                    const pf_v8h vv = ok ? __builtin_bit_cast(pf_v8h, *(const uint4*) (vr + d8 * 8)) : pf_v8h{};
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) vt[warp][g * 64 + d8 * 8 + i][l16] = vv[i];
+                }
+            } else
+                for (int d = 0; d < 64; ++d) vt[warp][g * 64 + d][l16] = (_Float16) (ok ? c2f(vr[d]) : 0.f);
+        }
+        // S^T: A = K rows straight from the cache (lane: key t0 + l16, dims s * 16 + g * 8 ..)
+        pf_v8f sc = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+        {
+            const int p = t0 + l16;
+            const bool ok = p < b0;
+            const kc_t* kr = K + size_t(p & kv_mask) * kKvDim + kh * kHd;
+#pragma unroll
+            for (int s8 = 0; s8 < 8; ++s8) {
+                pf_v8h ka;
+                if constexpr (sizeof(kc_t) == 2) ka = ok ? __builtin_bit_cast(pf_v8h, *(const uint4*) (kr + s8 * 16 + g * 8)) : pf_v8h{};
+                else
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) ka[i] = (_Float16) (ok ? c2f(kr[s8 * 16 + g * 8 + i]) : 0.f);
+                sc = pf_wmma(ka, qb[s8], sc);
+            }
+        }
+        // lane: head column l16, keys t0 + g * 8 + i
+        float mx = -INFINITY, v[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int p = t0 + g * 8 + i;
+            v[i] = (l16 < 8 && p < b0) ? sc[i] * scale : -INFINITY;
+            mx = fmaxf(mx, v[i]);
+        }
+        mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+        const float mn = fmaxf(m, mx), ref = mn == -INFINITY ? 0.f : mn;
+        const float cf = expf(m - ref);
+        m = mn;
+        pf_v8h pb;
+        float ps = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { const float e = expf(v[i] - ref); ps += e; pb[i] = (_Float16) e; }
+        l = l * cf + ps;
+        __builtin_amdgcn_wave_barrier();
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            o[j] = o[j] * cf;
+            const pf_v8h va = *(const pf_v8h*) &vt[warp][j * 16 + l16][g * 8];
+            o[j] = pf_wmma(va, pb, o[j]);
+        }
+        __builtin_amdgcn_wave_barrier();
+    }
+    l += __shfl_xor(l, 16, 32);
+    __syncthreads();   // (every warp done with its V tile before the outputs overwrite them)
+    // merge the 8 warps: lane (head l16 < 8, half g) has dims j * 16 + g * 8 + i
+    if (l16 < 8) {
+        if (g == 0) { wm[warp][l16] = m; wl[warp][l16] = l; }
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) wo[warp][l16][j * 16 + g * 8 + i] = o[j][i];
+    }
+    __syncthreads();
+    // thread t: head t / 32 (0-7), dims (t % 32) * 4 .. + 3
+    const int hh = tid >> 5, d0 = (tid & 31) * 4;
+    float M = -INFINITY;
+    for (int w = 0; w < 8; ++w) M = fmaxf(M, wm[w][hh]);
+    float Ls = 0, O[4] = {};
+    for (int w = 0; w < 8; ++w) {
+        if (wm[w][hh] == -INFINITY) continue;
+        const float f = expf(wm[w][hh] - M);
+        Ls += wl[w][hh] * f;
+        for (int i = 0; i < 4; ++i) O[i] += wo[w][hh][d0 + i] * f;
+    }
+    float* P = part + (size_t(kh * (kHeads / kKv) + hh) * kAttnChunks + c) * kPart;
+    if (d0 == 0) { P[0] = M; P[1] = Ls; }
+    for (int i = 0; i < 4; ++i) P[4 + d0 + i] = O[i];
+}
+
 __global__ void k_attn_merge(const float* part, const float* sinks, float* out) {
     const int h = blockIdx.x, t = threadIdx.x;   // 128 threads
     const float* P = part + size_t(h) * kAttnChunks * kPart;
@@ -431,23 +562,6 @@ __global__ void k_embed(const float* table, const int* state, float* h) {
 // Inputs go to the matrix units as two fp16 numbers a value, hi + lo (hi = fp16(x * s), lo = fp16(x * s - hi), s a
 // power of two putting the row's largest magnitude in [2^14, 2^15)): hi alone cost KL 0.006 on Flint, hi + lo is near
 // fp32. Weights are unpacked from Q4_1 to fp16 (d * q + m, one rounding: KL 0.0015).
-typedef _Float16 pf_v8h __attribute__((ext_vector_type(8)));
-typedef float pf_v8f __attribute__((ext_vector_type(8)));
-typedef _Float16 pf_v2h __attribute__((ext_vector_type(2)));
-__device__ __forceinline__ pf_v8f pf_wmma(const pf_v8h& a, const pf_v8h& b, const pf_v8f& c) {
-#if defined(__gfx1200__) || defined(__gfx1201__)
-    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
-#else
-    __trap();
-    return c;
-#endif
-}
-// LDS-only barrier (a __syncthreads' fence also covers global memory and invalidates the vector caches on gfx12)
-__device__ __forceinline__ void pf_sync() {
-    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
-}
 // rows of x (T x K fp32; rmsnorm * nw first when nw; silu(x) * x2 when x2) to hi / lo fp16 and the row's scale back
 __global__ void __launch_bounds__(256) k_split16(const float* x, const float* x2, const float* nw, int K, uint16_t* xh,
                                                  uint16_t* xl, float* xs) {
@@ -1289,7 +1403,11 @@ struct Model {
             }
             mv_in({{l.wq, q}, {l.wk, k}, {l.wv, v}}, {kQDim, kKvDim, kKvDim}, h, kHidden, l.attn_norm);
             k_qkv_post<<<kHeads + kKv, kHd, 0, st>>>(q, k, v, l.q_norm, l.k_norm, l.K, l.V, state, l.swa, l.kv_mask);
-            k_attn_part<<<dim3(kHeads, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask);
+            // the sliding layers (at most 513 keys) keep the per-head kernel; the full layers, whose keys grow with the
+            // context, read each key once for the 8 heads sharing it
+            static const bool attn_old = std::getenv("FLINT_ATTN_OLD") != nullptr;
+            if (attn_old || l.swa) k_attn_part<<<dim3(kHeads, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask);
+            else k_attn_dec_w<<<dim3(kKv, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask);
             k_attn_merge<<<kHeads, kHd, 0, st>>>(part, l.sinks, att);
             mv_in({{l.wo, h}}, {kHidden}, att, kQDim, nullptr, nullptr, true);
             if (i < kDense) {
