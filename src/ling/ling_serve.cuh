@@ -231,6 +231,11 @@ static int serve(Model& m, const std::vector<int>& eos_ids, int chunk) {
     const size_t feed_max = size_t(std::getenv("LING_FEED") ? std::atoi(std::getenv("LING_FEED")) : 32);
     std::vector<Snap> snaps(n_snaps);
     for (auto& s : snaps) CK(cudaMalloc(&s.buf, Model::snap_floats() * 4));
+    m.pf_alloc(chunk);   // (the prompt path's memory up front: a card too full says so at start, not mid-request)
+    m.stage_alloc();
+    size_t free_b = 0, total_b = 0;
+    CK(cudaMemGetInfo(&free_b, &total_b));
+    std::fprintf(stderr, "strata-ling: serving; %.2f GB of the card left\n", free_b / 1e9);
     uint64_t clock = 0;
     std::printf("INFO engine=strata-ling\n");
     std::printf("READY %d stop\n", m.max_ctx);

@@ -1163,19 +1163,44 @@ struct Model {
     uint8_t* stg = nullptr;              // the chunk's routed experts the card does not hold, copied from the mapping
     uint8_t* stg_raw = nullptr;          // (as copied, before the rearrangement into stg)
     size_t stg_bytes = 0;
+    static constexpr int kStgPiece = 32;
+    // the staging areas, once: stg for the most experts a layer leaves off the card, stg_raw for one piece
+    void stage_alloc() {
+        if (stg) return;
+        size_t most = 0, per = 0;
+        for (const auto& l : L) {
+            if (l.fmt_eg < 0) continue;   // (the dense layers)
+            size_t off = 0;
+            for (int e = 0; e < kExperts; ++e) off += l.slot_h.empty() || l.slot_h[e] < 0;
+            most = std::max(most, off);
+            per = std::max(per, 2 * size_t(kFfExp) * row_bytes(l.fmt_eg, kHidden) + size_t(kHidden) * row_bytes(l.fmt_ed, kFfExp));
+        }
+        stg_bytes = std::max<size_t>(1, most) * per;
+        CK(cudaMalloc(&stg, stg_bytes));
+        CK(cudaMalloc(&stg_raw, size_t(kStgPiece) * per));
+    }
+    float* pArena = nullptr;             // the attention's scratch, and (dead by then) the FFN's in the same place
     void pf_alloc(int T) {
         if (T <= pf_t) return;
         pf_t = T;
         auto f = [&](float*& p, size_t n) { if (p) CK(cudaFree(p)); CK(cudaMalloc(&p, n * 4)); };
         auto fi = [&](int*& p, size_t n) { if (p) CK(cudaFree(p)); CK(cudaMalloc(&p, n * 4)); };
-        const size_t S = size_t(T) * kTopK;
-        f(pH, size_t(T) * kHidden); f(pX, size_t(T) * kHidden); f(pQ, size_t(T) * kHeads * kQkHd); f(pK, size_t(T) * kInner);
-        f(pV, size_t(T) * kInner); f(pF, size_t(T) * kInner); f(pG, size_t(T) * kInner); f(pB, size_t(T) * kHeads);
-        f(pO, size_t(T) * kInner); f(pQa, size_t(T) * kHeads * kKvA); f(pOl, size_t(T) * kHeads * kLat); f(pRL, size_t(T) * kExperts);
-        f(pW, S); f(pAG, S * kFfExp); f(pAU, S * kFfExp); f(pY, S * kHidden); f(pSG, size_t(T) * kFfDense); f(pSU, size_t(T) * kFfDense);
-        f(pD1, size_t(T) * kInner); f(pD2, size_t(T) * kInner); f(pXc, size_t(T) * kInner);
+        const size_t S = size_t(T) * kTopK, t = size_t(T);
+        f(pH, t * kHidden); f(pX, t * kHidden);
+        // attention: KDA's q k v f g, conv outputs and o, or MLA's q, kv, absorbed q and latent out; then the FFN's
+        const size_t attn = t * (kHeads * kQkHd + 9 * size_t(kInner) + kHeads + kHeads * kKvA + kHeads * kLat);
+        const size_t ffn = t * (2 * size_t(kFfDense) + kExperts) + S * (1 + 2 * kFfExp + kHidden);
+        f(pArena, std::max(attn, ffn));
+        float* a = pArena;
+        auto take = [&](float*& p, size_t n) { p = a; a += n; };
+        take(pQ, t * kHeads * kQkHd); take(pK, t * kInner); take(pV, t * kInner); take(pF, t * kInner); take(pG, t * kInner);
+        take(pO, t * kInner); take(pD1, t * kInner); take(pD2, t * kInner); take(pXc, t * kInner); take(pB, t * kHeads);
+        take(pQa, t * kHeads * kKvA); take(pOl, t * kHeads * kLat);
+        a = pArena;
+        take(pSG, t * kFfDense); take(pSU, t * kFfDense); take(pRL, t * kExperts); take(pW, S); take(pAG, S * kFfExp);
+        take(pAU, S * kFfExp); take(pY, S * kHidden);
         {
-            const size_t n = std::max({size_t(T) * kFfDense, size_t(T) * kInner, S * kFfExp});
+            const size_t n = std::max({t * kFfDense, t * kInner, S * kFfExp});
             if (pXH) { CK(cudaFree(pXH)); CK(cudaFree(pXL)); CK(cudaFree(pXS)); }
             CK(cudaMalloc(&pXH, n * 2)); CK(cudaMalloc(&pXL, n * 2)); CK(cudaMalloc(&pXS, std::max<size_t>(S, T) * 4));
         }
@@ -1295,20 +1320,20 @@ struct Model {
             }
             // each used expert's three matrices: on the card already, or copied into the staging area
             const size_t eg = size_t(kFfExp) * row_bytes(l.fmt_eg, kHidden), ed = size_t(kHidden) * row_bytes(l.fmt_ed, kFfExp);
-            int nst = 0;
-            for (int e = 0; e < kExperts; ++e) if (hCount[e] && l.slot_h[e] < 0) ++nst;
-            const size_t need = size_t(nst) * (2 * eg + ed);
-            if (need > stg_bytes) {
-                if (stg) { CK(cudaFree(stg)); CK(cudaFree(stg_raw)); }
-                stg_bytes = std::max(need, size_t(64) << 20);
-                CK(cudaMalloc(&stg, stg_bytes));
-                CK(cudaMalloc(&stg_raw, stg_bytes));
-            }
-            // staged experts: gates, then ups, then downs, each a contiguous run (raw copies, then one rearrangement a run)
-            uint8_t* rg = stg_raw;
-            uint8_t* ru = rg + size_t(nst) * eg;
-            uint8_t* rd = ru + size_t(nst) * eg;
-            int j = 0;
+            stage_alloc();
+            // staged experts in pieces of kStgPiece: each piece's gates, ups and downs copied as they are into stg_raw,
+            // then rearranged into its own place in stg (gates, ups, downs a piece)
+            const size_t piece = 2 * eg + ed;
+            int j = 0, j0 = 0;
+            auto flush = [&]() {
+                const int np = j - j0;
+                if (!np) return;
+                uint8_t* dst = stg + size_t(j0) * piece;
+                repack(stg_raw, dst, size_t(2 * np) * kFfExp, kHidden, l.fmt_eg, st);   // (gates and ups together)
+                repack(stg_raw + size_t(2 * np) * eg, dst + size_t(2 * np) * eg, size_t(np) * kHidden, kFfExp, l.fmt_ed, st);
+                j0 = j;
+            };
+            std::vector<int> pend;
             for (int e = 0; e < kExperts; ++e) {
                 wptr_h[e] = wptr_h[kExperts + e] = wptr_h[2 * kExperts + e] = nullptr;
                 if (!hCount[e]) continue;
@@ -1317,17 +1342,22 @@ struct Model {
                     wptr_h[e] = l.ge + sl * eg; wptr_h[kExperts + e] = l.ue + sl * eg; wptr_h[2 * kExperts + e] = l.de + sl * ed;
                     continue;
                 }
-                CK(cudaMemcpyAsync(rg + j * eg, l.ge_h + size_t(e) * eg, eg, cudaMemcpyHostToDevice, st));
-                CK(cudaMemcpyAsync(ru + j * eg, l.ue_h + size_t(e) * eg, eg, cudaMemcpyHostToDevice, st));
-                CK(cudaMemcpyAsync(rd + j * ed, l.de_h + size_t(e) * ed, ed, cudaMemcpyHostToDevice, st));
-                wptr_h[e] = stg + (rg - stg_raw) + j * eg;
-                wptr_h[kExperts + e] = stg + (ru - stg_raw) + j * eg;
-                wptr_h[2 * kExperts + e] = stg + (rd - stg_raw) + j * ed;
-                ++j;
+                pend.push_back(e);
             }
-            if (nst) {
-                repack(rg, stg + (rg - stg_raw), size_t(2 * nst) * kFfExp, kHidden, l.fmt_eg, st);   // (gates and ups together)
-                repack(rd, stg + (rd - stg_raw), size_t(nst) * kHidden, kFfExp, l.fmt_ed, st);
+            for (size_t q = 0; q < pend.size(); q += kStgPiece) {
+                const int np = int(std::min(pend.size() - q, size_t(kStgPiece)));
+                uint8_t* dst = stg + size_t(j) * piece;
+                for (int u = 0; u < np; ++u) {
+                    const int e = pend[q + u];
+                    CK(cudaMemcpyAsync(stg_raw + u * eg, l.ge_h + size_t(e) * eg, eg, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(stg_raw + (np + u) * eg, l.ue_h + size_t(e) * eg, eg, cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(stg_raw + 2 * np * eg + u * ed, l.de_h + size_t(e) * ed, ed, cudaMemcpyHostToDevice, st));
+                    wptr_h[e] = dst + u * eg;
+                    wptr_h[kExperts + e] = dst + (np + u) * eg;
+                    wptr_h[2 * kExperts + e] = dst + 2 * np * eg + u * ed;
+                }
+                j += np;
+                flush();
             }
             CK(cudaMemcpyAsync(wptr, wptr_h, 3 * kExperts * sizeof(void*), cudaMemcpyHostToDevice, st));
             const int S = T * kTopK;
