@@ -41,6 +41,9 @@ constexpr int kHidden = 2048, kLayers = 49, kDense = 2;
 constexpr int kHeads = 32, kKv = 4, kHd = 128, kQDim = kHeads * kHd, kKvDim = kKv * kHd;
 constexpr int kFfDense = 6144, kExperts = 256, kTopK = 6, kFfExp = 512, kFfShared = 1024;
 constexpr int kWindow = 513;
+#ifndef FLINT_MINCHUNK
+#define FLINT_MINCHUNK 64   // attention: at least this many keys a chunk (short contexts: fewer chunks to merge)
+#endif
 constexpr int kSwaRing = 16384;
 // K and V cache element types (FLINT_K32 / FLINT_V32 at build time: fp32, for measuring what fp16 costs)
 #ifdef FLINT_K32
@@ -328,7 +331,7 @@ __global__ void k_qkv_post(float* q, const float* k, const float* v, const float
 // Split attention for one query position: block (h, c) takes chunk c of the keys lo..pos (kAttnChunks equal parts)
 // for query head h; each warp walks its keys with an online softmax (lane = 4 of the 128 dims), the 8 warps merge in
 // LDS, and the chunk's (max, sum, unnormalized output) goes to part. k_attn_merge adds the chunks and the sink.
-constexpr int kAttnChunks = 16, kPart = kHd + 4;   // a chunk's record: max, sum, 2 spare, 128 outputs
+constexpr int kAttnChunks = 16, kPart = kHd + 4, kMinChunk = FLINT_MINCHUNK;   // a chunk's record: max, sum, 2 spare, 128 outputs
 __device__ inline float4 h4(const float* p) { return *(const float4*) p; }
 __device__ inline float4 h4(const __half* p) {
     const uint2 u = *(const uint2*) p;
@@ -341,7 +344,7 @@ __global__ void __launch_bounds__(256) k_attn_part(const float* q, const kc_t* K
     part += size_t(blockIdx.z) * kHeads * kAttnChunks * kPart;
     const int h = blockIdx.x, c = blockIdx.y, kh = h / (kHeads / kKv);
     const int pos = state[0] + blockIdx.z, lo = swa ? max(0, pos - (kWindow - 1)) : 0, n = pos - lo + 1;
-    const int per = (n + kAttnChunks - 1) / kAttnChunks, a = lo + c * per, b = min(pos + 1, a + per);
+    const int per = max(kMinChunk, (n + kAttnChunks - 1) / kAttnChunks), a = lo + c * per, b = min(pos + 1, a + per);
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const float4 qv = *(const float4*) (q + h * kHd + lane * 4);
     const float scale = rsqrtf(float(kHd));
@@ -395,7 +398,7 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
     const int kh = blockIdx.x, c = blockIdx.y;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, l16 = lane & 15, g = lane >> 4;
     const int pos = state[0] + blockIdx.z, lo = swa ? max(0, pos - (kWindow - 1)) : 0, n = pos - lo + 1;
-    const int per = (n + kAttnChunks - 1) / kAttnChunks, a0 = lo + c * per, b0 = min(pos + 1, a0 + per);
+    const int per = max(kMinChunk, (n + kAttnChunks - 1) / kAttnChunks), a0 = lo + c * per, b0 = min(pos + 1, a0 + per);
     const int hq = kh * (kHeads / kKv) + l16;                // this lane's query head (columns 8-15: none)
     pf_v8h qb[8];
 #pragma unroll
