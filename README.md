@@ -35,7 +35,9 @@ Writing is 256 tokens, greedy, continuing the prompt.
 | 128K | 3,178 | 104 | 2,969 | 120 |
 | 256K (260,000 tokens) | 2,017 | 70.0 | 1,852 | 85.8 |
 
-- **Card memory at its peak:** 32.4-33.7 GB of 34.2 GB, or 30.5-31.8 GB with 8-bit keys.
+- **Card memory at its peak:** 32.4-33.7 GB of the card's 34.2 GB (31.4 of its 31.9 GiB, the "32 GB" on the box), or
+  30.5-31.8 GB with 8-bit keys. Nothing spills into system memory. The program itself holds 1.5 GB of RAM, mostly the
+  1.2 GB token table, which stays in RAM on purpose.
 - **llama.cpp on the same card** (with Flint support, 16-bit cache): 79 tokens/s writing, reading 5,388 at 4K and
   4,843 at 16K.
 - **8-bit keys** (`FLINT_K8=1`, off by default) store the long-history layers' keys in 8 bits as well as their

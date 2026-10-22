@@ -2812,6 +2812,7 @@ struct Model {
         }
         out_norm = (const float*) up_tensor("output_norm.weight", kF32);
         head = (const uint8_t*) up_tensor("output.weight", kQ4_1);
+        g.reset();   // (everything is on the card or in the pinned token table: the file's mapping goes)
         auto f = [&](float*& p, size_t n) { CK(cudaMalloc(&p, n * 4)); };
         f(h, kHidden); f(q, kQDim); f(k, kKvDim); f(v, kKvDim); f(att, kQDim); f(f1, kFfDense); f(f2, kFfDense);
         f(logits, vocab); f(rl, kExperts); f(wts, kTopK);
