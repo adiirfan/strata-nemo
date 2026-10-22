@@ -561,6 +561,21 @@ __global__ void __launch_bounds__(256) k_touch(Touch T, unsigned* sink) {
     if (a == 0x9e3779b9u) *sink = a;
 }
 
+// the experts the router picks from the layer's input (before attention: 84-87% of the real ones) read into the
+// memory-side cache while attention runs; idx from a router launched on the side stream
+__global__ void __launch_bounds__(256) k_touch_pred(const uint8_t* ge, const uint8_t* ue, const uint8_t* de, const int* idx,
+                                                    unsigned* sink) {
+    constexpr size_t mb = size_t(kFfExp) * (kHidden / 32) * 20;   // a matrix of one expert (gate, up and down alike)
+    uint32_t a = 0;
+    for (int k = 0; k < kTopK; ++k) {
+        const size_t e = size_t(idx[k]);
+        const uint4* p[3] = {(const uint4*) (ge + e * mb), (const uint4*) (ue + e * mb), (const uint4*) (de + e * mb)};
+        for (int j = 0; j < 3; ++j)
+            for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < mb / 16; i += gridDim.x * 256) { const uint4 v = p[j][i]; a ^= v.x ^ v.w; }
+    }
+    if (a == 0x9e3779b9u) *sink = a;
+}
+
 __global__ void k_embed(const float* table, const int* state, float* h) {
     const int i = blockIdx.x * 256 + threadIdx.x, tok = state[1];
     if (i < kHidden) h[i] = table[size_t(tok) * kHidden + i];
@@ -1581,6 +1596,15 @@ __global__ void __launch_bounds__(128) k_vr_pick(const float* logits, int T, int
     if (threadIdx.x == 0) *un = n;
 }
 
+// (measuring) how many of the experts chosen from the layer's input (before attention) are among the real ones
+__global__ void k_pred_overlap(const int* pred, const int* real, unsigned* cnt) {
+    if (threadIdx.x) return;
+    int hit = 0;
+    for (int a = 0; a < kTopK; ++a) for (int b = 0; b < kTopK; ++b) hit += pred[a] == real[b];
+    atomicAdd(cnt, unsigned(hit));
+    atomicAdd(cnt + 1, unsigned(kTopK));
+}
+
 // ---------------------------------------------------------------------------------------------------- the model
 struct Layer {
     const float *attn_norm, *ffn_norm, *q_norm, *k_norm, *sinks;
@@ -1606,6 +1630,10 @@ struct Model {
     std::vector<cudaEvent_t> ev;
     unsigned* sink;
     // scratch
+    int* pidx = nullptr;
+    float *pw = nullptr, *prl = nullptr;
+    unsigned* pcnt = nullptr;
+    unsigned* pdone = nullptr;
     float *act, *part, *h, *q, *k, *v, *att, *f1, *f2, *logits, *rl, *wts;
     float2* best;
     unsigned *done, *done2;
@@ -1710,6 +1738,9 @@ struct Model {
         CK(cudaMalloc(&state, 8));
         CK(cudaMemset(state, 0, 8));
         CK(cudaMallocHost(&host_state, 8));
+        CK(cudaMalloc(&pidx, kTopK * 4)); CK(cudaMalloc(&pw, kTopK * 4)); CK(cudaMalloc(&prl, kExperts * 4));
+        CK(cudaMalloc(&pdone, 4)); CK(cudaMemset(pdone, 0, 4));
+        if (std::getenv("FLINT_PRED")) { CK(cudaMalloc(&pcnt, 8)); CK(cudaMemset(pcnt, 0, 8)); }
         CK(cudaMalloc(&done2, 4));
         CK(cudaMemset(done2, 0, 4));
         CK(cudaMalloc(&best, 64 * sizeof(float2)));
@@ -2101,18 +2132,27 @@ struct Model {
             add(l.router, size_t(kExperts) * kHidden * 2);
             add(l.gate_s, kFfShared * r2k); add(l.up_s, kFfShared * r2k); add(l.down_s, size_t(kHidden) * (kFfShared / 32) * 20);
         }
-        static const int nb = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : 16;
+        static const int nb = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : 32;
         k_touch<<<nb, 256, 0, side>>>(T, sink);
     }
     void record() {
-        static const int pf = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : 16;
+        static const int pf = std::getenv("FLINT_PREFETCH") ? std::atoi(std::getenv("FLINT_PREFETCH")) : 32;
         k_embed<<<kHidden / 256, 256, 0, st>>>(embed, state, h);
         for (int i = 0; i < n_layers(); ++i) {
             Layer& l = L[i];
-            if (pf && i + 1 < kLayers) {   // layer i + 1's weights, from the start of layer i
+            static const int pe = std::getenv("FLINT_PREDPF") ? std::atoi(std::getenv("FLINT_PREDPF")) : 64;
+            if ((pf || pe) && i + 1 < kLayers) {   // from the start of layer i, on the side stream:
                 CK(cudaEventRecord(ev[i], st));
                 CK(cudaStreamWaitEvent(side, ev[i], 0));
-                prefetch(i + 1);
+                if (pe && i >= kDense) {   // this layer's likely experts, picked from its input
+                    k_router<<<kExperts / 4, 128, 0, side>>>(h, l.ffn_norm, l.router, prl, pidx, pw, pdone);
+                    k_touch_pred<<<pe, 256, 0, side>>>(l.gate_e, l.up_e, l.down_e, pidx, sink);
+                }
+                if (pf) prefetch(i + 1);   // layer i + 1's fixed weights
+            }
+            static const bool pred = std::getenv("FLINT_PRED") != nullptr;
+            if (pred && i >= kDense) {   // (measuring) the router on the layer's input
+                k_router<<<kExperts / 4, 128, 0, st>>>(h, l.ffn_norm, l.router, prl, pidx, pw, pdone);
             }
             mv_in({{l.wq, q}, {l.wk, k}, {l.wv, v}}, {kQDim, kKvDim, kKvDim}, h, kHidden, l.attn_norm);
             k_qkv_post<<<kHeads + kKv, kHd, 0, st>>>(q, k, v, l.q_norm, l.k_norm, l.K, l.V, state, l.swa, l.kv_mask);
@@ -2130,11 +2170,13 @@ struct Model {
                 continue;
             }
             k_router<<<kExperts / 4, 128, 0, st>>>(h, l.ffn_norm, l.router, rl, idx, wts, done);
+            if (pred) k_pred_overlap<<<1, 32, 0, st>>>(pidx, idx, pcnt);
             k_moe_gu<<<kActRows / kMvRows, 256, kHidden * 4, st>>>(h, l.ffn_norm, l.gate_e, l.up_e, l.gate_s, l.up_s, idx, act);
             k_moe_down<<<kHidden / kMvRows, 256, 0, st>>>(h, act, l.down_e, l.down_s, idx, wts);
             if (std::getenv("FLINT_DUMP_H")) dump_rows(h, 1);
         }
-        if (pf) {   // join the side stream back (the capture must end on one stream)
+        static const int pe2 = std::getenv("FLINT_PREDPF") ? std::atoi(std::getenv("FLINT_PREDPF")) : 64;
+        if (pf || pe2) {   // join the side stream back (the capture must end on one stream)
             CK(cudaEventRecord(ev[kLayers], side));
             CK(cudaStreamWaitEvent(st, ev[kLayers], 0));
         }
@@ -2283,6 +2325,11 @@ int main(int argc, char** argv) {
         m.step(-1);
     }
     CK(cudaStreamSynchronize(m.st));
+    if (m.pcnt) {
+        unsigned c[2];
+        CK(cudaMemcpy(c, m.pcnt, 8, cudaMemcpyDeviceToHost));
+        std::fprintf(stderr, "strata-flint: experts chosen from the layer input: %.1f%% of the real ones\n", 100.0 * c[0] / std::max(1u, c[1]));
+    }
     const double write_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count();
     if (top) std::fclose(top);
     std::fprintf(stderr, "strata-flint: read %zu in %.3f s (%.1f per second), wrote %d in %.2f s (%.2f per second)\n",
