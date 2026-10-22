@@ -73,7 +73,9 @@ __device__ inline float q8rt(float x, float amax, int bit = 3) {
 }
 // The full layers' V in 8 bits (values a head row of 128 share one scale): their K stays fp16 (8-bit K cost KL 0.011
 // on Flint, 8-bit V 0.007 against 0.006 for fp16). q null: V is the plain cache.
-struct V8 { int8_t* q; float* s; };
+// FLINT_K8: K too (kq null: K is the plain cache) - one scale a head row, scales grouped as V's, a row's values in the
+// order the writing attention's lanes read them (lane half g: dims s * 16 + g * 8 + i, s = 0..7, as 64 bytes)
+struct V8 { int8_t* q; float* s; int8_t* kq = nullptr; float* ks = nullptr; };
 // Stored in groups of 16 positions, dimension by dimension: a group's 16 values of one dim (and K/V head) sit side by
 // side, so attention reads V^T straight from memory. The scales are grouped the same way.
 __device__ inline size_t v8_qi(size_t slot, int kh, int d) { return ((slot >> 4) * kKv + kh) * (kHd * 16) + size_t(d) * 16 + (slot & 15); }
@@ -83,6 +85,34 @@ __device__ inline void v8_put(V8 st, size_t slot, int kh, int i, float v, float 
     const float d = amax > 0.f ? amax / 127.f : 1.f;
     st.q[v8_qi(slot, kh, i)] = int8_t(max(-127.f, min(127.f, rintf(v / d))));
     if (i == 0) st.s[v8_si(slot, kh)] = d;
+}
+// loads that pass through without settling in the caches (the K/V history: it would push out the prefetched weights)
+typedef unsigned int nt_u4 __attribute__((ext_vector_type(4)));
+typedef unsigned int nt_u2 __attribute__((ext_vector_type(2)));
+typedef float nt_f4 __attribute__((ext_vector_type(4)));
+#ifndef FLINT_KV_NT
+#define FLINT_KV_NT 0
+#endif
+__device__ inline uint4 ld_nt(const void* p) {
+    if (!FLINT_KV_NT) return *(const uint4*) p;
+    const nt_u4 v = __builtin_nontemporal_load((const nt_u4*) p);
+    return make_uint4(v.x, v.y, v.z, v.w);
+}
+__device__ inline uint2 ld_nt2(const void* p) {
+    if (!FLINT_KV_NT) return *(const uint2*) p;
+    const nt_u2 v = __builtin_nontemporal_load((const nt_u2*) p);
+    return make_uint2(v.x, v.y);
+}
+__device__ inline float4 ld_ntf(const void* p) {
+    if (!FLINT_KV_NT) return *(const float4*) p;
+    const nt_f4 v = __builtin_nontemporal_load((const nt_f4*) p);
+    return make_float4(v.x, v.y, v.z, v.w);
+}
+__device__ inline int k8_perm(int d) { return ((d >> 3) & 1) * 64 + (d >> 4) * 8 + (d & 7); }
+__device__ inline void k8_put(V8 st, size_t slot, int kh, int i, float k, float amax) {
+    const float d = amax > 0.f ? amax / 127.f : 1.f;
+    st.kq[(slot * kKv + kh) * kHd + k8_perm(i)] = int8_t(max(-127.f, min(127.f, rintf(k / d))));
+    if (i == 0) st.ks[v8_si(slot, kh)] = d;
 }
 template <class T> __device__ inline T f2c(float v);
 template <> __device__ inline __half f2c<__half>(float v) { return __float2half(v); }
@@ -360,7 +390,14 @@ __global__ void k_qkv_post(float* q, const float* k, const float* v, const float
             if (q8grp == 32) { ak = mk[i >> 5]; av = mv[i >> 5]; }
             else { ak = fmaxf(fmaxf(mk[0], mk[1]), fmaxf(mk[2], mk[3])); av = fmaxf(fmaxf(mv[0], mv[1]), fmaxf(mv[2], mv[3])); }
         }
-        K[r] = f2c<kc_t>(q8rt(y, ak, 1));
+        if (v8.kq) {
+            __shared__ float n8[4];
+            float a = fabsf(y);
+            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
+            if ((i & 31) == 0) n8[i >> 5] = a;
+            __syncthreads();
+            k8_put(v8, size_t(pos & kv_mask), kh, i, y, fmaxf(fmaxf(n8[0], n8[1]), fmaxf(n8[2], n8[3])));
+        } else K[r] = f2c<kc_t>(q8rt(y, ak, 1));
         if (v8.q) {
             __shared__ float m8[4];
             float a = fabsf(vv);
@@ -503,7 +540,11 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
             const size_t r = size_t(pos & kv_mask) * kKvDim + kh * kHd + tid;
             float ak = 0, av = 0;
             if (q8sim) { const int g0 = tid / q8grp * q8grp; for (int i = g0; i < g0 + q8grp; ++i) { ak = fmaxf(ak, fabsf(kf[i])); av = fmaxf(av, fabsf(vf[i])); } }
-            F.Kw[r] = f2c<kc_t>(q8rt(kf[tid], ak, 1));
+            if (v8.kq) {
+                float a8 = 0;
+                for (int i = 0; i < kHd; ++i) a8 = fmaxf(a8, fabsf(kf[i]));
+                k8_put(v8, size_t(pos & kv_mask), kh, tid, kf[tid], a8);
+            } else F.Kw[r] = f2c<kc_t>(q8rt(kf[tid], ak, 1));
             if (v8.q) {
                 float a8 = 0;
                 for (int i = 0; i < kHd; ++i) a8 = fmaxf(a8, fabsf(vf[i]));
@@ -546,21 +587,30 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
         // the store, and the next tile's K and V are fetched into registers while this one is used
         uint4 kn[8];
         uint2 vn[8];
-        float4 sn0, sn1;
+        float4 sn0, sn1, kn0, kn1;
         auto fetch = [&](int t0) {
             const int p = t0 + l16;
-            const uint4* kr = (const uint4*) ((const char*) K + (size_t(p & kv_mask) * kKvDim + kh * kHd + g * 8) * 2);
-#pragma unroll
-            for (int s8 = 0; s8 < 8; ++s8) kn[s8] = p < b0 ? kr[s8 * 2] : make_uint4(0, 0, 0, 0);
             const int pk = t0 + g * 8;
             const bool ok = pk < b0;
             const size_t sk = size_t(pk & kv_mask);
+            if (v8.kq) {   // (8-bit K: the lane's 64 bytes, and the scales of keys pk ..)
+                const uint4* kr = (const uint4*) (v8.kq + (size_t(p & kv_mask) * kKv + kh) * kHd + g * 64);
+#pragma unroll
+                for (int s4 = 0; s4 < 4; ++s4) kn[s4] = p < b0 ? ld_nt(kr + s4) : make_uint4(0, 0, 0, 0);
+                const float* kp = v8.ks + v8_si(sk, kh);
+                kn0 = ok ? ld_ntf(kp) : make_float4(0, 0, 0, 0);
+                kn1 = ok ? ld_ntf(kp + 4) : make_float4(0, 0, 0, 0);
+            } else {
+                const uint4* kr = (const uint4*) ((const char*) K + (size_t(p & kv_mask) * kKvDim + kh * kHd + g * 8) * 2);
+#pragma unroll
+                for (int s8 = 0; s8 < 8; ++s8) kn[s8] = p < b0 ? ld_nt(kr + s8 * 2) : make_uint4(0, 0, 0, 0);
+            }
             const float* sp = v8.s + v8_si(sk, kh);
-            sn0 = ok ? *(const float4*) sp : make_float4(0, 0, 0, 0);
-            sn1 = ok ? *(const float4*) (sp + 4) : make_float4(0, 0, 0, 0);
+            sn0 = ok ? ld_ntf(sp) : make_float4(0, 0, 0, 0);
+            sn1 = ok ? ld_ntf(sp + 4) : make_float4(0, 0, 0, 0);
             const int8_t* qb8 = v8.q + v8_qi(sk, kh, l16);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) vn[j] = ok ? *(const uint2*) (qb8 + j * 256) : make_uint2(0, 0);
+            for (int j = 0; j < 8; ++j) vn[j] = ok ? ld_nt2(qb8 + j * 256) : make_uint2(0, 0);
         };
         if (a0 + warp * 16 < b0) fetch(a0 + warp * 16);
         for (int t0 = a0 + warp * 16; t0 < b0; t0 += 8 * 16) {
@@ -569,6 +619,7 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
 #pragma unroll
             for (int i = 0; i < 8; ++i) { kc[i] = kn[i]; vq[i] = vn[i]; }
             float vs[8] = {sn0.x, sn0.y, sn0.z, sn0.w, sn1.x, sn1.y, sn1.z, sn1.w};
+            float ksc[8] = {kn0.x, kn0.y, kn0.z, kn0.w, kn1.x, kn1.y, kn1.z, kn1.w};
 #pragma unroll
             for (int i = 0; i < 8; ++i) if (t0 + g * 8 + i >= b0) vs[i] = 0.f;   // (past the chunk: never-written slots)
             if (t0 + 8 * 16 < b0) fetch(t0 + 8 * 16);
@@ -576,16 +627,24 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
             const bool here = fused && t0 + l16 == pos;
 #pragma unroll
             for (int s8 = 0; s8 < 8; ++s8) {
-                pf_v8h ka = __builtin_bit_cast(pf_v8h, kc[s8]);
+                pf_v8h ka;
+                if (v8.kq) {
+                    const int8_t* b8 = (const int8_t*) &kc[s8 >> 1] + (s8 & 1) * 8;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) ka[i] = (_Float16) b8[i];
+                } else ka = __builtin_bit_cast(pf_v8h, kc[s8]);
                 if (here)
 #pragma unroll
                     for (int i = 0; i < 8; ++i) ka[i] = (_Float16) c2f(f2c<kc_t>(kf[s8 * 16 + g * 8 + i]));
                 sc = pf_wmma(ka, qb[s8], sc);
             }
+            // (fused: the position's own k and v are the exact ones - the 8-bit copies may not be written yet)
+            const int self = fused ? pos - (t0 + g * 8) : -1;
+            if (v8.kq)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) sc[i] *= i == self ? 1.f : ksc[i];
             float cf;
             const pf_v8h pb = soft(sc, t0, cf);
-            // (fused: the position's own value is the exact one - the 8-bit copy may not be written yet)
-            const int self = fused ? pos - (t0 + g * 8) : -1;
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 o[j] = o[j] * cf;
@@ -1145,8 +1204,8 @@ __global__ void k_pf_qkpost(float* QKV, const float* qn, const float* kn, kc_t* 
         const float x0 = tb[j], x1 = tb[j + 64];
         y = i < 64 ? x0 * cs - x1 * sn : x0 * sn + x1 * cs;
     }
-    if (isq) src[i] = y;
-    else {
+    if (isq || v8.kq) src[i] = y;   // (8-bit K: the chunk's own keys are read exact from here)
+    if (!isq) {
         const int kh = hb - kHeads;
         const size_t r = size_t(pos & kv_mask) * kKvDim + kh * kHd + i;
         const float vv = row[kQDim + kKvDim + kh * kHd + i];
@@ -1160,7 +1219,14 @@ __global__ void k_pf_qkpost(float* QKV, const float* qn, const float* kn, kc_t* 
             if (q8grp == 32) { ak = mk[i >> 5]; av = mv[i >> 5]; }
             else { ak = fmaxf(fmaxf(mk[0], mk[1]), fmaxf(mk[2], mk[3])); av = fmaxf(fmaxf(mv[0], mv[1]), fmaxf(mv[2], mv[3])); }
         }
-        K[r] = f2c<kc_t>(q8rt(y, ak, 1));
+        if (v8.kq) {
+            __shared__ float n8[4];
+            float a = fabsf(y);
+            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
+            if ((i & 31) == 0) n8[i >> 5] = a;
+            __syncthreads();
+            k8_put(v8, size_t(pos & kv_mask), kh, i, y, fmaxf(fmaxf(n8[0], n8[1]), fmaxf(n8[2], n8[3])));
+        } else K[r] = f2c<kc_t>(q8rt(y, ak, 1));
         if (v8.q) {
             __shared__ float m8[4];
             float a = fabsf(vv);
@@ -2222,6 +2288,7 @@ __global__ void __launch_bounds__(256) k_pf_attn_w2(const float* __restrict__ QK
     constexpr int KT = 32, NQ = 16 * QT, LDQ = kQDim + 2 * kKvDim;
     __shared__ __align__(16) _Float16 ks[2][KT][kHd + 8];
     __shared__ __align__(16) _Float16 vt[2][kHd][KT + 8];
+    __shared__ float kss[2][KT];   // (8-bit K: the tile's key scales, applied to the scores)
     const int kh = blockIdx.x, q0 = blockIdx.y * NQ;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, l16 = lane & 15, g = lane >> 4;
     const int h = kh * (kHeads / kKv) + warp;
@@ -2259,11 +2326,26 @@ __global__ void __launch_bounds__(256) k_pf_attn_w2(const float* __restrict__ QK
     const int vd = tid >> 1, vh = tid & 1;   // (8-bit V: dim vd, keys vh * 16 .. + 15)
     uint4 rk[2];
     uint32_t rv[8];
+    float rks = 0;
     auto load = [&](int k0) {
         const int p = k0 + lk;
         const bool ok = p <= last;
         const kc_t* kr = K + size_t(p & kv_mask) * kKvDim + kh * kHd + lc;
-        if constexpr (sizeof(kc_t) == 2) {
+        if (v8.kq && ok && p >= p0) {   // this chunk's own keys: exact, in the same two runs of 8 dims
+            const int d0 = ((lc & 63) >> 3) * 16 + (lc >> 6) * 8;
+            const float* kx = QKV + size_t(p - p0) * LDQ + kQDim + kh * kHd + d0;
+            pf_v8h a, b;
+            for (int i = 0; i < 8; ++i) { a[i] = (_Float16) kx[i]; b[i] = (_Float16) kx[16 + i]; }
+            rk[0] = __builtin_bit_cast(uint4, a); rk[1] = __builtin_bit_cast(uint4, b);
+            rks = 1.f;
+        } else if (v8.kq) {   // stored positions lc .. + 15: dims s * 16 + h * 8 + i and (s + 1) * 16 + h * 8 + i
+            const uint4 u = ok ? *(const uint4*) (v8.kq + (size_t(p & kv_mask) * kKv + kh) * kHd + lc) : make_uint4(0, 0, 0, 0);
+            const int8_t* b8 = (const int8_t*) &u;
+            pf_v8h a, b;
+            for (int i = 0; i < 8; ++i) { a[i] = (_Float16) b8[i]; b[i] = (_Float16) b8[8 + i]; }
+            rk[0] = __builtin_bit_cast(uint4, a); rk[1] = __builtin_bit_cast(uint4, b);
+            rks = ok ? v8.ks[v8_si(size_t(p & kv_mask), kh)] : 0.f;
+        } else if constexpr (sizeof(kc_t) == 2) {
             rk[0] = ok ? *(const uint4*) kr : make_uint4(0, 0, 0, 0);
             rk[1] = ok ? *(const uint4*) (kr + 8) : make_uint4(0, 0, 0, 0);
         } else {
@@ -2297,8 +2379,15 @@ __global__ void __launch_bounds__(256) k_pf_attn_w2(const float* __restrict__ QK
         for (int i = 0; i < 8; ++i) rv[i] = __builtin_bit_cast(uint32_t, pf_v2h{(_Float16) vv[2 * i], (_Float16) vv[2 * i + 1]});
     };
     auto store = [&](int buf) {
-        *(uint4*) &ks[buf][lk][lc] = rk[0];
-        *(uint4*) &ks[buf][lk][lc + 8] = rk[1];
+        if (v8.kq) {
+            const int d0 = ((lc & 63) >> 3) * 16 + (lc >> 6) * 8;
+            *(uint4*) &ks[buf][lk][d0] = rk[0];
+            *(uint4*) &ks[buf][lk][d0 + 16] = rk[1];
+            if (lc == 0) kss[buf][lk] = rks;
+        } else {
+            *(uint4*) &ks[buf][lk][lc] = rk[0];
+            *(uint4*) &ks[buf][lk][lc + 8] = rk[1];
+        }
         if (v8.q) {
             *(uint4*) &vt[buf][vd][vh * 16] = make_uint4(rv[0], rv[1], rv[2], rv[3]);
             *(uint4*) &vt[buf][vd][vh * 16 + 8] = make_uint4(rv[4], rv[5], rv[6], rv[7]);
@@ -2330,6 +2419,13 @@ __global__ void __launch_bounds__(256) k_pf_attn_w2(const float* __restrict__ QK
             pf_v8h pb[QT];
             float cf[QT];
             const int kb0 = k0 + sub * 16;
+            if (v8.kq)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float f = kss[buf][sub * 16 + g * 8 + i];
+#pragma unroll
+                    for (int j = 0; j < QT; ++j) sc[j][i] *= f;
+                }
             const bool whole = kb0 >= all_lo && kb0 + 15 <= all_hi;   // (masks only on the edge tiles)
 #pragma unroll
             for (int j = 0; j < QT; ++j) {
@@ -2521,14 +2617,25 @@ struct Model {
             static const int ring = std::getenv("FLINT_SWA_RING") ? std::atoi(std::getenv("FLINT_SWA_RING")) : kSwaRing;   // (a power of two)
             const size_t rows = l.swa && max_ctx > ring ? ring : max_ctx;
             if (l.swa && rows == size_t(ring)) l.kv_mask = ring - 1;
-            CK(cudaMalloc(&l.K, rows * kKvDim * sizeof(kc_t)));
             static const bool v16 = std::getenv("FLINT_V16") != nullptr;   // (fp16 V on the full layers too)
+            static const bool k8 = std::getenv("FLINT_K8") != nullptr;      // (8-bit K too: about a third less to read)
+            if (k8 && (v16 || sizeof(kc_t) != 2 || std::getenv("FLINT_ATTN_OLD") ||
+                       (std::getenv("FLINT_PF_QT") && !std::strchr("124", std::getenv("FLINT_PF_QT")[0])))) {
+                std::fprintf(stderr, "strata-flint: FLINT_K8 needs 8-bit V, fp16 K and the default attention kernels\n");
+                std::exit(2);
+            }
+            if (l.swa || v16 || !k8) CK(cudaMalloc(&l.K, rows * kKvDim * sizeof(kc_t)));
             if (!l.swa && !v16) {
                 const size_t rg = (rows + 15) & ~size_t(15);   // (whole groups of 16 positions)
                 CK(cudaMalloc(&l.v8.q, rg * kKvDim));
                 CK(cudaMalloc(&l.v8.s, rg * kKv * 4));
-                kv_bytes += rows * kKvDim * sizeof(kc_t) + rg * kKvDim + rg * kKv * 4;
+                kv_bytes += rg * kKvDim + rg * kKv * 4;
                 l.V = nullptr;
+                if (k8) {
+                    CK(cudaMalloc(&l.v8.kq, rg * kKvDim));
+                    CK(cudaMalloc(&l.v8.ks, rg * kKv * 4));
+                    kv_bytes += rg * kKvDim + rg * kKv * 4;
+                } else kv_bytes += rows * kKvDim * sizeof(kc_t);
             } else {
                 CK(cudaMalloc(&l.V, rows * kKvDim * sizeof(vc_t)));
                 kv_bytes += rows * kKvDim * (sizeof(kc_t) + sizeof(vc_t));
