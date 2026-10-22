@@ -312,3 +312,187 @@ __global__ void k_pembed(const uint8_t* table, int fmt, const int* ids, float* h
     deq8(fmt, table + size_t(ids[tok]) * row_bytes(fmt, kHidden), g, v, kHidden);
     for (int i = 0; i < 8; ++i) h[size_t(tok) * kHidden + g * 8 + i] = v[i];
 }
+
+// ---- the prompt path's products on the matrix cores (gfx12 WMMA 16x16x16, fp16 in, fp32 sums): X split per row into
+// fp16 hi + lo with a power-of-2 scale (exact to ~22 bits, as strata-flint's prompt path), W unpacked by deq8 into the A
+// operand (lane l16: row, g: k half - deq8's 8 consecutive values), as fp16. A block: 8 warps over 256 rows (2 tiles of
+// 16 each), 64 tokens (4 tiles), k 64 a step through LDS (double-buffered). GROUPED: as k_gemm's grouped form.
+typedef _Float16 lp_v8h __attribute__((ext_vector_type(8)));
+typedef float lp_v8f __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ lp_v8f lp_wmma(const lp_v8h& a, const lp_v8h& b, const lp_v8f& c) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#else
+    __trap();
+    return c;
+#endif
+}
+// x rows (T x K, row stride ldx) -> hi / lo fp16 (T x K) and each row's scale (xs[t] = 2^(e - 14), the row's max near 2^14)
+__global__ void __launch_bounds__(256) k_split16(const float* x, int ldx, int K, uint16_t* xh, uint16_t* xl, float* xs) {
+    __shared__ float red[8];
+    const int t = blockIdx.x;
+    const float* r = x + size_t(t) * ldx;
+    float mx = 0;
+    for (int i = threadIdx.x; i < K; i += 256) mx = fmaxf(mx, fabsf(r[i]));
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, fl_shfl_xor(mx, o, 32));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
+    __syncthreads();
+    float m = 0;
+    for (int i = 0; i < 8; ++i) m = fmaxf(m, red[i]);
+    const int e = m > 0.f ? ilogbf(m) : 0;
+    const float up = ldexpf(1.f, 14 - e);
+    for (int i = threadIdx.x; i < K; i += 256) {
+        const float a = r[i] * up;
+        const __half hi = __float2half(a);
+        const __half lo = __float2half(a - __half2float(hi));
+        uint16_t uh, ul;
+        std::memcpy(&uh, &hi, 2);
+        std::memcpy(&ul, &lo, 2);
+        xh[size_t(t) * K + i] = uh;
+        xl[size_t(t) * K + i] = ul;
+    }
+    if (threadIdx.x == 0) xs[t] = ldexpf(1.f, e - 14);
+}
+// 8 consecutive weights straight to fp16 for the A operand. AQ4_0 / AQ4_1 / AQ8_0: packed fp16 maths on the exact
+// codes (nibble n as the half 1024 + n, then - 1032 or - 1024: exact; then one rounding, as converting deq8's fp32 would);
+// other formats through deq8.
+__device__ __forceinline__ lp_v8h deq8h(int fmt, const uint8_t* row, int g, int K) {
+    lp_v8h r;
+    if (fmt == AQ4_0 || fmt == AQ4_1) {
+        const int b = g >> 2, j0 = (g & 3) * 8, sh = j0 >= 16 ? 4 : 0, nb = K / 32;
+        const uint2 q = *(const uint2*) (row + size_t(b) * 16 + (j0 & 15));
+        const uint32_t u[2] = {(q.x >> sh) & 0x0F0F0F0Fu, (q.y >> sh) & 0x0F0F0F0Fu};
+        const uint8_t* sc = row + size_t(nb) * 16;
+        _Float16 d, m;
+        if (fmt == AQ4_0) { d = *(const _Float16*) (sc + b * 2); m = (_Float16) 0.f; }
+        else { d = *(const _Float16*) (sc + b * 4); m = *(const _Float16*) (sc + b * 4 + 2); }
+        const _Float16 off = (_Float16) (fmt == AQ4_0 ? -1032.f : -1024.f);
+#pragma unroll
+        for (int w = 0; w < 2; ++w)
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint16_t bits = uint16_t(0x6400u | ((u[w] >> (8 * k)) & 0xFFu));
+                const _Float16 code = __builtin_bit_cast(_Float16, bits) + off;   // (exact: a small integer)
+                r[w * 4 + k] = fmt == AQ4_0 ? code * d : code * d + m;
+            }
+        return r;
+    }
+    if (fmt == AQ8_0) {
+        const int b = g >> 2, j0 = (g & 3) * 8, nb = K / 32;
+        const uint2 q = *(const uint2*) (row + size_t(b) * 32 + j0);
+        const int8_t* qb = (const int8_t*) &q;
+        const _Float16 d = *(const _Float16*) (row + size_t(nb) * 32 + b * 2);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) r[i] = (_Float16) qb[i] * d;
+        return r;
+    }
+    float v[8];
+    deq8(fmt, row, g, v, K);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) r[i] = (_Float16) v[i];
+    return r;
+}
+struct GemmW {
+    const uint8_t* W;
+    const uint8_t* const* wp;
+    int fmt, N, K;
+    const uint16_t *xh, *xl;
+    const float* xs;
+    int T;
+    float* Y;
+    int ldy;
+    bool add;
+    const int *src, *bounds, *tiles, *n_tiles;
+};
+template <bool GROUPED>
+__global__ void __launch_bounds__(256) k_gemm_w(GemmW J) {
+    constexpr int TA = 2, TB = 4, BN = TB * 16, BK = 64, LD = BK + 8;
+    __shared__ __align__(16) uint16_t sx[2][2][BN][LD];
+    __shared__ int srow[BN];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, l16 = lane & 15, g = lane >> 4;
+    const int o0 = blockIdx.x * 256 + warp * TA * 16;
+    int t0, tn;
+    const uint8_t* W = J.W;
+    if (GROUPED) {
+        const int tile = blockIdx.y;
+        if (tile >= *J.n_tiles) return;
+        const int e = J.tiles[2 * tile];
+        t0 = J.bounds[e] + J.tiles[2 * tile + 1];
+        tn = min(BN, J.bounds[e + 1] - t0);
+        W = J.wp[e];
+        if (tid < BN) srow[tid] = tid < tn ? (J.src ? J.src[t0 + tid] : t0 + tid) : -1;
+    } else {
+        t0 = blockIdx.y * BN;
+        tn = min(BN, J.T - t0);
+        if (tid < BN) srow[tid] = tid < tn ? t0 + tid : -1;
+    }
+    __syncthreads();
+    const size_t rb = row_bytes(J.fmt, J.K);
+    const uint8_t* wr[TA];
+#pragma unroll
+    for (int a = 0; a < TA; ++a) wr[a] = W + size_t(min(o0 + a * 16 + l16, J.N - 1)) * rb;
+    auto fetch = [&](int k0, uint4* r) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = tid + j * 256, hl = i >> 9, t = (i >> 3) & 63, c = (i & 7) * 8;
+            const int row = srow[t];
+            const uint16_t* sp = hl ? J.xl : J.xh;
+            r[j] = row >= 0 ? *(const uint4*) (sp + size_t(row) * J.K + k0 + c) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    auto put = [&](const uint4* r, int buf) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = tid + j * 256, hl = i >> 9, t = (i >> 3) & 63, c = (i & 7) * 8;
+            *(uint4*) &sx[buf][hl][t][c] = r[j];
+        }
+    };
+    lp_v8f acc[TA][TB];
+#pragma unroll
+    for (int a = 0; a < TA; ++a)
+#pragma unroll
+        for (int b = 0; b < TB; ++b) acc[a][b] = lp_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    uint4 rbuf[4];
+    fetch(0, rbuf);
+    put(rbuf, 0);
+    __syncthreads();
+    int buf = 0;
+    for (int k0 = 0; k0 < J.K; k0 += BK) {
+        if (k0 + BK < J.K) fetch(k0 + BK, rbuf);
+#pragma unroll
+        for (int kk = 0; kk < BK / 16; ++kk) {
+            lp_v8h fa[TA];
+#pragma unroll
+            for (int a = 0; a < TA; ++a) fa[a] = deq8h(J.fmt, wr[a], (k0 + kk * 16) / 8 + g, J.K);
+#pragma unroll
+            for (int b = 0; b < TB; ++b) {
+                const lp_v8h bh = *(const lp_v8h*) &sx[buf][0][b * 16 + l16][kk * 16 + g * 8];
+                const lp_v8h bl = *(const lp_v8h*) &sx[buf][1][b * 16 + l16][kk * 16 + g * 8];
+#pragma unroll
+                for (int a = 0; a < TA; ++a) { acc[a][b] = lp_wmma(fa[a], bh, acc[a][b]); acc[a][b] = lp_wmma(fa[a], bl, acc[a][b]); }
+            }
+        }
+        if (k0 + BK < J.K) put(rbuf, buf ^ 1);
+        __syncthreads();
+        buf ^= 1;
+    }
+    // lane: outputs o0 + a * 16 + g * 8 + i, token tile b, column l16
+#pragma unroll
+    for (int b = 0; b < TB; ++b) {
+        const int t = b * 16 + l16;
+        if (t >= tn) continue;
+        const int row = srow[t];
+        const float sc = J.xs[row];
+        const size_t yrow = size_t(t0 + t);
+#pragma unroll
+        for (int a = 0; a < TA; ++a)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int o = o0 + a * 16 + g * 8 + i;
+                if (o >= J.N) continue;
+                float* y = J.Y + yrow * J.ldy + o;
+                const float v = acc[a][b][i] * sc;
+                *y = J.add ? *y + v : v;
+            }
+    }
+}

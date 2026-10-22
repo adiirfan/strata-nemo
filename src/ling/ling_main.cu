@@ -390,6 +390,70 @@ __global__ void __launch_bounds__(256) k_mla_attn(const float* qa, const float* 
         ol[h * kLat + i] = a / sc_sum;
     }
 }
+// the writing step's attention with the cache read once for all 32 heads: block c takes positions c * per .. (per: the
+// chunk), warp w heads w, w + 8, w + 16, w + 24 (lane: 18 of the 576 key values, 16 of the 512 latent ones), online
+// softmax; each (chunk, head)'s max, sum and latent sum into part (kMlaChunks x 32 x 514), k_mla_merge adds them up
+constexpr int kMlaChunks = 32, kMlaPart = 2 + kLat;
+__global__ void __launch_bounds__(256) k_mla_attn_part(const float* qa, const float* cache, float* part, const int* state) {
+    const int c = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5, n = state[0] + 1;
+    const int per = max(64, (n + kMlaChunks - 1) / kMlaChunks), a0 = c * per, b0 = min(n, a0 + per);
+    const float scale = rsqrtf(float(kQkHd));
+    float qv[4][18], acc[4][16], m[4], l[4];
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        const float* qh = qa + (w + 8 * a) * kKvA;
+#pragma unroll
+        for (int i = 0; i < 18; ++i) qv[a][i] = qh[lane + 32 * i] * scale;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) acc[a][i] = 0.f;
+        m[a] = -INFINITY;
+        l[a] = 0.f;
+    }
+    for (int s = a0; s < b0; ++s) {
+        const float* row = cache + size_t(s) * kKvA;
+        float kv[18];
+#pragma unroll
+        for (int i = 0; i < 18; ++i) kv[i] = row[lane + 32 * i];
+#pragma unroll
+        for (int a = 0; a < 4; ++a) {
+            float d = 0;
+#pragma unroll
+            for (int i = 0; i < 18; ++i) d += qv[a][i] * kv[i];
+            d = warp_sum(d);
+            const float mn = fmaxf(m[a], d), cf = expf(m[a] - mn), p = expf(d - mn);
+            m[a] = mn;
+            l[a] = l[a] * cf + p;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) acc[a][i] = acc[a][i] * cf + p * kv[i];
+        }
+    }
+#pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        float* P = part + (size_t(c) * kHeads + w + 8 * a) * kMlaPart;
+        if (lane == 0) { P[0] = m[a]; P[1] = l[a]; }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) P[2 + lane + 32 * i] = acc[a][i];
+    }
+}
+// per head (block, 256 threads): the chunks' records into ol_h (512)
+__global__ void __launch_bounds__(256) k_mla_merge(const float* part, float* ol) {
+    const int h = blockIdx.x;
+    float M = -INFINITY;
+    for (int c = 0; c < kMlaChunks; ++c) M = fmaxf(M, part[(size_t(c) * kHeads + h) * kMlaPart]);
+    float L = 0;
+    for (int c = 0; c < kMlaChunks; ++c) {
+        const float mc = part[(size_t(c) * kHeads + h) * kMlaPart];
+        if (mc != -INFINITY) L += part[(size_t(c) * kHeads + h) * kMlaPart + 1] * expf(mc - M);
+    }
+    for (int i = threadIdx.x; i < kLat; i += 256) {
+        float o = 0;
+        for (int c = 0; c < kMlaChunks; ++c) {
+            const float* P = part + (size_t(c) * kHeads + h) * kMlaPart;
+            if (P[0] != -INFINITY) o += P[2 + i] * expf(P[0] - M);
+        }
+        ol[h * kLat + i] = o / L;
+    }
+}
 // per head: out_h = (wv_b_h ol_h) * sigmoid(gate_h), 128 values. Block a head, 256 threads
 __global__ void __launch_bounds__(256) k_mla_out(const float* ol, const uint8_t* wvb, int fmt, const float* gate, float* out) {
     __shared__ float l[kLat];
@@ -693,6 +757,7 @@ struct Model {
     const float* out_norm;
     int max_ctx;
     cudaStream_t st;
+    float* mla_part = nullptr;
     float *h, *x1, *qb, *kb, *vb, *fb, *gb, *betab, *ob, *qa, *ol, *act, *logits, *rl, *wts, *hy;
     int *idx, *state, *host_state;
     int pos = 0;
@@ -888,6 +953,7 @@ struct Model {
         f(fb, kInner); f(gb, kInner); f(betab, kHeads); f(ob, kInner > kFfDense ? kInner : kFfDense); f(qa, kHeads * kKvA);
         f(ol, kHeads * kLat); f(act, kActRows > kFfDense ? kActRows : kFfDense); f(logits, 157184); f(rl, kExperts); f(wts, kTopK);
         f(hy, kHidden);
+        f(mla_part, size_t(kMlaChunks) * kHeads * kMlaPart);
         CK(cudaMalloc(&idx, kTopK * 4));
         CK(cudaMalloc(&state, 8)); CK(cudaMemset(state, 0, 8));
         CK(cudaMallocHost(&host_state, 8));
@@ -1009,7 +1075,8 @@ struct Model {
             mv({{l.q, qb}, {l.kva, kb}, {l.gate, betab}}, {kHeads * kQkHd, kKvA, kHeads}, h, kHidden, l.attn_norm);
             k_mla_kv<<<1, kLat, 0, st>>>(kb, l.kv_norm, l.cache, state);
             k_mla_q<<<kHeads, 256, 0, st>>>(qb, l.kb.d, l.kb.fmt, qa, state);
-            k_mla_attn<<<kHeads, 256, size_t(max_ctx) * 4, st>>>(qa, l.cache, ol, state);
+            k_mla_attn_part<<<kMlaChunks, 256, 0, st>>>(qa, l.cache, mla_part, state);
+            k_mla_merge<<<kHeads, 256, 0, st>>>(mla_part, ol);
             k_mla_out<<<kHeads, 256, 0, st>>>(ol, l.vb.d, l.vb.fmt, betab, ob);
         }
         mv({{l.wo, h}}, {kHidden}, ob, kInner, nullptr, true);
@@ -1081,8 +1148,14 @@ struct Model {
     }
     // ------------------------------------------------ the prompt path (ling_prefill.cuh): chunks of up to pf_t tokens
     int pf_t = 0;
-    float *pH = nullptr, *pX, *pQ, *pK, *pV, *pF, *pG, *pB, *pO, *pQa, *pOl, *pRL, *pW, *pAG, *pAU, *pY, *pSG, *pSU, *pD1, *pD2, *pXc;
-    int *pIds, *pIdx, *pCount, *pBounds, *pFill, *pTiles, *pNT, *pSrc, *pSlot, *hCount;
+    float *pH = nullptr, *pX = nullptr, *pQ = nullptr, *pK = nullptr, *pV = nullptr, *pF = nullptr, *pG = nullptr, *pB = nullptr,
+          *pO = nullptr, *pQa = nullptr, *pOl = nullptr, *pRL = nullptr, *pW = nullptr, *pAG = nullptr, *pAU = nullptr, *pY = nullptr,
+          *pSG = nullptr, *pSU = nullptr, *pD1 = nullptr, *pD2 = nullptr, *pXc = nullptr;
+    int *pIds = nullptr, *pIdx = nullptr, *pCount = nullptr, *pBounds = nullptr, *pFill = nullptr, *pTiles = nullptr, *pNT = nullptr,
+        *pSrc = nullptr, *pSlot = nullptr, *hCount = nullptr;
+    uint16_t *pXH = nullptr, *pXL = nullptr;   // the matrix-core products' split inputs (k_split16)
+    float* pXS = nullptr;
+    int split_K = 0;
     const uint8_t** wptr = nullptr;      // the grouped products' expert pointers: gate, up, down (3 x 512), device
     const uint8_t** wptr_h = nullptr;    // (pinned host copy)
     uint8_t* stg = nullptr;              // the chunk's routed experts the card does not hold, copied from the mapping
@@ -1099,6 +1172,11 @@ struct Model {
         f(pO, size_t(T) * kInner); f(pQa, size_t(T) * kHeads * kKvA); f(pOl, size_t(T) * kHeads * kLat); f(pRL, size_t(T) * kExperts);
         f(pW, S); f(pAG, S * kFfExp); f(pAU, S * kFfExp); f(pY, S * kHidden); f(pSG, size_t(T) * kFfDense); f(pSU, size_t(T) * kFfDense);
         f(pD1, size_t(T) * kInner); f(pD2, size_t(T) * kInner); f(pXc, size_t(T) * kInner);
+        {
+            const size_t n = std::max({size_t(T) * kFfDense, size_t(T) * kInner, S * kFfExp});
+            if (pXH) { CK(cudaFree(pXH)); CK(cudaFree(pXL)); CK(cudaFree(pXS)); }
+            CK(cudaMalloc(&pXH, n * 2)); CK(cudaMalloc(&pXL, n * 2)); CK(cudaMalloc(&pXS, std::max<size_t>(S, T) * 4));
+        }
         fi(pIds, T); fi(pIdx, S); fi(pCount, kExperts); fi(pBounds, kExperts + 1); fi(pFill, kExperts);
         fi(pTiles, 2 * (S / 64 + kExperts + 1)); fi(pNT, 1); fi(pSrc, S); fi(pSlot, S);
         if (!hCount) CK(cudaMallocHost(&hCount, kExperts * 4));
@@ -1108,6 +1186,29 @@ struct Model {
         Gemm J{};
         J.W = w.d; J.fmt = w.fmt; J.N = N; J.K = K; J.X = X; J.ldx = ldx; J.T = T; J.Y = Y; J.ldy = ldy; J.add = add;
         k_gemm<<<dim3((N + 63) / 64, (T + 63) / 64), 256, 0, st>>>(J);
+    }
+    // the matrix-core form: split X once (split), then any number of products on it (gemm_w); LING_PF_SIMT=1 keeps the fp32
+    // SIMT products everywhere
+    static bool simt() { static const bool v = std::getenv("LING_PF_SIMT") != nullptr; return v; }
+    void split(const float* X, int ldx, int K, int rows) {
+        k_split16<<<rows, 256, 0, st>>>(X, ldx, K, pXH, pXL, pXS);
+        split_K = K;
+    }
+    void gemm_w(const Tensor& w, int N, int K, int T, float* Y, int ldy, bool add) {
+        GemmW J{};
+        J.W = w.d; J.fmt = w.fmt; J.N = N; J.K = K; J.xh = pXH; J.xl = pXL; J.xs = pXS; J.T = T; J.Y = Y; J.ldy = ldy; J.add = add;
+        k_gemm_w<false><<<dim3((N + 255) / 256, (T + 63) / 64), 256, 0, st>>>(J);
+    }
+    // (SIMT or matrix cores) Y = W . X for X already split when matrix cores
+    void prod(const Tensor& w, int N, int K, const float* X, int ldx, int T, float* Y, int ldy, bool add) {
+        if (simt()) gemm(w, N, K, X, ldx, T, Y, ldy, add);
+        else gemm_w(w, N, K, T, Y, ldy, add);
+    }
+    void gemm_grp_w(const uint8_t* const* wp, int fmt, int N, int K, const int* src, float* Y, int ldy, int S) {
+        GemmW J{};
+        J.wp = wp; J.fmt = fmt; J.N = N; J.K = K; J.xh = pXH; J.xl = pXL; J.xs = pXS; J.Y = Y; J.ldy = ldy; J.src = src;
+        J.bounds = pBounds; J.tiles = pTiles; J.n_tiles = pNT;
+        k_gemm_w<true><<<dim3((N + 255) / 256, S / 64 + kExperts + 1), 256, 0, st>>>(J);
     }
     void gemm_grp(const uint8_t* const* wp, int fmt, int N, int K, const float* X, int ldx, const int* src, float* Y, int ldy, int S) {
         Gemm J{};
@@ -1124,12 +1225,13 @@ struct Model {
         for (int i = 0; i < kLayers; ++i) {
             Layer& l = L[i];
             k_rms_rows<<<T, 256, 0, st>>>(pH, l.attn_norm, pX, kHidden);
+            if (!simt()) split(pX, kHidden, kHidden, T);
             if (l.kda) {
-                gemm(l.wq, kInner, kHidden, pX, kHidden, T, pQ, kInner, false);
-                gemm(l.wk, kInner, kHidden, pX, kHidden, T, pK, kInner, false);
-                gemm(l.wv, kInner, kHidden, pX, kHidden, T, pV, kInner, false);
-                gemm(l.wf, kInner, kHidden, pX, kHidden, T, pF, kInner, false);
-                gemm(l.wg, kInner, kHidden, pX, kHidden, T, pG, kInner, false);
+                prod(l.wq, kInner, kHidden, pX, kHidden, T, pQ, kInner, false);
+                prod(l.wk, kInner, kHidden, pX, kHidden, T, pK, kInner, false);
+                prod(l.wv, kInner, kHidden, pX, kHidden, T, pV, kInner, false);
+                prod(l.wf, kInner, kHidden, pX, kHidden, T, pF, kInner, false);
+                prod(l.wg, kInner, kHidden, pX, kHidden, T, pG, kInner, false);
                 gemm(Tensor{(const uint8_t*) l.beta_w, F32}, kHeads, kHidden, pX, kHidden, T, pB, kHeads, false);
                 k_kda_conv<<<kInner / 256, 256, 0, st>>>(pQ, l.cq, l.cs, pD1, T);
                 k_kda_conv<<<kInner / 256, 256, 0, st>>>(pK, l.ck, l.cs + 3 * kInner, pD2, T);
@@ -1141,8 +1243,8 @@ struct Model {
                 k_kda_scan<<<kHeads, kHd, 0, st>>>(pD1, pD2, pXc, pF, pB, l.S, pO, T);
                 k_kda_out<<<T * kHeads, kHd, 0, st>>>(pO, pG, l.onorm);
             } else {
-                gemm(l.q, kHeads * kQkHd, kHidden, pX, kHidden, T, pQ, kHeads * kQkHd, false);
-                gemm(l.kva, kKvA, kHidden, pX, kHidden, T, pK, kKvA, false);
+                prod(l.q, kHeads * kQkHd, kHidden, pX, kHidden, T, pQ, kHeads * kQkHd, false);
+                prod(l.kva, kKvA, kHidden, pX, kHidden, T, pK, kKvA, false);
                 gemm(l.gate, kHeads, kHidden, pX, kHidden, T, pB, kHeads, false);
                 k_pmla_kv<<<T, kLat, 0, st>>>(pK, l.kv_norm, l.cache, p0);
                 const size_t rbk = row_bytes(l.kb.fmt, kQkNope), rbv = row_bytes(l.vb.fmt, kLat);
@@ -1156,20 +1258,22 @@ struct Model {
                          pO + hh * kHd, kInner, false);
                 k_pmla_gate<<<T, 256, 0, st>>>(pO, pB);
             }
-            gemm(l.wo, kHidden, kInner, pO, kInner, T, pH, kHidden, true);
+            if (!simt()) split(pO, kInner, kInner, T);
+            prod(l.wo, kHidden, kInner, pO, kInner, T, pH, kHidden, true);
             k_rms_rows<<<T, 256, 0, st>>>(pH, l.ffn_norm, pX, kHidden);
+            if (!simt()) split(pX, kHidden, kHidden, T);
             if (l.dense) {
-                gemm(l.fg, kFfDense, kHidden, pX, kHidden, T, pSG, kFfDense, false);
-                gemm(l.fu, kFfDense, kHidden, pX, kHidden, T, pSU, kFfDense, false);
+                prod(l.fg, kFfDense, kHidden, pX, kHidden, T, pSG, kFfDense, false);
+                prod(l.fu, kFfDense, kHidden, pX, kHidden, T, pSU, kFfDense, false);
                 k_pswiglu<<<(T * kFfDense + 255) / 256, 256, 0, st>>>(pSG, pSU, size_t(T) * kFfDense, 0.f);
-                gemm(l.fd, kHidden, kFfDense, pSG, kFfDense, T, pH, kHidden, true);
+                if (!simt()) split(pSG, kFfDense, kFfDense, T);
+                prod(l.fd, kHidden, kFfDense, pSG, kFfDense, T, pH, kHidden, true);
                 continue;
             }
-            // shared expert, added into h
-            gemm(l.gs, kFfShared, kHidden, pX, kHidden, T, pSG, kFfShared, false);
-            gemm(l.us, kFfShared, kHidden, pX, kHidden, T, pSU, kFfShared, false);
+            // shared expert, added into h (its act split afterwards: the routed experts' gate / up need pX's split first)
+            prod(l.gs, kFfShared, kHidden, pX, kHidden, T, pSG, kFfShared, false);
+            prod(l.us, kFfShared, kHidden, pX, kHidden, T, pSU, kFfShared, false);
             k_pswiglu<<<(T * kFfShared + 255) / 256, 256, 0, st>>>(pSG, pSU, size_t(T) * kFfShared, l.clamp_s);
-            gemm(l.ds, kHidden, kFfShared, pSG, kFfShared, T, pH, kHidden, true);
             // routing, then the rows grouped by expert
             gemm(Tensor{(const uint8_t*) l.router, F32}, kExperts, kHidden, pX, kHidden, T, pRL, kExperts, false);
             CK(cudaMemsetAsync(pCount, 0, kExperts * 4, st));
@@ -1225,10 +1329,21 @@ struct Model {
             }
             CK(cudaMemcpyAsync(wptr, wptr_h, 3 * kExperts * sizeof(void*), cudaMemcpyHostToDevice, st));
             const int S = T * kTopK;
-            gemm_grp(wptr, aligned_fmt(l.fmt_eg), kFfExp, kHidden, pX, kHidden, pSrc, pAG, kFfExp, S);
-            gemm_grp(wptr + kExperts, aligned_fmt(l.fmt_eg), kFfExp, kHidden, pX, kHidden, pSrc, pAU, kFfExp, S);
-            k_pswiglu<<<(unsigned) ((size_t(S) * kFfExp + 255) / 256), 256, 0, st>>>(pAG, pAU, size_t(S) * kFfExp, l.clamp_e);
-            gemm_grp(wptr + 2 * kExperts, aligned_fmt(l.fmt_ed), kHidden, kFfExp, pAG, kFfExp, nullptr, pY, kHidden, S);
+            if (simt()) {
+                gemm(l.ds, kHidden, kFfShared, pSG, kFfShared, T, pH, kHidden, true);
+                gemm_grp(wptr, aligned_fmt(l.fmt_eg), kFfExp, kHidden, pX, kHidden, pSrc, pAG, kFfExp, S);
+                gemm_grp(wptr + kExperts, aligned_fmt(l.fmt_eg), kFfExp, kHidden, pX, kHidden, pSrc, pAU, kFfExp, S);
+                k_pswiglu<<<(unsigned) ((size_t(S) * kFfExp + 255) / 256), 256, 0, st>>>(pAG, pAU, size_t(S) * kFfExp, l.clamp_e);
+                gemm_grp(wptr + 2 * kExperts, aligned_fmt(l.fmt_ed), kHidden, kFfExp, pAG, kFfExp, nullptr, pY, kHidden, S);
+            } else {
+                gemm_grp_w(wptr, aligned_fmt(l.fmt_eg), kFfExp, kHidden, pSrc, pAG, kFfExp, S);   // (pX's split)
+                gemm_grp_w(wptr + kExperts, aligned_fmt(l.fmt_eg), kFfExp, kHidden, pSrc, pAU, kFfExp, S);
+                split(pSG, kFfShared, kFfShared, T);
+                gemm_w(l.ds, kHidden, kFfShared, T, pH, kHidden, true);
+                k_pswiglu<<<(unsigned) ((size_t(S) * kFfExp + 255) / 256), 256, 0, st>>>(pAG, pAU, size_t(S) * kFfExp, l.clamp_e);
+                split(pAG, kFfExp, kFfExp, S);
+                gemm_grp_w(wptr + 2 * kExperts, aligned_fmt(l.fmt_ed), kHidden, kFfExp, nullptr, pY, kHidden, S);
+            }
             k_pcombine<<<T, 256, 0, st>>>(pH, pY, pSlot, pW);
             CK(cudaStreamSynchronize(st));   // (wptr_h and the staging area are reused by the next layer)
         }
@@ -1320,7 +1435,7 @@ int main(int argc, char** argv) {
     std::vector<float> lg(157184);
     const auto t1 = std::chrono::steady_clock::now();
     static const bool tokwise = std::getenv("LING_TOKWISE") != nullptr;
-    const int chunk = std::getenv("LING_CHUNK") ? std::atoi(std::getenv("LING_CHUNK")) : 2048;
+    const int chunk = std::getenv("LING_CHUNK") ? std::atoi(std::getenv("LING_CHUNK")) : 8192;
     if (!tokwise) {   // (with --logits: only the last position's, the prompt path computes no others)
         for (size_t i = 0; i < ids.size(); i += chunk) m.prefill_chunk(ids.data() + i, int(std::min(ids.size() - i, size_t(chunk))));
         if (lf) {
