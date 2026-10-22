@@ -26,6 +26,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <type_traits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -294,11 +295,13 @@ __global__ void __launch_bounds__(128) k_router(const float* h, const float* nw,
 
 // after the q/k/v products: q and k heads RMSNorm (+ RoPE on sliding layers), k and v into the cache. Blocks 0-31 the
 // query heads, 32-35 the K/V heads; 128 threads.
+// (blockIdx.z: the z-th of several tokens at positions state[0] + z, its q / k / v zs floats further on)
 __global__ void k_qkv_post(float* q, const float* k, const float* v, const float* qn, const float* kn, kc_t* K,
-                           vc_t* V, const int* state, bool rope, int kv_mask) {
+                           vc_t* V, const int* state, bool rope, int kv_mask, int zs = 0) {
     __shared__ float sh[4];
     __shared__ float t[kHd];
-    const int pos = state[0], hb = blockIdx.x, i = threadIdx.x;
+    q += blockIdx.z * zs; k += blockIdx.z * zs; v += blockIdx.z * zs;
+    const int pos = state[0] + blockIdx.z, hb = blockIdx.x, i = threadIdx.x;
     const bool isq = hb < kHeads;
     const float x = isq ? q[hb * kHd + i] : k[(hb - kHeads) * kHd + i];
     const float s = block_sum<128>(x * x, sh);
@@ -333,9 +336,11 @@ __device__ inline float4 h4(const __half* p) {
     return make_float4(a.x, a.y, b.x, b.y);
 }
 __global__ void __launch_bounds__(256) k_attn_part(const float* q, const kc_t* K, const vc_t* V, float* part,
-                                                   const int* state, bool swa, int kv_mask) {
+                                                   const int* state, bool swa, int kv_mask, int zs = 0) {
+    q += blockIdx.z * zs;
+    part += size_t(blockIdx.z) * kHeads * kAttnChunks * kPart;
     const int h = blockIdx.x, c = blockIdx.y, kh = h / (kHeads / kKv);
-    const int pos = state[0], lo = swa ? max(0, pos - (kWindow - 1)) : 0, n = pos - lo + 1;
+    const int pos = state[0] + blockIdx.z, lo = swa ? max(0, pos - (kWindow - 1)) : 0, n = pos - lo + 1;
     const int per = (n + kAttnChunks - 1) / kAttnChunks, a = lo + c * per, b = min(pos + 1, a + per);
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const float4 qv = *(const float4*) (q + h * kHd + lane * 4);
@@ -379,7 +384,9 @@ __global__ void __launch_bounds__(256) k_attn_part(const float* q, const kc_t* K
 // LDS and the chunk's record per query head goes to part (k_attn_merge adds the chunks and the sink, as before).
 __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q, const kc_t* __restrict__ K,
                                                     const vc_t* __restrict__ V, float* __restrict__ part,
-                                                    const int* __restrict__ state, int swa, int kv_mask) {
+                                                    const int* __restrict__ state, int swa, int kv_mask, int zs = 0) {
+    q += blockIdx.z * zs;
+    part += size_t(blockIdx.z) * kHeads * kAttnChunks * kPart;
     // a warp's V tile (transposed) during the loop; the same LDS holds the warps' outputs for the merge after it
     __shared__ __align__(16) char lds[8 * kHd * (16 + 8) * 2];
     _Float16 (*vt)[kHd][16 + 8] = (_Float16 (*)[kHd][16 + 8]) lds;
@@ -387,7 +394,7 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
     __shared__ float wm[8][8], wl[8][8];
     const int kh = blockIdx.x, c = blockIdx.y;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, l16 = lane & 15, g = lane >> 4;
-    const int pos = state[0], lo = swa ? max(0, pos - (kWindow - 1)) : 0, n = pos - lo + 1;
+    const int pos = state[0] + blockIdx.z, lo = swa ? max(0, pos - (kWindow - 1)) : 0, n = pos - lo + 1;
     const int per = (n + kAttnChunks - 1) / kAttnChunks, a0 = lo + c * per, b0 = min(pos + 1, a0 + per);
     const int hq = kh * (kHeads / kKv) + l16;                // this lane's query head (columns 8-15: none)
     pf_v8h qb[8];
@@ -486,6 +493,8 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
 }
 
 __global__ void k_attn_merge(const float* part, const float* sinks, float* out) {
+    part += size_t(blockIdx.z) * kHeads * kAttnChunks * kPart;
+    out += blockIdx.z * kQDim;
     const int h = blockIdx.x, t = threadIdx.x;   // 128 threads
     const float* P = part + size_t(h) * kAttnChunks * kPart;
     float M = sinks[h];
@@ -1037,6 +1046,294 @@ __global__ void __launch_bounds__(256) k_pf_attn_w(const float* __restrict__ QKV
         for (int i = 0; i < 8; ++i) out[j * 16 + g * 8 + i] = o[j][i] * f / L;
 }
 
+
+// ---------------------------------------------------------------------------------------------------- checking drafts
+// Up to kVMax tokens at positions state[0] .. state[0] + T - 1 in one pass (the current token and the drafted ones):
+// every weight is read once and used for all T, each routed expert once for the tokens that chose it.
+constexpr int kVMax = 8, kVUniq = kVMax * kTopK;
+// X[t] = rmsnorm(H[t]) * nw over 2048 (block t)
+__global__ void k_v_norm(const float* H, const float* nw, float* X) {
+    __shared__ float red[8];
+    const float* h = H + size_t(blockIdx.x) * kHidden;
+    float ss = 0;
+    for (int i = threadIdx.x; i < kHidden; i += 256) ss += h[i] * h[i];
+    ss = warp_sum(ss);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    float t = 0;
+    for (int i = 0; i < 8; ++i) t += red[i];
+    const float r = rsqrtf(t / kHidden + kEps);
+    for (int i = threadIdx.x; i < kHidden; i += 256) X[size_t(blockIdx.x) * kHidden + i] = h[i] * r * nw[i];
+}
+// out[t][i] = silu(g[t][i]) * u[t][i] (n a token, rows at stride ld)
+__global__ void k_v_swiglu(const float* g, const float* u, float* out, int n, int ld) {
+    const int t = blockIdx.y, i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) out[size_t(t) * ld + i] = silu(g[size_t(t) * ld + i]) * u[size_t(t) * ld + i];
+}
+// R rows of a Q4_1 matrix against T inputs x_t = X + t * ldx (global, L2-cached); lane 0 of each row's warp-sum
+template <int R>
+__device__ inline void q4_rows_t(const uint8_t* W, size_t rowb, int nb, const float* X, int ldx, int T, int lane,
+                                 float (*acc)[kVMax]) {
+    const int qd = lane & 3;
+    for (int b = lane >> 2; b < nb; b += 8) {
+        uint32_t dmv[R], qv[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint8_t* B = W + r * rowb + size_t(b) * 20;
+            dmv[r] = *(const uint32_t*) B;
+            qv[r] = *(const uint32_t*) (B + 4 + qd * 4);
+        }
+        for (int t = 0; t < T; ++t) {
+            const float* xs = X + size_t(t) * ldx;
+            const float4 xa = *(const float4*) (xs + b * 32 + qd * 4);
+            const float4 xb = *(const float4*) (xs + b * 32 + 16 + qd * 4);
+            const float sx = xa.x + xa.y + xa.z + xa.w + xb.x + xb.y + xb.z + xb.w;
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const uint32_t dm = dmv[r], q = qv[r];
+                const float d = __half2float(__ushort_as_half(uint16_t(dm))), m = __half2float(__ushort_as_half(uint16_t(dm >> 16)));
+                const float tt = float(q & 15) * xa.x + float((q >> 8) & 15) * xa.y + float((q >> 16) & 15) * xa.z + float((q >> 24) & 15) * xa.w
+                               + float((q >> 4) & 15) * xb.x + float((q >> 12) & 15) * xb.y + float((q >> 20) & 15) * xb.z + float(q >> 28) * xb.w;
+                acc[r][t] += d * tt + m * sx;
+            }
+        }
+    }
+}
+// The same with the T inputs staged through LDS 256 values at a time (sb: T x 256 floats), T a compile-time count so
+// the per-token loops unroll and every load of a step is in flight together. Each lane takes one Q4_1 block a slice
+// (4 lanes a block, 8 blocks a slice). xp[t]: token t's input row (nullptr: zeros). All threads of the block call it.
+template <int R, int T>
+__device__ inline void q4_rows_s(const uint8_t* W, size_t rowb, int nb, const float* const* xp, float* sb, int lane,
+                                 float (*acc)[kVMax]) {
+    const int qd = lane & 3, bl = lane >> 2;
+    for (int kc = 0; kc < nb * 32; kc += 256) {
+        uint32_t dmv[R], qv[R];
+        const int b = kc / 32 + bl;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint8_t* B = W + r * rowb + size_t(b) * 20;
+            dmv[r] = *(const uint32_t*) B;
+            qv[r] = *(const uint32_t*) (B + 4 + qd * 4);
+        }
+        for (int i = threadIdx.x; i < T * 64; i += 256) {
+            const int t = i >> 6, c = (i & 63) * 4;
+            *(float4*) (sb + t * 256 + c) = xp[t] ? *(const float4*) (xp[t] + kc + c) : make_float4(0, 0, 0, 0);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            const float* xs = sb + t * 256 + bl * 32;
+            const float4 xa = *(const float4*) (xs + qd * 4), xb = *(const float4*) (xs + 16 + qd * 4);
+            const float sx = xa.x + xa.y + xa.z + xa.w + xb.x + xb.y + xb.z + xb.w;
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const uint32_t dm = dmv[r], q = qv[r];
+                const float d = __half2float(__ushort_as_half(uint16_t(dm))), m = __half2float(__ushort_as_half(uint16_t(dm >> 16)));
+                const float tt = float(q & 15) * xa.x + float((q >> 8) & 15) * xa.y + float((q >> 16) & 15) * xa.z + float((q >> 24) & 15) * xa.w
+                               + float((q >> 4) & 15) * xb.x + float((q >> 12) & 15) * xb.y + float((q >> 20) & 15) * xb.z + float(q >> 28) * xb.w;
+                acc[r][t] += d * tt + m * sx;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// Up to three matrices on T inputs, 32 rows a block: y[j] + t * ldy + r (= or += when acc)
+struct MvV {
+    const uint8_t* w[3];
+    float* y[3];
+    int rows[3], nmat;
+    const float* X;
+    int ldx, n_in, T, ldy;
+    bool acc;
+};
+template <int T>
+__global__ void __launch_bounds__(256) k_v_mv(MvV J) {
+    __shared__ __align__(16) float sb[T * 256];
+    int rb = blockIdx.x * kMvRows, j = 0;
+    while (j < J.nmat - 1 && rb >= J.rows[j]) rb -= J.rows[j++];
+    const int lane = threadIdx.x & 31, r0 = rb + (threadIdx.x >> 5) * kMvRpw, nb = J.n_in / 32;
+    const size_t rowb = size_t(nb) * 20;
+    float acc[kMvRpw][kVMax] = {};
+    const float* xp[T];
+#pragma unroll
+    for (int t = 0; t < T; ++t) xp[t] = J.X + size_t(t) * J.ldx;
+    q4_rows_s<kMvRpw, T>(J.w[j] + size_t(r0) * rowb, rowb, nb, xp, sb, lane, acc);
+#pragma unroll
+    for (int t = 0; t < T; ++t)
+#pragma unroll
+        for (int r = 0; r < kMvRpw; ++r) {
+            const float v = warp_sum(acc[r][t]);
+            if (lane == 0) { float* y = J.y[j] + size_t(t) * J.ldy + r0 + r; *y = J.acc ? *y + v : v; }
+        }
+}
+// Router logits for T tokens (one warp an expert row, 4 a block), then in the last block: each token's top 6 (the
+// writing path's rule) and the distinct experts among them: un of them, ue[u] the expert, um[u] a bitmask of the tokens
+// that chose it, vu[t][k] the distinct index of token t's k-th choice.
+__global__ void __launch_bounds__(128) k_v_router(const float* X, const uint16_t* W, int T, float* logits, int* idx,
+                                                  float* wts, int* ue, int* um, int* vu, int* un, unsigned* done) {
+    __shared__ bool last;
+    const int lane = threadIdx.x & 31, e = blockIdx.x * 4 + (threadIdx.x >> 5);
+    for (int t = 0; t < T; ++t) {
+        const float* x = X + size_t(t) * kHidden;
+        float acc = 0;
+        for (int i = lane * 8; i < kHidden; i += 256) {
+            const uint4 w = *(const uint4*) (W + size_t(e) * kHidden + i);
+            const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+            for (int k = 0; k < 4; ++k) acc += __uint_as_float(ww[k] << 16) * x[i + 2 * k] + __uint_as_float(ww[k] & 0xffff0000u) * x[i + 2 * k + 1];
+        }
+        acc = warp_sum(acc);
+        if (lane == 0) logits[t * kExperts + e] = acc;
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(done, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const int w = threadIdx.x >> 5;
+    for (int t = w; t < T; t += 4) {
+        float sc[8];
+        for (int j = 0; j < 8; ++j) sc[j] = 1.f / (1.f + expf(-((volatile float*) logits)[t * kExperts + lane * 8 + j]));
+        float tot = 0, pv[kTopK];
+        int pi[kTopK];
+        for (int k = 0; k < kTopK; ++k) {
+            float v = -2.f;
+            int i = 0;
+            for (int j = 0; j < 8; ++j) if (sc[j] > v) { v = sc[j]; i = lane * 8 + j; }
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor(v, o, 32);
+                const int oi = __shfl_xor(i, o, 32);
+                if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
+            }
+            if (lane == i / 8) sc[i % 8] = -1.f;
+            pv[k] = v; pi[k] = i; tot += v;
+        }
+        if (lane == 0)
+            for (int k = 0; k < kTopK; ++k) { idx[t * kTopK + k] = pi[k]; wts[t * kTopK + k] = pv[k] / tot; }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int n = 0;
+        for (int t = 0; t < T; ++t)
+            for (int k = 0; k < kTopK; ++k) {
+                const int x = ((volatile int*) idx)[t * kTopK + k];
+                int u = 0;
+                while (u < n && ue[u] != x) ++u;
+                if (u == n) { ue[n] = x; um[n] = 0; ++n; }
+                um[u] |= 1 << t;
+                vu[t * kTopK + k] = u;
+            }
+        *un = n;
+        *done = 0;
+    }
+}
+// MoE gate/up for T tokens: grid.y = distinct expert u (or kVUniq: the shared expert), 32 rows a block; act[t] holds
+// the token's 6 experts at k * 512 (k its choice) and the shared expert at 3072
+template <int T>
+__global__ void __launch_bounds__(256) k_v_moe_gu(const float* X, const uint8_t* ge, const uint8_t* ue_, const uint8_t* gs,
+                                                  const uint8_t* us, const int* ue, const int* um, const int* vu,
+                                                  const int* un, float* act) {
+    __shared__ __align__(16) float sb[T * 256];
+    const int u = blockIdx.y;
+    const bool shared = u == kVUniq;
+    if (!shared && (u >= *un || blockIdx.x * kMvRows >= kFfExp)) return;
+    const int lane = threadIdx.x & 31, row = blockIdx.x * kMvRows + (threadIdx.x >> 5) * kMvRpw;
+    constexpr size_t rowb = size_t(kHidden / 32) * 20;
+    const uint8_t *G, *U;
+    if (shared) { G = gs + size_t(row) * rowb; U = us + size_t(row) * rowb; }
+    else { const size_t e = size_t(ue[u]) * kFfExp + row; G = ge + e * rowb; U = ue_ + e * rowb; }
+    // the tokens using this expert, packed (the shared one: all)
+    int tl[kVMax], nt = 0;
+    const int mask = shared ? (1 << T) - 1 : um[u];
+    for (int t = 0; t < T; ++t) if (mask >> t & 1) tl[nt++] = t;
+    float g[kMvRpw][kVMax] = {}, uu[kMvRpw][kVMax] = {};
+    const float* xp[T];
+#pragma unroll
+    for (int t = 0; t < T; ++t) xp[t] = (mask >> t & 1) ? X + size_t(t) * kHidden : nullptr;
+    q4_rows_s<kMvRpw, T>(G, rowb, kHidden / 32, xp, sb, lane, g);
+    q4_rows_s<kMvRpw, T>(U, rowb, kHidden / 32, xp, sb, lane, uu);
+    for (int i = 0; i < nt; ++i) {
+        const int t = tl[i];
+        int k = 0;
+        if (!shared) while (vu[t * kTopK + k] != u) ++k;
+        float* a = act + size_t(t) * kActRows + (shared ? kTopK * kFfExp : k * kFfExp);
+#pragma unroll
+        for (int r = 0; r < kMvRpw; ++r) {
+            const float gv = warp_sum(g[r][t]), uv = warp_sum(uu[r][t]);
+            if (lane == 0) a[row + r] = silu(gv) * uv;
+        }
+    }
+}
+// MoE down for T tokens: 32 output rows a block; each distinct expert's rows read once for the tokens that chose it
+template <int T>
+__global__ void __launch_bounds__(256) k_v_moe_down(float* H, const float* act, const uint8_t* de, const uint8_t* ds,
+                                                    const int* ue, const int* um, const int* vu, const float* wts,
+                                                    const int* un) {
+    __shared__ __align__(16) float sb[T * 256];
+    const int lane = threadIdx.x & 31, r0 = blockIdx.x * kMvRows + (threadIdx.x >> 5) * kMvRpw;
+    constexpr size_t rowe = size_t(kFfExp / 32) * 20, rows_ = size_t(kFfShared / 32) * 20;
+    float tot[kMvRpw][kVMax] = {};
+    const int n = *un;
+    for (int u = 0; u < n; ++u) {
+        const int e = ue[u], mask = um[u];
+        const float* xp[T];
+        float wk[T];
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            xp[t] = nullptr; wk[t] = 0.f;
+            if (mask >> t & 1) {
+                int k = 0;
+                while (vu[t * kTopK + k] != u) ++k;
+                xp[t] = act + size_t(t) * kActRows + k * kFfExp;
+                wk[t] = wts[t * kTopK + k];
+            }
+        }
+        float a[kMvRpw][kVMax] = {};
+        q4_rows_s<kMvRpw, T>(de + (size_t(e) * kHidden + r0) * rowe, rowe, kFfExp / 32, xp, sb, lane, a);
+#pragma unroll
+        for (int t = 0; t < T; ++t)
+#pragma unroll
+            for (int r = 0; r < kMvRpw; ++r) tot[r][t] += wk[t] * a[r][t];
+    }
+    const float* xs_[T];
+#pragma unroll
+    for (int t = 0; t < T; ++t) xs_[t] = act + size_t(t) * kActRows + kTopK * kFfExp;
+    q4_rows_s<kMvRpw, T>(ds + size_t(r0) * rows_, rows_, kFfShared / 32, xs_, sb, lane, tot);
+#pragma unroll
+    for (int t = 0; t < T; ++t)
+#pragma unroll
+        for (int r = 0; r < kMvRpw; ++r) {
+            const float v = warp_sum(tot[r][t]);
+            if (lane == 0) H[size_t(t) * kHidden + r0 + r] += v;
+        }
+}
+__global__ void k_v_embed(const float* table, const int* toks, float* H) {
+    const int t = blockIdx.x;
+    for (int i = threadIdx.x; i < kHidden; i += 256) H[size_t(t) * kHidden + i] = table[size_t(toks[t]) * kHidden + i];
+}
+// each row's most likely token (block t over row t of the T x n logits)
+__global__ void __launch_bounds__(1024) k_argmax_rows(const float* lg, int n, int* best) {
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    const float* l = lg + size_t(blockIdx.x) * n;
+    float v = -INFINITY;
+    int i = 0;
+    for (int j = threadIdx.x; j < n; j += 1024) if (l[j] > v) { v = l[j]; i = j; }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor(v, o, 32);
+        const int oi = __shfl_xor(i, o, 32);
+        if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
+    }
+    if ((threadIdx.x & 31) == 0) { bv[threadIdx.x >> 5] = v; bi[threadIdx.x >> 5] = i; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < 32; ++w) if (bv[w] > v || (bv[w] == v && bi[w] < i)) { v = bv[w]; i = bi[w]; }
+        best[blockIdx.x] = i;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------- the model
 struct Layer {
     const float *attn_norm, *ffn_norm, *q_norm, *k_norm, *sinks;
@@ -1205,6 +1502,110 @@ struct Model {
         if (check) { CK(cudaStreamSynchronize(st)); CK(cudaGetLastError()); }
         ++pos;
     }
+
+    // ------------------------------------------------ checking drafts: T tokens (the current one and T - 1 drafted)
+    float *vH = nullptr, *vX, *vQKV, *vATT, *vG, *vU, *vACT, *vLG, *vRL, *vW, *vPart;
+    int *vToks, *vIdx, *vUe, *vUm, *vVu, *vUn, *vBest;
+    int* vToksHost = nullptr;
+    int* vBestHost = nullptr;
+    unsigned* vDone;
+    cudaGraphExec_t vgraph[kVMax + 1] = {};
+    void v_alloc() {
+        if (vH) return;
+        auto f = [&](float*& p_, size_t n) { CK(cudaMalloc(&p_, n * 4)); };
+        auto fi = [&](int*& p_, size_t n) { CK(cudaMalloc(&p_, n * 4)); };
+        f(vH, kVMax * kHidden); f(vX, kVMax * kFfDense); f(vQKV, kVMax * (kQDim + 2 * kKvDim)); f(vATT, kVMax * kQDim);
+        f(vG, kVMax * kFfDense); f(vU, kVMax * kFfDense); f(vACT, kVMax * kActRows); f(vLG, size_t(kVMax) * vocab);
+        f(vRL, kVMax * kExperts); f(vW, kVMax * kTopK); f(vPart, size_t(kVMax) * kHeads * kAttnChunks * kPart);
+        fi(vToks, kVMax); fi(vIdx, kVMax * kTopK); fi(vUe, kVUniq); fi(vUm, kVUniq); fi(vVu, kVMax * kTopK); fi(vUn, 1);
+        fi(vBest, kVMax);
+        CK(cudaMalloc(&vDone, 4));
+        CK(cudaMemset(vDone, 0, 4));
+        CK(cudaMallocHost(&vToksHost, kVMax * 4));
+        CK(cudaMallocHost(&vBestHost, kVMax * 4));
+    }
+    template <class F> static void vdispatch(int T, F&& f) {
+        switch (T) {
+            case 1: f(std::integral_constant<int, 1>{}); break;
+            case 2: f(std::integral_constant<int, 2>{}); break;
+            case 3: f(std::integral_constant<int, 3>{}); break;
+            case 4: f(std::integral_constant<int, 4>{}); break;
+            case 5: f(std::integral_constant<int, 5>{}); break;
+            case 6: f(std::integral_constant<int, 6>{}); break;
+            case 7: f(std::integral_constant<int, 7>{}); break;
+            default: f(std::integral_constant<int, 8>{}); break;
+        }
+    }
+    void v_mv(std::initializer_list<std::pair<const uint8_t*, float*>> mats, std::initializer_list<int> rows,
+              const float* X, int ldx, int n_in, int T, int ldy, bool accum) {
+        MvV J{};
+        int j = 0, total = 0;
+        for (auto& m_ : mats) { J.w[j] = m_.first; J.y[j] = m_.second; ++j; }
+        j = 0;
+        for (int r : rows) { J.rows[j++] = r; total += r; }
+        J.nmat = j; J.X = X; J.ldx = ldx; J.n_in = n_in; J.T = T; J.ldy = ldy; J.acc = accum;
+        vdispatch(T, [&](auto tc) { k_v_mv<decltype(tc)::value><<<total / kMvRows, 256, 0, st>>>(J); });
+    }
+    void v_record(int T) {
+        const int NQKV = kQDim + 2 * kKvDim;
+        k_v_embed<<<T, 256, 0, st>>>(embed, vToks, vH);
+        for (int i = 0; i < kLayers; ++i) {
+            Layer& l = L[i];
+            k_v_norm<<<T, 256, 0, st>>>(vH, l.attn_norm, vX);
+            v_mv({{l.wq, vQKV}, {l.wk, vQKV + kQDim}, {l.wv, vQKV + kQDim + kKvDim}}, {kQDim, kKvDim, kKvDim}, vX, kHidden, kHidden, T, NQKV, false);
+            k_qkv_post<<<dim3(kHeads + kKv, 1, T), kHd, 0, st>>>(vQKV, vQKV + kQDim, vQKV + kQDim + kKvDim, l.q_norm, l.k_norm, l.K, l.V, state, l.swa, l.kv_mask, NQKV);
+            if (l.swa) k_attn_part<<<dim3(kHeads, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV);
+            else k_attn_dec_w<<<dim3(kKv, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV);
+            k_attn_merge<<<dim3(kHeads, 1, T), kHd, 0, st>>>(vPart, l.sinks, vATT);
+            v_mv({{l.wo, vH}}, {kHidden}, vATT, kQDim, kQDim, T, kHidden, true);
+            k_v_norm<<<T, 256, 0, st>>>(vH, l.ffn_norm, vX);
+            if (i < kDense) {
+                v_mv({{l.gate, vG}, {l.up, vU}}, {kFfDense, kFfDense}, vX, kHidden, kHidden, T, kFfDense, false);
+                k_v_swiglu<<<dim3(kFfDense / 256, T), 256, 0, st>>>(vG, vU, vG, kFfDense, kFfDense);
+                v_mv({{l.down, vH}}, {kHidden}, vG, kFfDense, kFfDense, T, kHidden, true);
+                continue;
+            }
+            k_v_router<<<kExperts / 4, 128, 0, st>>>(vX, l.router, T, vRL, vIdx, vW, vUe, vUm, vVu, vUn, vDone);
+            vdispatch(T, [&](auto tc) {
+                constexpr int TT = decltype(tc)::value;
+                k_v_moe_gu<TT><<<dim3(kFfShared / kMvRows, kVUniq + 1), 256, 0, st>>>(vX, l.gate_e, l.up_e, l.gate_s, l.up_s, vUe, vUm, vVu, vUn, vACT);
+                k_v_moe_down<TT><<<kHidden / kMvRows, 256, 0, st>>>(vH, vACT, l.down_e, l.down_s, vUe, vUm, vVu, vW, vUn);
+            });
+        }
+        k_v_norm<<<T, 256, 0, st>>>(vH, out_norm, vX);
+        v_mv({{head, vLG}}, {vocab}, vX, kHidden, kHidden, T, vocab, false);
+        k_argmax_rows<<<T, 1024, 0, st>>>(vLG, vocab, vBest);
+    }
+    // the T tokens through the model at pos .. pos + T - 1 (their K/V written); afterwards each row's most likely next
+    // token in vBestHost and the logits in vLG. pos is not moved: v_commit does that.
+    void verify(const int* toks, int T) {
+        v_alloc();
+        std::memcpy(vToksHost, toks, T * 4);
+        CK(cudaMemcpyAsync(vToks, vToksHost, T * 4, cudaMemcpyHostToDevice, st));
+        static const bool no_graph = std::getenv("FLINT_NO_GRAPH") != nullptr;
+        if (no_graph) v_record(T);
+        else {
+            if (!vgraph[T]) {
+                cudaGraph_t g;
+                CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+                v_record(T);
+                CK(cudaStreamEndCapture(st, &g));
+                CK(cudaGraphInstantiate(&vgraph[T], g, nullptr, nullptr, 0));
+                CK(cudaGraphDestroy(g));
+            }
+            CK(cudaGraphLaunch(vgraph[T], st));
+        }
+        CK(cudaMemcpyAsync(vBestHost, vBest, T * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+    }
+    // keep n of the checked tokens: the next position is pos + n, the next token goes into state[1]
+    void v_commit(int n, int next) {
+        pos += n;
+        const int v[2] = {pos, next};
+        CK(cudaMemcpyAsync(state, v, 8, cudaMemcpyHostToDevice, st));
+        CK(cudaStreamSynchronize(st));
+    }
+
     // the position the next token goes to (a request reusing a shorter prefix than the cache holds)
     void set_pos(int p) {
         pos = p;
@@ -1487,6 +1888,39 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     Model m(path, ctx);
     if (std::getenv("FLINT_GEMM_TEST")) { m.gemm_test(); return 0; }
+    if (std::getenv("FLINT_VTEST")) {   // (checking) the draft-checking pass against plain writing
+        m.prefill(ids, 8192);
+        const int p0 = m.pos;
+        std::vector<int> seq;
+        for (int i = 0; i < 40; ++i) { seq.push_back(m.next_token()); m.step(-1); }
+        int same = 0, total = 0;
+        for (int start = 0; start + 9 <= 40; start += 8) {
+            m.set_pos(p0 + start);
+            m.verify(seq.data() + start, 8);
+            for (int i = 0; i < 8; ++i) { same += m.vBestHost[i] == seq[start + i + 1]; ++total; }
+        }
+        std::printf("checking pass agrees with plain writing on %d of %d next tokens\n", same, total);
+        for (int T = 1; T <= kVMax; ++T) {
+            m.set_pos(p0);
+            for (int r = 0; r < 3; ++r) m.verify(seq.data(), T);
+            const auto a0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < 20; ++r) m.verify(seq.data(), T);
+            std::printf("checking %d tokens: %.2f ms\n", T, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a0).count() / 20);
+        }
+        return 0;
+    }
+    if (std::getenv("FLINT_TTEST")) {   // (measuring) small batches on the prompt path after a prompt
+        m.prefill(ids, 8192);
+        std::vector<int> few(16, 13);
+        for (int T : {1, 2, 3, 4, 6, 9, 16}) {
+            for (int r = 0; r < 3; ++r) m.prefill_chunk(few.data(), T);
+            const auto a0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < 10; ++r) m.prefill_chunk(few.data(), T);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a0).count() / 10;
+            std::printf("prompt path, %2d tokens: %.2f ms\n", T, ms);
+        }
+        return 0;
+    }
     if (serve_mode) {
         std::fprintf(stderr, "strata-flint: K/V for %d positions: %.2f GB\n", ctx, m.kv_bytes / 1e9);
         const int ch = std::min(8192, std::getenv("FLINT_CHUNK") ? std::atoi(std::getenv("FLINT_CHUNK")) : 8192);
