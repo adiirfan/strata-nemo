@@ -41,6 +41,9 @@ constexpr int kHidden = 2048, kLayers = 49, kDense = 2;
 constexpr int kHeads = 32, kKv = 4, kHd = 128, kQDim = kHeads * kHd, kKvDim = kKv * kHd;
 constexpr int kFfDense = 6144, kExperts = 256, kTopK = 6, kFfExp = 512, kFfShared = 1024;
 constexpr int kWindow = 513;
+#ifndef FLINT_SELFROUND
+#define FLINT_SELFROUND 0   // (the current position's V rounded as stored, in its own attention)
+#endif
 #ifndef FLINT_MINCHUNK
 #define FLINT_MINCHUNK 64   // attention: at least this many keys a chunk (short contexts: fewer chunks to merge)
 #endif
@@ -58,6 +61,22 @@ typedef __half vc_t;
 #endif
 __device__ inline float c2f(__half v) { return __half2float(v); }
 __device__ inline float c2f(float v) { return v; }
+// (experiment) FLINT_Q8SIM=1: the full layers' K and V rounded to 8 bits with one scale per head row before storing
+__constant__ int q8sim = 0, q8grp = 128;
+__device__ inline float q8rt(float x, float amax, int bit = 3) {
+    if (!(q8sim & bit) || amax == 0.f) return x;
+    const float d = amax / 127.f;
+    return rintf(x / d) * d;
+}
+// The full layers' V in 8 bits (values a head row of 128 share one scale): their K stays fp16 (8-bit K cost KL 0.011
+// on Flint, 8-bit V 0.007 against 0.006 for fp16). q null: V is the plain cache.
+struct V8 { int8_t* q; float* s; };
+// v (128 values of one position and K/V head, one a thread of 128) into the 8-bit store; amax over the 128 given
+__device__ inline void v8_put(V8 st, size_t slot, int kh, int i, float v, float amax) {
+    const float d = amax > 0.f ? amax / 127.f : 1.f;
+    st.q[slot * kKvDim + kh * kHd + i] = int8_t(max(-127.f, min(127.f, rintf(v / d))));
+    if (i == 0) st.s[slot * kKv + kh] = d;
+}
 template <class T> __device__ inline T f2c(float v);
 template <> __device__ inline __half f2c<__half>(float v) { return __float2half(v); }
 template <> __device__ inline float f2c<float>(float v) { return v; }   // sliding layers' K/V slots: the window plus the largest prompt chunk (8192)
@@ -300,7 +319,7 @@ __global__ void __launch_bounds__(128) k_router(const float* h, const float* nw,
 // query heads, 32-35 the K/V heads; 128 threads.
 // (blockIdx.z: the z-th of several tokens at positions state[0] + z, its q / k / v zs floats further on)
 __global__ void k_qkv_post(float* q, const float* k, const float* v, const float* qn, const float* kn, kc_t* K,
-                           vc_t* V, const int* state, bool rope, int kv_mask, int zs = 0) {
+                           vc_t* V, const int* state, bool rope, int kv_mask, int zs = 0, V8 v8 = {}) {
     __shared__ float sh[4];
     __shared__ float t[kHd];
     q += blockIdx.z * zs; k += blockIdx.z * zs; v += blockIdx.z * zs;
@@ -323,8 +342,26 @@ __global__ void k_qkv_post(float* q, const float* k, const float* v, const float
     else {
         const int kh = hb - kHeads;
         const size_t r = size_t(pos & kv_mask) * kKvDim + kh * kHd + i;
-        K[r] = f2c<kc_t>(y);
-        V[r] = f2c<vc_t>(v[kh * kHd + i]);
+        const float vv = v[kh * kHd + i];
+        float ak = 0, av = 0;
+        if (q8sim && !rope) {
+            __shared__ float mk[4], mv[4];
+            float a = fabsf(y), b = fabsf(vv);
+            for (int o = 16; o > 0; o >>= 1) { a = fmaxf(a, __shfl_xor(a, o, 32)); b = fmaxf(b, __shfl_xor(b, o, 32)); }
+            if ((i & 31) == 0) { mk[i >> 5] = a; mv[i >> 5] = b; }
+            __syncthreads();
+            if (q8grp == 32) { ak = mk[i >> 5]; av = mv[i >> 5]; }
+            else { ak = fmaxf(fmaxf(mk[0], mk[1]), fmaxf(mk[2], mk[3])); av = fmaxf(fmaxf(mv[0], mv[1]), fmaxf(mv[2], mv[3])); }
+        }
+        K[r] = f2c<kc_t>(q8rt(y, ak, 1));
+        if (v8.q) {
+            __shared__ float m8[4];
+            float a = fabsf(vv);
+            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
+            if ((i & 31) == 0) m8[i >> 5] = a;
+            __syncthreads();
+            v8_put(v8, size_t(pos & kv_mask), kh, i, vv, fmaxf(fmaxf(m8[0], m8[1]), fmaxf(m8[2], m8[3])));
+        } else V[r] = f2c<vc_t>(q8rt(vv, av, 2));
     }
 }
 
@@ -341,7 +378,7 @@ __device__ inline float4 h4(const __half* p) {
 // The writing path's attention also does what k_qkv_post did when F.qn is set: q (its head) and this position's k
 // RMSNorm (+ RoPE on sliding layers) from the raw products, k / v of this position into the cache (one block a K/V
 // head writes them), and that position's key used from LDS (other blocks may not have written it yet).
-struct AttnFuse { const float *k, *v, *qn, *kn; kc_t* Kw; vc_t* Vw; };
+struct AttnFuse { const float *k, *v, *qn, *kn; kc_t* Kw; vc_t* Vw; };   // (the 8-bit V store comes as the kernel's v8)
 // rmsnorm * w (+ NEOX RoPE at pos) of 128 values in place, by one warp (4 a lane)
 __device__ inline void head_norm_warp(float* t, const float* w, int pos, bool rope, int lane) {
     float y[4], ss = 0;
@@ -431,7 +468,7 @@ __global__ void __launch_bounds__(256) k_attn_part(const float* q, const kc_t* K
 __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q, const kc_t* __restrict__ K,
                                                     const vc_t* __restrict__ V, float* __restrict__ part,
                                                     const int* __restrict__ state, int swa, int kv_mask, int zs = 0,
-                                                    AttnFuse F = {}) {
+                                                    AttnFuse F = {}, V8 v8 = {}) {
     q += blockIdx.z * zs;
     part += size_t(blockIdx.z) * kHeads * kAttnChunks * kPart;
     __shared__ __align__(16) float qf8[8][kHd], kf[kHd], vf[kHd];
@@ -455,8 +492,14 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
         __syncthreads();
         if (c == 0 && tid < kHd) {
             const size_t r = size_t(pos & kv_mask) * kKvDim + kh * kHd + tid;
-            F.Kw[r] = f2c<kc_t>(kf[tid]);
-            F.Vw[r] = f2c<vc_t>(vf[tid]);
+            float ak = 0, av = 0;
+            if (q8sim) { const int g0 = tid / q8grp * q8grp; for (int i = g0; i < g0 + q8grp; ++i) { ak = fmaxf(ak, fabsf(kf[i])); av = fmaxf(av, fabsf(vf[i])); } }
+            F.Kw[r] = f2c<kc_t>(q8rt(kf[tid], ak, 1));
+            if (v8.q) {
+                float a8 = 0;
+                for (int i = 0; i < kHd; ++i) a8 = fmaxf(a8, fabsf(vf[i]));
+                v8_put(v8, size_t(pos & kv_mask), kh, tid, vf[tid], a8);
+            } else F.Vw[r] = f2c<vc_t>(q8rt(vf[tid], av, 2));
         }
     }
     pf_v8h qb[8];
@@ -475,9 +518,26 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
             const int p = t0 + l16;
             const bool ok = p < b0;
             const vc_t* vr = V + size_t(p & kv_mask) * kKvDim + kh * kHd + g * 64;
-            if (fused && p == pos)
-                for (int d = 0; d < 64; ++d) vt[warp][g * 64 + d][l16] = (_Float16) c2f(f2c<vc_t>(vf[g * 64 + d]));
-            else if constexpr (sizeof(vc_t) == 2) {
+            if (fused && p == pos) {
+                float a8 = 0;
+                if (v8.q) for (int i = 0; i < kHd; ++i) a8 = fmaxf(a8, fabsf(vf[i]));
+                const float d8 = a8 > 0.f ? a8 / 127.f : 1.f;
+                for (int d = 0; d < 64; ++d) {
+                    const float x = vf[g * 64 + d];
+                    static constexpr bool kSelfRound = FLINT_SELFROUND;
+                    vt[warp][g * 64 + d][l16] = (_Float16) (v8.q && kSelfRound ? max(-127.f, min(127.f, rintf(x / d8))) * d8 : c2f(f2c<vc_t>(x)));
+                }
+            } else if (v8.q) {
+                const float d8 = ok ? v8.s[size_t(p & kv_mask) * kKv + kh] : 0.f;
+                const int8_t* qr = v8.q + size_t(p & kv_mask) * kKvDim + kh * kHd + g * 64;
+#pragma unroll
+                for (int d16 = 0; d16 < 4; ++d16) {
+                    const uint4 u = ok ? *(const uint4*) (qr + d16 * 16) : make_uint4(0, 0, 0, 0);
+                    const int8_t* b = (const int8_t*) &u;
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) vt[warp][g * 64 + d16 * 16 + i][l16] = (_Float16) (float(b[i]) * d8);
+                }
+            } else if constexpr (sizeof(vc_t) == 2) {
 #pragma unroll
                 for (int d8 = 0; d8 < 8; ++d8) {
                     const pf_v8h vv = ok ? __builtin_bit_cast(pf_v8h, *(const uint4*) (vr + d8 * 8)) : pf_v8h{};
@@ -1004,7 +1064,7 @@ __global__ void k_pf_embed(const float* table, const int* ids, float* H) {
 }
 // q / k heads: RMSNorm (+ NEOX RoPE on sliding layers) at position p0 + t; q back in place, k and v into the cache.
 // grid (36 heads, T), 128 threads
-__global__ void k_pf_qkpost(float* QKV, const float* qn, const float* kn, kc_t* K, vc_t* V, int p0, bool rope, int kv_mask) {
+__global__ void k_pf_qkpost(float* QKV, const float* qn, const float* kn, kc_t* K, vc_t* V, int p0, bool rope, int kv_mask, V8 v8 = {}) {
     __shared__ float sh[4];
     __shared__ float tb[kHd];
     const int hb = blockIdx.x, t = blockIdx.y, i = threadIdx.x, pos = p0 + t;
@@ -1028,8 +1088,26 @@ __global__ void k_pf_qkpost(float* QKV, const float* qn, const float* kn, kc_t* 
     else {
         const int kh = hb - kHeads;
         const size_t r = size_t(pos & kv_mask) * kKvDim + kh * kHd + i;
-        K[r] = f2c<kc_t>(y);
-        V[r] = f2c<vc_t>(row[kQDim + kKvDim + kh * kHd + i]);
+        const float vv = row[kQDim + kKvDim + kh * kHd + i];
+        float ak = 0, av = 0;
+        if (q8sim && !rope) {
+            __shared__ float mk[4], mv[4];
+            float a = fabsf(y), b = fabsf(vv);
+            for (int o = 16; o > 0; o >>= 1) { a = fmaxf(a, __shfl_xor(a, o, 32)); b = fmaxf(b, __shfl_xor(b, o, 32)); }
+            if ((i & 31) == 0) { mk[i >> 5] = a; mv[i >> 5] = b; }
+            __syncthreads();
+            if (q8grp == 32) { ak = mk[i >> 5]; av = mv[i >> 5]; }
+            else { ak = fmaxf(fmaxf(mk[0], mk[1]), fmaxf(mk[2], mk[3])); av = fmaxf(fmaxf(mv[0], mv[1]), fmaxf(mv[2], mv[3])); }
+        }
+        K[r] = f2c<kc_t>(q8rt(y, ak, 1));
+        if (v8.q) {
+            __shared__ float m8[4];
+            float a = fabsf(vv);
+            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
+            if ((i & 31) == 0) m8[i >> 5] = a;
+            __syncthreads();
+            v8_put(v8, size_t(pos & kv_mask), kh, i, vv, fmaxf(fmaxf(m8[0], m8[1]), fmaxf(m8[2], m8[3])));
+        } else V[r] = f2c<vc_t>(q8rt(vv, av, 2));
     }
 }
 
@@ -1040,7 +1118,7 @@ __global__ void k_pf_qkpost(float* QKV, const float* qn, const float* kn, kc_t* 
 // and adds O^T += V^T P^T (dims x queries). K and V go through LDS as fp16 (V transposed), Q and P are fp16, sums fp32.
 __global__ void __launch_bounds__(256) k_pf_attn_w(const float* __restrict__ QKV, const kc_t* __restrict__ K,
                                                    const vc_t* __restrict__ V, const float* __restrict__ sinks,
-                                                   float* __restrict__ ATT, int p0, int T, int swa, int kv_mask) {
+                                                   float* __restrict__ ATT, int p0, int T, int swa, int kv_mask, V8 v8 = {}) {
     constexpr int KT = 64;
     __shared__ __align__(16) _Float16 ks[KT][kHd + 8];
     __shared__ __align__(16) _Float16 vt[kHd][KT + 8];
@@ -1074,10 +1152,16 @@ __global__ void __launch_bounds__(256) k_pf_attn_w(const float* __restrict__ QKV
             const bool ok = p <= last;
             const kc_t* kr = K + size_t(p & kv_mask) * kKvDim + kh * kHd + c0;
             const vc_t* vr = V + size_t(p & kv_mask) * kKvDim + kh * kHd + c0;
+            // (8-bit V: this chunk's own keys use their exact values from QKV - rounding a key's own value in its
+            // attention cost KL 0.02 - and only older positions come from the 8-bit store)
+            const bool own = v8.q && p >= p0;
+            const float* vraw = own ? QKV + size_t(p - p0) * (kQDim + 2 * kKvDim) + kQDim + kKvDim + kh * kHd + c0 : nullptr;
+            const float d8 = v8.q && ok && !own ? v8.s[size_t(p & kv_mask) * kKv + kh] : 0.f;
+            const int8_t* qr = v8.q && !own ? v8.q + size_t(p & kv_mask) * kKvDim + kh * kHd + c0 : nullptr;
 #pragma unroll
             for (int c = 0; c < 32; ++c) {
                 ks[key][c0 + c] = (_Float16) (ok ? c2f(kr[c]) : 0.f);
-                vt[c0 + c][key] = (_Float16) (ok ? c2f(vr[c]) : 0.f);
+                vt[c0 + c][key] = (_Float16) (!ok ? 0.f : own ? vraw[c] : qr ? float(qr[c]) * d8 : c2f(vr[c]));
             }
         }
         pf_sync();
@@ -2078,6 +2162,7 @@ struct Layer {
     kc_t* K = nullptr;   // [slot][K/V head][128]
     vc_t* V = nullptr;
     int kv_mask = 0x7fffffff;              // slot = position & kv_mask (a ring on the sliding layers)
+    V8 v8{};                               // the full layers' 8-bit V (then V is unused)
 };
 
 struct Model {
@@ -2136,6 +2221,11 @@ struct Model {
     }
 
     Model(const std::string& path, int ctx) : max_ctx(ctx) {
+        if (std::getenv("FLINT_Q8SIM")) {
+            const int bits = std::atoi(std::getenv("FLINT_Q8SIM")), grp = std::getenv("FLINT_Q8GRP") ? std::atoi(std::getenv("FLINT_Q8GRP")) : 128;
+            CK(cudaMemcpyToSymbol(q8sim, &bits, 4));
+            CK(cudaMemcpyToSymbol(q8grp, &grp, 4));
+        }
         g = std::make_unique<strata::GgufFile>(path);
         const auto* arch = g->get("general.architecture");
         if (!arch || arch->s != "flint") { std::fprintf(stderr, "strata-flint: %s is not a Flint GGUF\n", path.c_str()); std::exit(1); }
@@ -2191,8 +2281,16 @@ struct Model {
             const size_t rows = l.swa && max_ctx > ring ? ring : max_ctx;
             if (l.swa && rows == size_t(ring)) l.kv_mask = ring - 1;
             CK(cudaMalloc(&l.K, rows * kKvDim * sizeof(kc_t)));
-            CK(cudaMalloc(&l.V, rows * kKvDim * sizeof(vc_t)));
-            kv_bytes += rows * kKvDim * (sizeof(kc_t) + sizeof(vc_t));
+            static const bool v16 = std::getenv("FLINT_V16") != nullptr;   // (fp16 V on the full layers too)
+            if (!l.swa && !v16) {
+                CK(cudaMalloc(&l.v8.q, rows * kKvDim));
+                CK(cudaMalloc(&l.v8.s, rows * kKv * 4));
+                kv_bytes += rows * kKvDim * (sizeof(kc_t) + 1) + rows * kKv * 4;
+                l.V = nullptr;
+            } else {
+                CK(cudaMalloc(&l.V, rows * kKvDim * sizeof(vc_t)));
+                kv_bytes += rows * kKvDim * (sizeof(kc_t) + sizeof(vc_t));
+            }
         }
         {   // the token table (1.2 GB fp32) stays in pinned host memory: the card reads one 8 KB row a token over the bus
             const strata::TensorInfo* t = g->find("token_embd.weight");
@@ -2229,7 +2327,7 @@ struct Model {
             CK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&per, k_token, 256, kActRows * 4));
             hipFuncAttributes fa;
             CK(hipFuncGetAttributes(&fa, (const void*) k_token));
-            if (want > 0 && want < kMegaTot && per * pr.multiProcessorCount >= kMegaTot) mega_g = want;
+            if (want > 0 && want < kMegaTot && per * pr.multiProcessorCount >= kMegaTot && std::getenv("FLINT_V16")) mega_g = want;   // (fp16 V only)
             if (want > 0) std::fprintf(stderr, "strata-flint: one-launch step %s (%d workers, %d prefetchers; %d blocks fit a unit x %d, %d registers)\n",
                                        mega_g ? "on" : "off", mega_g, kMegaTot - mega_g, per, pr.multiProcessorCount, fa.numRegs);
             std::vector<MegaLayer> ml(kLayers);
@@ -2351,9 +2449,9 @@ struct Model {
             k_split16<<<T, 256, 0, st>>>(vH, nullptr, l.attn_norm, kHidden, vXH, vXL, vXS);
             // (k_split16 writes rows of K = 2048 at stride K: the VgIn stride is the split's K)
             vg({{l.wq, vQKV}, {l.wk, vQKV + kQDim}, {l.wv, vQKV + kQDim + kKvDim}}, {kQDim, kKvDim, kKvDim}, kHidden, T, NQKV, 0, VgIn{vXH, vXL, vXS, kHidden});
-            k_qkv_post<<<dim3(kHeads + kKv, 1, T), kHd, 0, st>>>(vQKV, vQKV + kQDim, vQKV + kQDim + kKvDim, l.q_norm, l.k_norm, l.K, l.V, state, l.swa, l.kv_mask, NQKV);
+            k_qkv_post<<<dim3(kHeads + kKv, 1, T), kHd, 0, st>>>(vQKV, vQKV + kQDim, vQKV + kQDim + kKvDim, l.q_norm, l.k_norm, l.K, l.V, state, l.swa, l.kv_mask, NQKV, l.v8);
             if (l.swa) k_attn_part<<<dim3(kHeads, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV);
-            else k_attn_dec_w<<<dim3(kKv, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV);
+            else k_attn_dec_w<<<dim3(kKv, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV, {}, l.v8);
             k_attn_merge<<<dim3(kHeads, 1, T), kHd, 0, st>>>(vPart, l.sinks, vATT);
             k_split16<<<T, 256, 0, st>>>(vATT, nullptr, nullptr, kQDim, vXH, vXL, vXS);
             vg({{l.wo, vH}}, {kHidden}, kQDim, T, kHidden, 1, VgIn{vXH, vXL, vXS, kQDim});
@@ -2398,9 +2496,9 @@ struct Model {
                 if (pf) prefetch(i + 1);
             }
             v_mv({{l.wq, vQKV}, {l.wk, vQKV + kQDim}, {l.wv, vQKV + kQDim + kKvDim}}, {kQDim, kKvDim, kKvDim}, vH, kHidden, kHidden, T, NQKV, false, l.attn_norm);
-            k_qkv_post<<<dim3(kHeads + kKv, 1, T), kHd, 0, st>>>(vQKV, vQKV + kQDim, vQKV + kQDim + kKvDim, l.q_norm, l.k_norm, l.K, l.V, state, l.swa, l.kv_mask, NQKV);
+            k_qkv_post<<<dim3(kHeads + kKv, 1, T), kHd, 0, st>>>(vQKV, vQKV + kQDim, vQKV + kQDim + kKvDim, l.q_norm, l.k_norm, l.K, l.V, state, l.swa, l.kv_mask, NQKV, l.v8);
             if (l.swa) k_attn_part<<<dim3(kHeads, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV);
-            else k_attn_dec_w<<<dim3(kKv, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV);
+            else k_attn_dec_w<<<dim3(kKv, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV, {}, l.v8);
             k_attn_merge<<<dim3(kHeads, 1, T), kHd, 0, st>>>(vPart, l.sinks, vATT);
             v_mv({{l.wo, vH}}, {kHidden}, vATT, kQDim, kQDim, T, kHidden, true);
             k_v_norm<<<T, 256, 0, st>>>(vH, l.ffn_norm, vX);
@@ -2542,8 +2640,8 @@ struct Model {
             pf_gemm(l.wq, kQDim, kHidden, T, pQKV, NQKV, 0);
             pf_gemm(l.wk, kKvDim, kHidden, T, pQKV + kQDim, NQKV, 0);
             pf_gemm(l.wv, kKvDim, kHidden, T, pQKV + kQDim + kKvDim, NQKV, 0);
-            k_pf_qkpost<<<dim3(kHeads + kKv, T), kHd, 0, st>>>(pQKV, l.q_norm, l.k_norm, l.K, l.V, p0, l.swa, l.kv_mask);
-            k_pf_attn_w<<<dim3(kKv, (T + 15) / 16), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa, l.kv_mask);
+            k_pf_qkpost<<<dim3(kHeads + kKv, T), kHd, 0, st>>>(pQKV, l.q_norm, l.k_norm, l.K, l.V, p0, l.swa, l.kv_mask, l.v8);
+            k_pf_attn_w<<<dim3(kKv, (T + 15) / 16), 256, 0, st>>>(pQKV, l.K, l.V, l.sinks, pATT, p0, T, l.swa, l.kv_mask, l.v8);
             pf_split(pATT, nullptr, nullptr, kQDim, T);
             pf_gemm(l.wo, kHidden, kQDim, T, pH, kHidden, 1);
             pf_split(pH, nullptr, l.ffn_norm, kHidden, T);
@@ -2683,8 +2781,8 @@ struct Model {
             // the sliding layers (at most 513 keys) keep the per-head kernel; the full layers, whose keys grow with the
             // context, read each key once for the 8 heads sharing it
             static const bool attn_old = std::getenv("FLINT_ATTN_OLD") != nullptr;
-            if (attn_old || l.swa) k_attn_part<<<dim3(kHeads, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask, 0, F);
-            else k_attn_dec_w<<<dim3(kKv, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask, 0, F);
+            if ((attn_old && !l.v8.q) || l.swa) k_attn_part<<<dim3(kHeads, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask, 0, F);
+            else k_attn_dec_w<<<dim3(kKv, kAttnChunks), 256, 0, st>>>(q, l.K, l.V, part, state, l.swa, l.kv_mask, 0, F, l.v8);
             k_attn_merge<<<kHeads, kHd, 0, st>>>(part, l.sinks, att);
             mv_in({{l.wo, h}}, {kHidden}, att, kQDim, nullptr, nullptr, true);
             if (i < kDense) {
@@ -2809,6 +2907,11 @@ int main(int argc, char** argv) {
         return serve(m, eos_ids, ch);
     }
     std::fprintf(stderr, "strata-flint: K/V for %d positions: %.2f GB\n", ctx, m.kv_bytes / 1e9);
+    {
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        std::fprintf(stderr, "strata-flint: card memory %.2f GB free of %.2f GB after load\n", fr / 1e9, tot / 1e9);
+    }
     std::fprintf(stderr, "strata-flint: %.1f GB on the card in %.1f s\n", m.loaded / 1e9,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     FILE* top = top_path.empty() ? nullptr : std::fopen(top_path.c_str(), "w");
