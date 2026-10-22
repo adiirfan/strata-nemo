@@ -402,6 +402,167 @@ __global__ void k_embed(const float* table, const int* state, float* h) {
     if (i < kHidden) h[i] = table[size_t(tok) * kHidden + i];
 }
 
+
+// ---------------------------------------------------------------------------------------------------- prompt path (many tokens)
+// Inputs go to the matrix units as two fp16 numbers a value, hi + lo (hi = fp16(x * s), lo = fp16(x * s - hi), s a
+// power of two putting the row's largest magnitude in [2^14, 2^15)): hi alone cost KL 0.006 on Flint, hi + lo is near
+// fp32. Weights are unpacked from Q4_1 to fp16 (d * q + m, one rounding: KL 0.0015).
+typedef _Float16 pf_v8h __attribute__((ext_vector_type(8)));
+typedef float pf_v8f __attribute__((ext_vector_type(8)));
+typedef _Float16 pf_v2h __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ pf_v8f pf_wmma(const pf_v8h& a, const pf_v8h& b, const pf_v8f& c) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#else
+    __trap();
+    return c;
+#endif
+}
+// LDS-only barrier (a __syncthreads' fence also covers global memory and invalidates the vector caches on gfx12)
+__device__ __forceinline__ void pf_sync() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+// rows of x (T x K fp32; rmsnorm * nw first when nw; silu(x) * x2 when x2) to hi / lo fp16 and the row's scale back
+__global__ void __launch_bounds__(256) k_split16(const float* x, const float* x2, const float* nw, int K, uint16_t* xh,
+                                                 uint16_t* xl, float* xs) {
+    const int t = blockIdx.x;
+    const float* r = x + size_t(t) * K;
+    const float* r2 = x2 ? x2 + size_t(t) * K : nullptr;
+    __shared__ float red[8], redm[8];
+    float ss = 0, mx = 0;
+    for (int i = threadIdx.x; i < K; i += 256) {
+        const float v = r2 ? silu(r[i]) * r2[i] : r[i];
+        ss += v * v;
+        mx = fmaxf(mx, fabsf(nw ? v * nw[i] : v));
+    }
+    ss = warp_sum(ss);
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 32));
+    if ((threadIdx.x & 31) == 0) { red[threadIdx.x >> 5] = ss; redm[threadIdx.x >> 5] = mx; }
+    __syncthreads();
+    float tot = 0, m = 0;
+    for (int i = 0; i < 8; ++i) { tot += red[i]; m = fmaxf(m, redm[i]); }
+    const float rn = nw ? rsqrtf(tot / K + kEps) : 1.f;
+    m *= rn;
+    const int e = m > 0.f ? ilogbf(m) : 0;
+    const float up = ldexpf(1.f, 14 - e);
+    for (int i = threadIdx.x; i < K; i += 256) {
+        float v = r2 ? silu(r[i]) * r2[i] : r[i];
+        if (nw) v = v * rn * nw[i];
+        const float a = v * up;
+        const __half hi = __float2half(a);
+        const __half lo = __float2half(a - __half2float(hi));
+        xh[size_t(t) * K + i] = __half_as_ushort(hi);
+        xl[size_t(t) * K + i] = __half_as_ushort(lo);
+    }
+    if (threadIdx.x == 0) xs[t] = ldexpf(1.f, e - 14);
+}
+// the 8 fp16 weights of a lane's A operand: row W (Q4_1, GGUF layout), values k .. k + 7 (k a multiple of 8)
+__device__ __forceinline__ pf_v8h pf_q41_a8(const uint8_t* W, int k) {
+    const uint8_t* B = W + (k >> 5) * 20;
+    const int j0 = k & 31;
+    const uint32_t dm = *(const uint32_t*) B;
+    const uint2 qq = *(const uint2*) (B + 4 + (j0 & 15));
+    const int sh = j0 >= 16 ? 4 : 0;
+    const uint32_t u0 = (qq.x >> sh) & 0x0F0F0F0Fu, u1 = (qq.y >> sh) & 0x0F0F0F0Fu;
+    // bytes q0 q1 q2 q3 -> halves (1024 + q0, 1024 + q1), (1024 + q2, 1024 + q3)
+    const uint32_t c = 0x64646464u;
+    const uint32_t h0 = __builtin_amdgcn_perm(c, u0, 0x07010700u), h1 = __builtin_amdgcn_perm(c, u0, 0x07030702u);
+    const uint32_t h2 = __builtin_amdgcn_perm(c, u1, 0x07010700u), h3 = __builtin_amdgcn_perm(c, u1, 0x07030702u);
+    const pf_v2h off = {(_Float16) -1024.f, (_Float16) -1024.f};
+    const _Float16 d = __builtin_bit_cast(_Float16, uint16_t(dm)), m = __builtin_bit_cast(_Float16, uint16_t(dm >> 16));
+    const pf_v2h d2 = {d, d}, m2 = {m, m};
+    pf_v2h w0 = (__builtin_bit_cast(pf_v2h, h0) + off), w1 = (__builtin_bit_cast(pf_v2h, h1) + off);
+    pf_v2h w2 = (__builtin_bit_cast(pf_v2h, h2) + off), w3 = (__builtin_bit_cast(pf_v2h, h3) + off);
+    w0 = __builtin_elementwise_fma(w0, d2, m2); w1 = __builtin_elementwise_fma(w1, d2, m2);
+    w2 = __builtin_elementwise_fma(w2, d2, m2); w3 = __builtin_elementwise_fma(w3, d2, m2);
+    pf_v8h r;
+    r[0] = w0[0]; r[1] = w0[1]; r[2] = w1[0]; r[3] = w1[1]; r[4] = w2[0]; r[5] = w2[1]; r[6] = w3[0]; r[7] = w3[1];
+    return r;
+}
+// Y[t][o] (= or +=) sum_k W[o][k] x[t][k] for T tokens: W Q4_1 rows (N x K), x as hi / lo fp16 (T x K) with a scale a
+// row. A block: 8 warps side by side over 256 outputs (2 tiles of 16 each), 64 tokens (4 tiles), k 64 a step; the
+// weights go straight from memory into the operand registers, the inputs through LDS (double-buffered).
+// LO: also the lo halves (two products a pair of operands).
+template <bool LO>
+__global__ void __launch_bounds__(256) k_gemm_q41(const uint8_t* __restrict__ W, int N, int K, const uint16_t* __restrict__ xh,
+                                                  const uint16_t* __restrict__ xl, const float* __restrict__ xs, int T,
+                                                  float* __restrict__ Y, int ldy, int add) {
+    constexpr int TA = 2, TB = 4, BN = TB * 16, BK = 64, LD = BK + 8;
+    __shared__ __align__(16) uint16_t sx[2][2][BN][LD];   // [buffer][hi, lo][token][k]
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, l16 = lane & 15, g = lane >> 4;
+    const int o0 = blockIdx.x * 256 + warp * TA * 16, t0 = blockIdx.y * BN;
+    const size_t rowb = size_t(K / 32) * 20;
+    const uint8_t* wr[TA];
+#pragma unroll
+    for (int a = 0; a < TA; ++a) wr[a] = W + size_t(o0 + a * 16 + l16) * rowb;
+    // B loads: 64 tokens x 64 k x 2 = 1024 uint4; thread takes token tid / 4 (+ 0) ... 4 of them
+    auto fetch = [&](int k0, uint4* r) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = tid + j * 256, hl = i >> 9, t = (i >> 3) & 63, c = (i & 7) * 8;
+            const uint16_t* src = hl ? xl : xh;
+            r[j] = (t0 + t < T && (LO || !hl)) ? *(const uint4*) (src + size_t(t0 + t) * K + k0 + c) : make_uint4(0, 0, 0, 0);
+        }
+    };
+    auto put = [&](const uint4* r, int buf) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = tid + j * 256, hl = i >> 9, t = (i >> 3) & 63, c = (i & 7) * 8;
+            *(uint4*) &sx[buf][hl][t][c] = r[j];
+        }
+    };
+    pf_v8f acc[TA][TB];
+#pragma unroll
+    for (int a = 0; a < TA; ++a)
+#pragma unroll
+        for (int b = 0; b < TB; ++b) acc[a][b] = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    uint4 rb[4];
+    fetch(0, rb);
+    put(rb, 0);
+    pf_sync();
+    int buf = 0;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        if (k0 + BK < K) fetch(k0 + BK, rb);
+#pragma unroll
+        for (int kk = 0; kk < BK / 16; ++kk) {
+            pf_v8h fa[TA];
+#pragma unroll
+            for (int a = 0; a < TA; ++a) fa[a] = pf_q41_a8(wr[a], k0 + kk * 16 + g * 8);
+#pragma unroll
+            for (int b = 0; b < TB; ++b) {
+                const pf_v8h bh = *(const pf_v8h*) &sx[buf][0][b * 16 + l16][kk * 16 + g * 8];
+#pragma unroll
+                for (int a = 0; a < TA; ++a) acc[a][b] = pf_wmma(fa[a], bh, acc[a][b]);
+                if (LO) {
+                    const pf_v8h bl = *(const pf_v8h*) &sx[buf][1][b * 16 + l16][kk * 16 + g * 8];
+#pragma unroll
+                    for (int a = 0; a < TA; ++a) acc[a][b] = pf_wmma(fa[a], bl, acc[a][b]);
+                }
+            }
+        }
+        if (k0 + BK < K) put(rb, buf ^ 1);
+        pf_sync();
+        buf ^= 1;
+    }
+    // lane: outputs o0 + a * 16 + g * 8 + i, token t0 + b * 16 + l16
+#pragma unroll
+    for (int b = 0; b < TB; ++b) {
+        const int t = t0 + b * 16 + l16;
+        if (t >= T) continue;
+        const float sc = xs[t];
+#pragma unroll
+        for (int a = 0; a < TA; ++a)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                float* y = Y + size_t(t) * ldy + o0 + a * 16 + g * 8 + i;
+                const float v = acc[a][b][i] * sc;
+                *y = add ? *y + v : v;
+            }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------- the model
 struct Layer {
     const float *attn_norm, *ffn_norm, *q_norm, *k_norm, *sinks;
@@ -570,6 +731,45 @@ struct Model {
         J.nmat = j; J.x = x_; J.nw = nw; J.x2 = x2; J.n_in = n_in; J.acc = accum;
         k_mv_in<<<total / kMvRows, 256, n_in * 4, st>>>(J);
     }
+    // the prompt GEMM against mv_in on layer 5's q/k/v rows for T random-ish rows (normed inputs)
+    void gemm_test() {
+        const int T = 100, K = kHidden, N = kQDim + 2 * kKvDim;
+        std::vector<float> hx(size_t(T) * K);
+        uint32_t seed = 1;
+        for (auto& v : hx) { seed = seed * 1664525u + 1013904223u; v = (float(seed >> 8) / 16777216.f - 0.5f) * 4.f; }
+        for (int i = 0; i < 40; ++i) hx[size_t(i * 7 % T) * K + (i * 131) % K] = 3000.f;   // a few big values, as Flint has
+        float *X, *Y, *Y2, *xs_;
+        uint16_t *xh, *xl;
+        CK(cudaMalloc(&X, hx.size() * 4)); CK(cudaMalloc(&Y, size_t(T) * N * 4)); CK(cudaMalloc(&Y2, size_t(T) * N * 4));
+        CK(cudaMalloc(&xh, hx.size() * 2)); CK(cudaMalloc(&xl, hx.size() * 2)); CK(cudaMalloc(&xs_, T * 4));
+        CK(cudaMemcpy(X, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice));
+        const Layer& l = L[5];
+        // reference: mat-vec per row on rmsnorm(x) * attn_norm (mv_in does the norm)
+        for (int t = 0; t < T; ++t)
+            mv_in({{l.wq, Y2 + size_t(t) * N}, {l.wk, Y2 + size_t(t) * N + kQDim}, {l.wv, Y2 + size_t(t) * N + kQDim + kKvDim}},
+                  {kQDim, kKvDim, kKvDim}, X + size_t(t) * K, K, l.attn_norm);
+        k_split16<<<T, 256, 0, st>>>(X, nullptr, l.attn_norm, K, xh, xl, xs_);
+        for (int lo = 0; lo < 2; ++lo) {
+            // q, k, v are separate tensors: three GEMMs into the columns of Y
+            const uint8_t* ws[3] = {l.wq, l.wk, l.wv};
+            const int ns[3] = {kQDim, kKvDim, kKvDim}, offs[3] = {0, kQDim, kQDim + kKvDim};
+            for (int j = 0; j < 3; ++j) {
+                const dim3 gr(ns[j] / 256, (T + 63) / 64);
+                if (lo) k_gemm_q41<true><<<gr, 256, 0, st>>>(ws[j], ns[j], K, xh, xl, xs_, T, Y + offs[j], N, 0);
+                else k_gemm_q41<false><<<gr, 256, 0, st>>>(ws[j], ns[j], K, xh, xl, xs_, T, Y + offs[j], N, 0);
+            }
+            CK(cudaStreamSynchronize(st)); CK(cudaGetLastError());
+            std::vector<float> a(size_t(T) * N), b(size_t(T) * N);
+            CK(cudaMemcpy(a.data(), Y, a.size() * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(b.data(), Y2, b.size() * 4, cudaMemcpyDeviceToHost));
+            double num = 0, den = 0, mx = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                num += double(a[i] - b[i]) * (a[i] - b[i]); den += double(b[i]) * b[i];
+                mx = std::max(mx, (double) std::fabs(a[i] - b[i]) / (std::fabs(b[i]) + 1e-2));
+            }
+            std::printf("GEMM %s vs mat-vec: relative RMS error %.3e, max %.3e\n", lo ? "hi+lo" : "hi only", std::sqrt(num / den), mx);
+        }
+    }
     // one step: 8 launches a MoE layer
     // the next layer's fixed weights (attention, shared expert, router; its experts are not known yet) read on the side
     // stream while this layer runs, so they come from the memory-side cache. FLINT_PREFETCH=0 off, =N blocks.
@@ -654,6 +854,7 @@ int main(int argc, char** argv) {
 
     const auto t0 = std::chrono::steady_clock::now();
     Model m(path, ctx);
+    if (std::getenv("FLINT_GEMM_TEST")) { m.gemm_test(); return 0; }
     std::fprintf(stderr, "strata-flint: %.1f GB on the card in %.1f s\n", m.loaded / 1e9,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     FILE* top = top_path.empty() ? nullptr : std::fopen(top_path.c_str(), "w");
