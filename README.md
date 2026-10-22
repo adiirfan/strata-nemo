@@ -9,7 +9,7 @@ and Anthropic-compatible APIs and a web app. Strata's own README is now [README-
 | --- | --- | --- | --- | ---: | --- |
 | `engine/strata-nemo` | [Nemotron 3.5 Bolt 74B-A9B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB), with the [LiLiCorr drafter](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr) | 24 GB | all on the card | 262,144 | `src/nemotron/` |
 | `engine/strata-flint` | [Recursive Flint 40B-A2.5B](https://huggingface.co/RecursiveSI/flint), [Q4_1 GGUF](https://huggingface.co/RecursiveSI/flint-int4-gguf) | 26 GB | all on the card | 262,144 | `src/flint/` |
-| `engine/strata-ling` | [Ling-3.0-flash-VL 124B-A5.5B](https://huggingface.co/inclusionAI/Ling-3.0-flash-VL), [Q4_0 GGUF](https://huggingface.co/bartowski/Ling-3.0-flash-VL-GGUF) | 67 GB | card + system RAM | 65,536 | `src/ling/` |
+| `engine/strata-ling` | [Ling-3.0-flash-VL 124B-A5.5B](https://huggingface.co/inclusionAI/Ling-3.0-flash-VL), [Q4_0 GGUF](https://huggingface.co/bartowski/Ling-3.0-flash-VL-GGUF) | 67 GB | card + system RAM | 131,072 | `src/ling/` |
 
 Ling is too big for the card. Its attention, shared weights and 23 GB of its experts stay on the card. The processor
 computes the other experts from system RAM, and the card's set changes as the conversation goes on (see
@@ -131,8 +131,9 @@ program reads text only; the picture reader is not wired in.
 - **Accuracy,** against Ling computed exactly in 64-bit floats (`tools/ling/ref_ling.py`, dequantizing the same
   GGUF): KL divergence about 1e-11 on the writing path and 3e-8 on the prompt path, the same top token at every
   position. The prompt path's matrix-core products split each input into two 16-bit halves, so they stay this close.
-- **Card memory:** with the server's 65,536-token context, all working memory is set aside at start and 1.8 GB of the
-  card stays free.
+- **Context:** 131,072 tokens, the model's own limit (its GGUF says so, and it carries no setting for stretching it
+  further). All working memory is set aside at start: at 131,072 tokens 0.75 GB of the card stays free, at 65,536
+  (the benchmark above) 1.8 GB.
 - **Conversation reuse:** the delta layers' running state cannot be rewound to an earlier token, so the engine saves
   it one token before the end of each prompt (`LING_SNAPS`, 4 kept). A turn that extends the last one goes on from
   where it stopped; otherwise from the latest saved state inside the shared part.
@@ -188,7 +189,7 @@ engine/strata-flint --model flint-int4-q4_1.gguf --ids @prompt_ids.txt --new 256
 
 # Ling: LING_PLAN names the experts the card starts with (below)
 LING_PLAN=plan-23gb.txt engine/strata-ling --model Ling-3.0-flash-VL-Q4_0-00001-of-00002.gguf \
-    --ids @prompt_ids.txt --new 256 --max-ctx 65536
+    --ids @prompt_ids.txt --new 256 --max-ctx 131072
 ```
 
 The written token ids go to standard output, the speeds to standard error. `--ids` also takes the ids inline
@@ -217,7 +218,7 @@ python -m serve.server --engine strata --config strata-ling.json --port 8080
 ```json
 {
   "exe": "<repo>/engine/strata-ling",
-  "args": ["--model", "<model dir>/Ling-3.0-flash-VL-Q4_0-00001-of-00002.gguf", "--max-context", "65536"],
+  "args": ["--model", "<model dir>/Ling-3.0-flash-VL-Q4_0-00001-of-00002.gguf", "--max-context", "131072"],
   "tokenizer": "<dir>/tokenizer",
   "model_family": "ling",
   "model_name": "ling-3.0-flash",
@@ -275,7 +276,7 @@ name them.
 - Nemotron's command line writes greedily only.
 - Nemotron and Ling are built and tested for the R9700 (gfx1201) only. Flint also builds for NVIDIA cards and was
   tested on an RTX 3080.
-- Ling reads text only, and its context is set to 65,536 tokens here; reading a 32K prompt takes about 50 s.
+- Ling reads text only, up to 131,072 tokens; reading a 32K prompt takes about 50 s.
 
 ## License
 
