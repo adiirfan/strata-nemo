@@ -369,7 +369,10 @@ static int serve(Model& m, const std::vector<int>& eos_ids, int chunk) {
         for (size_t i = reuse; i < ids.size();) {
             const size_t e = std::min(ids.size(), i + size_t(chunk));
             const std::vector<int> c(ids.begin() + i, ids.begin() + e);
-            if (c.size() >= 16) m.prefill_chunk(c.data(), int(c.size()));
+            // (hybrid: a prompt piece copies every layer's experts to the card - ~1.7 s at PCIe 4.0 x8 - so short
+            // pieces go through the writing path instead, whose CPU computes the experts the card does not hold)
+            static const size_t feed_max = m.hybrid ? size_t(std::getenv("FLINT_HY_FEED") ? std::atoi(std::getenv("FLINT_HY_FEED")) : 128) : 15;
+            if (c.size() > feed_max) m.prefill_chunk(c.data(), int(c.size()));
             else m.feed(c);
             live.insert(live.end(), c.begin(), c.end());
             read_n += int(c.size());
