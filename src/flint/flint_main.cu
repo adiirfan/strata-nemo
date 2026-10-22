@@ -38,6 +38,40 @@
 #include <vector>
 
 namespace {
+// ---- the few things that differ between AMD (HIP, wave32) and NVIDIA (CUDA built by clang, see
+// tools/cuda/build-flint.sh): warp shuffles, lane swaps, byte permutes, sleeps, barriers, the 16x16x16 matrix product
+#if defined(__HIPCC__)
+#define FL_HIP 1
+template <class T> __device__ __forceinline__ T fl_shfl_xor(T v, int m, int w = 32) { return __shfl_xor(v, m, w); }
+__device__ __forceinline__ bool fl_any(bool p) { return __any(p); }
+__device__ __forceinline__ float fl_exp2(float x) { return __builtin_amdgcn_exp2f(x); }
+__device__ __forceinline__ void fl_wave_barrier() { __builtin_amdgcn_wave_barrier(); }
+__device__ __forceinline__ uint32_t fl_perm(uint32_t a, uint32_t b, uint32_t sel) { return __builtin_amdgcn_perm(a, b, sel); }
+__device__ __forceinline__ float fl_swap16(float v) {   // lane l <-> lane l ^ 16
+    return __int_as_float((int) __builtin_amdgcn_permlanex16((unsigned) __float_as_int(v), (unsigned) __float_as_int(v), 0x76543210u, 0xfedcba98u, false, false));
+}
+#define fl_sleep(n) __builtin_amdgcn_s_sleep(n)
+#else
+#define FL_HIP 0
+template <class T> __device__ __forceinline__ T fl_shfl_xor(T v, int m, int w = 32) { return __shfl_xor_sync(0xffffffffu, v, m, w); }
+__device__ __forceinline__ bool fl_any(bool p) { return __any_sync(0xffffffffu, p); }
+__device__ __forceinline__ float fl_exp2(float x) { return exp2f(x); }
+__device__ __forceinline__ void fl_wave_barrier() { __syncwarp(); }
+// AMD's v_perm_b32: bytes 0-3 of {a:b} are b's, 4-7 a's; a selector byte 0-7 picks one (every use here stays in 0-7)
+__device__ __forceinline__ uint32_t fl_perm(uint32_t a, uint32_t b, uint32_t sel) {
+    const uint32_t s = (sel & 7) | ((sel >> 8) & 7) << 4 | ((sel >> 16) & 7) << 8 | ((sel >> 24) & 7) << 12;
+    return __byte_perm(b, a, s);
+}
+__device__ __forceinline__ float fl_swap16(float v) { return __shfl_xor_sync(0xffffffffu, v, 16); }
+#define fl_sleep(n) __nanosleep(64 * (n))
+// (clang 19's NVPTX back end has no acquire load: a volatile read then a fence; a fence then a volatile write)
+template <class T> __device__ __forceinline__ T fl_ld_acq(const T* p) { const T v = *(const volatile T*) p; __threadfence(); return v; }
+template <class T> __device__ __forceinline__ void fl_st_rel(T* p, T v) { __threadfence(); *(volatile T*) p = v; }
+#define __hip_atomic_load(p, order, scope) fl_ld_acq(p)
+#define __hip_atomic_store(p, v, order, scope) fl_st_rel((p), (v))
+#define __HIP_MEMORY_SCOPE_AGENT 0
+#endif
+
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     std::fprintf(stderr, "strata-flint: %s failed: %s (%s:%d)\n", #x, cudaGetErrorString(e_), __FILE__, __LINE__); std::exit(1); } } while (0)
@@ -132,7 +166,7 @@ static_assert(sizeof(block_q4_1) == 20, "block layout");
 
 // ---------------------------------------------------------------------------------------------------- kernels
 __device__ inline float warp_sum(float v) {
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o, 32);
+    for (int o = 16; o > 0; o >>= 1) v += fl_shfl_xor(v, o, 32);
     return v;
 }
 __device__ inline float silu(float x) { return x / (1.f + expf(-x)); }
@@ -152,9 +186,46 @@ __device__ inline float block_sum(float v, float* sh) {
 typedef _Float16 pf_v8h __attribute__((ext_vector_type(8)));
 typedef float pf_v8f __attribute__((ext_vector_type(8)));
 typedef _Float16 pf_v2h __attribute__((ext_vector_type(2)));
+// D = A . B + C, 16 x 16 x 16, fp16 in, fp32 sums, in gfx12's wave32 WMMA layout: lane (l16, g = lane >> 4) holds
+// A[l16][g * 8 + i], B[g * 8 + i][l16] and C/D[g * 8 + i][l16]
 __device__ __forceinline__ pf_v8f pf_wmma(const pf_v8h& a, const pf_v8h& b, const pf_v8f& c) {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#elif !FL_HIP
+    // NVIDIA: the operands through shared memory into mma.sync m16n8k16's layout (two products for the 16 columns),
+    // the result back the same way. Exact, not fast: the hot kernels get native-layout versions.
+    __shared__ __align__(16) float wb[8][256];   // a warp's: A, B as fp16, then D as fp32 (blocks of up to 256)
+    const int lane = threadIdx.x & 31, w = (threadIdx.x >> 5) & 7, l16 = lane & 15, g = lane >> 4;
+    const int gid = lane >> 2, tig = lane & 3;
+    _Float16* AB = (_Float16*) wb[w];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { AB[l16 * 16 + g * 8 + i] = a[i]; AB[256 + l16 * 16 + g * 8 + i] = b[i]; }   // A[m][k], Bt[n][k]
+    __syncwarp();
+    const uint32_t* A32 = (const uint32_t*) AB;
+    const uint32_t a0 = A32[(gid * 16 + 2 * tig) / 2], a1 = A32[((gid + 8) * 16 + 2 * tig) / 2];
+    const uint32_t a2 = A32[(gid * 16 + 2 * tig + 8) / 2], a3 = A32[((gid + 8) * 16 + 2 * tig + 8) / 2];
+    float d[2][4];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const uint32_t b0 = A32[(256 + (8 * h + gid) * 16 + 2 * tig) / 2], b1 = A32[(256 + (8 * h + gid) * 16 + 2 * tig + 8) / 2];
+        d[h][0] = d[h][1] = d[h][2] = d[h][3] = 0.f;
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                     : "+f"(d[h][0]), "+f"(d[h][1]), "+f"(d[h][2]), "+f"(d[h][3])
+                     : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    }
+    __syncwarp();
+    float* D = wb[w];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        D[gid * 16 + 8 * h + 2 * tig] = d[h][0]; D[gid * 16 + 8 * h + 2 * tig + 1] = d[h][1];
+        D[(gid + 8) * 16 + 8 * h + 2 * tig] = d[h][2]; D[(gid + 8) * 16 + 8 * h + 2 * tig + 1] = d[h][3];
+    }
+    __syncwarp();
+    pf_v8f out;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) out[i] = c[i] + D[(g * 8 + i) * 16 + l16];
+    __syncwarp();
+    return out;
 #else
     __trap();
     return c;
@@ -162,9 +233,13 @@ __device__ __forceinline__ pf_v8f pf_wmma(const pf_v8h& a, const pf_v8h& b, cons
 }
 // LDS-only barrier (a __syncthreads' fence also covers global memory and invalidates the vector caches on gfx12)
 __device__ __forceinline__ void pf_sync() {
+#if FL_HIP
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
+    __syncthreads();
+#endif
 }
 constexpr int kMvRows = 32, kMvRpw = 4;
 // Stage n_in inputs into LDS: x, or rmsnorm(x) * nw when nw, or silu(x) * x2 when x2. 256 threads.
@@ -310,7 +385,7 @@ struct HyShared {
 };
 __device__ __forceinline__ void hy_pause() {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-    __builtin_amdgcn_s_sleep(1);
+    fl_sleep(1);
 #else
     __nanosleep(100);
 #endif
@@ -390,8 +465,8 @@ __global__ void __launch_bounds__(128) k_router(const float* h, const float* nw,
         int i = threadIdx.x;
         if (sc[threadIdx.x + 128] > v) { v = sc[threadIdx.x + 128]; i = threadIdx.x + 128; }
         for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor(v, o, 32);
-            const int oi = __shfl_xor(i, o, 32);
+            const float ov = fl_shfl_xor(v, o, 32);
+            const int oi = fl_shfl_xor(i, o, 32);
             if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
         }
         if (lane == 0) { bv[threadIdx.x >> 5] = v; bi[threadIdx.x >> 5] = i; }
@@ -446,7 +521,7 @@ __global__ void k_qkv_post(float* q, const float* k, const float* v, const float
         if (q8sim && !rope) {
             __shared__ float mk[4], mv[4];
             float a = fabsf(y), b = fabsf(vv);
-            for (int o = 16; o > 0; o >>= 1) { a = fmaxf(a, __shfl_xor(a, o, 32)); b = fmaxf(b, __shfl_xor(b, o, 32)); }
+            for (int o = 16; o > 0; o >>= 1) { a = fmaxf(a, fl_shfl_xor(a, o, 32)); b = fmaxf(b, fl_shfl_xor(b, o, 32)); }
             if ((i & 31) == 0) { mk[i >> 5] = a; mv[i >> 5] = b; }
             __syncthreads();
             if (q8grp == 32) { ak = mk[i >> 5]; av = mv[i >> 5]; }
@@ -455,7 +530,7 @@ __global__ void k_qkv_post(float* q, const float* k, const float* v, const float
         if (v8.kq) {
             __shared__ float n8[4];
             float a = fabsf(y);
-            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
+            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, fl_shfl_xor(a, o, 32));
             if ((i & 31) == 0) n8[i >> 5] = a;
             __syncthreads();
             k8_put(v8, size_t(pos & kv_mask), kh, i, y, fmaxf(fmaxf(n8[0], n8[1]), fmaxf(n8[2], n8[3])));
@@ -463,7 +538,7 @@ __global__ void k_qkv_post(float* q, const float* k, const float* v, const float
         if (v8.q) {
             __shared__ float m8[4];
             float a = fabsf(vv);
-            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
+            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, fl_shfl_xor(a, o, 32));
             if ((i & 31) == 0) m8[i >> 5] = a;
             __syncthreads();
             v8_put(v8, size_t(pos & kv_mask), kh, i, vv, fmaxf(fmaxf(m8[0], m8[1]), fmaxf(m8[2], m8[3])));
@@ -478,7 +553,10 @@ constexpr int kAttnChunks = FLINT_CHUNKS, kPart = kHd + 4, kMinChunk = FLINT_MIN
 __device__ inline float4 h4(const float* p) { return *(const float4*) p; }
 __device__ inline float4 h4(const __half* p) {
     const uint2 u = *(const uint2*) p;
-    const float2 a = __half22float2(__builtin_bit_cast(__half2, u.x)), b = __half22float2(__builtin_bit_cast(__half2, u.y));
+    __half2 ha, hb;
+    std::memcpy(&ha, &u.x, 4);
+    std::memcpy(&hb, &u.y, 4);
+    const float2 a = __half22float2(ha), b = __half22float2(hb);
     return make_float4(a.x, a.y, b.x, b.y);
 }
 // The writing path's attention also does what k_qkv_post did when F.qn is set: q (its head) and this position's k
@@ -633,7 +711,7 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
             v[i] = (l16 < 8 && p < b0) ? sc[i] * scale : -INFINITY;
             mx = fmaxf(mx, v[i]);
         }
-        mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+        mx = fmaxf(mx, fl_shfl_xor(mx, 16, 32));
         const float mn = fmaxf(m, mx), ref = mn == -INFINITY ? 0.f : mn;
         cf = expf(m - ref);
         m = mn;
@@ -766,16 +844,16 @@ __global__ void __launch_bounds__(256) k_attn_dec_w(const float* __restrict__ q,
         }
         float cf;
         const pf_v8h pb = soft(sc, t0, cf);
-        __builtin_amdgcn_wave_barrier();
+        fl_wave_barrier();
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             o[j] = o[j] * cf;
             const pf_v8h va = *(const pf_v8h*) &vt[warp][j * 16 + l16][g * 8];
             o[j] = pf_wmma(va, pb, o[j]);
         }
-        __builtin_amdgcn_wave_barrier();
+        fl_wave_barrier();
     }
-    l += __shfl_xor(l, 16, 32);
+    l += fl_shfl_xor(l, 16, 32);
     __syncthreads();   // (every warp done with its V tile before the outputs overwrite them)
     // merge the 8 warps: lane (head l16 < 8, half g) has dims j * 16 + g * 8 + i
     if (l16 < 8) {
@@ -903,7 +981,7 @@ __global__ void __launch_bounds__(256) k_attn_dec_m(const float* __restrict__ q,
                 v[i] = (pk + i < b0 && pk + i <= zlast[cg]) ? sc[cg][i] : -INFINITY;
                 mx = fmaxf(mx, v[i]);
             }
-            mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+            mx = fmaxf(mx, fl_shfl_xor(mx, 16, 32));
             const float mn = fmaxf(m[cg], mx), ref = mn == -INFINITY ? 0.f : mn;
             cf[cg] = expf(m[cg] - ref);
             m[cg] = mn;
@@ -924,7 +1002,7 @@ __global__ void __launch_bounds__(256) k_attn_dec_m(const float* __restrict__ q,
     }
 #pragma unroll
     for (int cg = 0; cg < NCG; ++cg) {
-        l[cg] += __shfl_xor(l[cg], 16, 32);
+        l[cg] += fl_shfl_xor(l[cg], 16, 32);
         if (g == 0) { wm[warp][cg * 16 + l16] = m[cg]; wl[warp][cg * 16 + l16] = l[cg]; }
     }
     // merge the 8 warps a token at a time: lane (column l16 of group cg, half g) has dims j * 16 + g * 8 + i
@@ -987,8 +1065,8 @@ __global__ void __launch_bounds__(1024) k_argmax64(const float* lg, int n, int* 
     int i = 0;
     for (int j = a + threadIdx.x; j < e; j += 1024) if (lg[j] > v) { v = lg[j]; i = j; }
     for (int o = 16; o > 0; o >>= 1) {
-        const float ov = __shfl_xor(v, o, 32);
-        const int oi = __shfl_xor(i, o, 32);
+        const float ov = fl_shfl_xor(v, o, 32);
+        const int oi = fl_shfl_xor(i, o, 32);
         if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
     }
     if ((threadIdx.x & 31) == 0) { bv[threadIdx.x >> 5] = v; bi[threadIdx.x >> 5] = i; }
@@ -1069,7 +1147,7 @@ __global__ void __launch_bounds__(256) k_split16(const float* x, const float* x2
         mx = fmaxf(mx, fabsf(nw ? v * nw[i] : v));
     }
     ss = warp_sum(ss);
-    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 32));
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, fl_shfl_xor(mx, o, 32));
     if ((threadIdx.x & 31) == 0) { red[threadIdx.x >> 5] = ss; redm[threadIdx.x >> 5] = mx; }
     __syncthreads();
     float tot = 0, m = 0;
@@ -1094,13 +1172,14 @@ __device__ __forceinline__ pf_v8h pf_q41_a8(const uint8_t* W, int k) {
     const uint8_t* B = W + (k >> 5) * 20;
     const int j0 = k & 31;
     const uint32_t dm = *(const uint32_t*) B;
-    const uint2 qq = *(const uint2*) (B + 4 + (j0 & 15));
+    // (two 4-byte loads: a block is 20 bytes, so B + 4 is only 4-aligned - AMD reads it as 8, NVIDIA faults)
+    const uint2 qq = make_uint2(*(const uint32_t*) (B + 4 + (j0 & 15)), *(const uint32_t*) (B + 8 + (j0 & 15)));
     const int sh = j0 >= 16 ? 4 : 0;
     const uint32_t u0 = (qq.x >> sh) & 0x0F0F0F0Fu, u1 = (qq.y >> sh) & 0x0F0F0F0Fu;
     // bytes q0 q1 q2 q3 -> halves (1024 + q0, 1024 + q1), (1024 + q2, 1024 + q3)
     const uint32_t c = 0x64646464u;
-    const uint32_t h0 = __builtin_amdgcn_perm(c, u0, 0x07010700u), h1 = __builtin_amdgcn_perm(c, u0, 0x07030702u);
-    const uint32_t h2 = __builtin_amdgcn_perm(c, u1, 0x07010700u), h3 = __builtin_amdgcn_perm(c, u1, 0x07030702u);
+    const uint32_t h0 = fl_perm(c, u0, 0x07010700u), h1 = fl_perm(c, u0, 0x07030702u);
+    const uint32_t h2 = fl_perm(c, u1, 0x07010700u), h3 = fl_perm(c, u1, 0x07030702u);
     const pf_v2h off = {(_Float16) -1024.f, (_Float16) -1024.f};
     const _Float16 d = __builtin_bit_cast(_Float16, uint16_t(dm)), m = __builtin_bit_cast(_Float16, uint16_t(dm >> 16));
     const pf_v2h d2 = {d, d}, m2 = {m, m};
@@ -1373,8 +1452,8 @@ __global__ void k_pf_topk(const float* logits, int T, int* idx, float* wts, int*
         int i = 0;
         for (int j = 0; j < 8; ++j) if (sc[j] > v) { v = sc[j]; i = lane * 8 + j; }
         for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor(v, o, 32);
-            const int oi = __shfl_xor(i, o, 32);
+            const float ov = fl_shfl_xor(v, o, 32);
+            const int oi = fl_shfl_xor(i, o, 32);
             if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
         }
         if (lane == i / 8) sc[i % 8] = -1.f;
@@ -1460,7 +1539,7 @@ __global__ void k_pf_qkpost(float* QKV, const float* qn, const float* kn, kc_t* 
         if (q8sim && !rope) {
             __shared__ float mk[4], mv[4];
             float a = fabsf(y), b = fabsf(vv);
-            for (int o = 16; o > 0; o >>= 1) { a = fmaxf(a, __shfl_xor(a, o, 32)); b = fmaxf(b, __shfl_xor(b, o, 32)); }
+            for (int o = 16; o > 0; o >>= 1) { a = fmaxf(a, fl_shfl_xor(a, o, 32)); b = fmaxf(b, fl_shfl_xor(b, o, 32)); }
             if ((i & 31) == 0) { mk[i >> 5] = a; mv[i >> 5] = b; }
             __syncthreads();
             if (q8grp == 32) { ak = mk[i >> 5]; av = mv[i >> 5]; }
@@ -1469,7 +1548,7 @@ __global__ void k_pf_qkpost(float* QKV, const float* qn, const float* kn, kc_t* 
         if (v8.kq) {
             __shared__ float n8[4];
             float a = fabsf(y);
-            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
+            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, fl_shfl_xor(a, o, 32));
             if ((i & 31) == 0) n8[i >> 5] = a;
             __syncthreads();
             k8_put(v8, size_t(pos & kv_mask), kh, i, y, fmaxf(fmaxf(n8[0], n8[1]), fmaxf(n8[2], n8[3])));
@@ -1477,7 +1556,7 @@ __global__ void k_pf_qkpost(float* QKV, const float* qn, const float* kn, kc_t* 
         if (v8.q) {
             __shared__ float m8[4];
             float a = fabsf(vv);
-            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
+            for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, fl_shfl_xor(a, o, 32));
             if ((i & 31) == 0) m8[i >> 5] = a;
             __syncthreads();
             v8_put(v8, size_t(pos & kv_mask), kh, i, vv, fmaxf(fmaxf(m8[0], m8[1]), fmaxf(m8[2], m8[3])));
@@ -1557,7 +1636,7 @@ __global__ void __launch_bounds__(256) k_pf_attn_w(const float* __restrict__ QKV
                 v[i] = (live && p >= qlo && p <= qpos) ? sc[i] * scale : -INFINITY;
                 mx = fmaxf(mx, v[i]);
             }
-            mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+            mx = fmaxf(mx, fl_shfl_xor(mx, 16, 32));
             // (no branch around the products: a matrix instruction needs every lane; a query with nothing visible yet
             // keeps m = -inf and adds zeros)
             const float mn = fmaxf(m, mx), ref = mn == -INFINITY ? 0.f : mn;
@@ -1579,7 +1658,7 @@ __global__ void __launch_bounds__(256) k_pf_attn_w(const float* __restrict__ QKV
         pf_sync();
     }
     // the two halves' sums, the sink, and the output: lane (query l16, half g) has dims j * 16 + g * 8 + i
-    l += __shfl_xor(l, 16, 32);
+    l += fl_shfl_xor(l, 16, 32);
     if (!live) return;
     const float sk = sinks[h], M = fmaxf(m, sk);
     const float f = expf(m - M), L = l * f + expf(sk - M);
@@ -1820,8 +1899,8 @@ __global__ void __launch_bounds__(128) k_v_router(const float* X, const uint16_t
             int i = 0;
             for (int j = 0; j < 8; ++j) if (sc[j] > v) { v = sc[j]; i = lane * 8 + j; }
             for (int o = 16; o > 0; o >>= 1) {
-                const float ov = __shfl_xor(v, o, 32);
-                const int oi = __shfl_xor(i, o, 32);
+                const float ov = fl_shfl_xor(v, o, 32);
+                const int oi = fl_shfl_xor(i, o, 32);
                 if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
             }
             if (lane == i / 8) sc[i % 8] = -1.f;
@@ -1949,8 +2028,8 @@ __global__ void __launch_bounds__(1024) k_argmax_rows(const float* lg, int n, in
     int i = 0;
     for (int j = threadIdx.x; j < n; j += 1024) if (l[j] > v) { v = l[j]; i = j; }
     for (int o = 16; o > 0; o >>= 1) {
-        const float ov = __shfl_xor(v, o, 32);
-        const int oi = __shfl_xor(i, o, 32);
+        const float ov = fl_shfl_xor(v, o, 32);
+        const int oi = fl_shfl_xor(i, o, 32);
         if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
     }
     if ((threadIdx.x & 31) == 0) { bv[threadIdx.x >> 5] = v; bi[threadIdx.x >> 5] = i; }
@@ -2112,8 +2191,8 @@ __global__ void __launch_bounds__(128) k_vr_pick(const float* logits, int T, int
             int i = 0;
             for (int j = 0; j < 8; ++j) if (sc[j] > v) { v = sc[j]; i = lane * 8 + j; }
             for (int o = 16; o > 0; o >>= 1) {
-                const float ov = __shfl_xor(v, o, 32);
-                const int oi = __shfl_xor(i, o, 32);
+                const float ov = fl_shfl_xor(v, o, 32);
+                const int oi = fl_shfl_xor(i, o, 32);
                 if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
             }
             if (lane == i / 8) sc[i % 8] = -1.f;
@@ -2181,7 +2260,7 @@ __device__ inline void mega_bar(unsigned* cnt, unsigned& gen, unsigned n) {
         __threadfence();
         const unsigned target = (gen + 1) * n;
         atomicAdd(cnt, 1u);
-        while (__hip_atomic_load(cnt, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < target) __builtin_amdgcn_s_sleep(1);
+        while (__hip_atomic_load(cnt, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < target) fl_sleep(1);
         __threadfence();
     }
     ++gen;
@@ -2224,8 +2303,8 @@ __device__ inline void mega_top6(const float* lg, int lane, int& oi, float& ow) 
         int i = 0;
         for (int j = 0; j < 8; ++j) if (sc[j] > v) { v = sc[j]; i = lane * 8 + j; }
         for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor(v, o, 32);
-            const int oi_ = __shfl_xor(i, o, 32);
+            const float ov = fl_shfl_xor(v, o, 32);
+            const int oi_ = fl_shfl_xor(i, o, 32);
             if (ov > v || (ov == v && oi_ < i)) { v = ov; i = oi_; }
         }
         if (lane == i / 8) sc[i % 8] = -1.f;
@@ -2264,7 +2343,7 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8))) k
         for (int i = 0; i < kLayers; ++i) {
             if (tid == 0) {
                 unsigned p;
-                while ((p = __hip_atomic_load(A.ctr + 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT)) < unsigned(i + 1)) __builtin_amdgcn_s_sleep(2);
+                while ((p = __hip_atomic_load(A.ctr + 1, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT)) < unsigned(i + 1)) fl_sleep(2);
                 at = int(p) - 1;   // the layer the workers are on
             }
             __syncthreads();
@@ -2688,16 +2767,15 @@ __global__ void __launch_bounds__(256) k_pf_attn_w2(const float* __restrict__ QK
                         mx = fmaxf(mx, v[i]);
                     }
                 }
-                mx = fmaxf(mx, __int_as_float((int) __builtin_amdgcn_permlanex16((unsigned) __float_as_int(mx), (unsigned) __float_as_int(mx),
-                                                                                    0x76543210u, 0xfedcba98u, false, false)));
+                mx = fmaxf(mx, fl_swap16(mx));
                 const float mn = fmaxf(m[j], mx), ref = mn == -INFINITY ? 0.f : mn;
-                cf[j] = __builtin_amdgcn_exp2f(m[j] - ref);
+                cf[j] = fl_exp2(m[j] - ref);
                 m[j] = mn;
                 float ps = 0;
                 uint32_t w[4];
 #pragma unroll
                 for (int i = 0; i < 8; i += 2) {
-                    const float e0 = __builtin_amdgcn_exp2f(v[i] - ref), e1 = __builtin_amdgcn_exp2f(v[i + 1] - ref);
+                    const float e0 = fl_exp2(v[i] - ref), e1 = fl_exp2(v[i + 1] - ref);
                     ps += e0 + e1;
                     w[i / 2] = __builtin_bit_cast(uint32_t, pf_v2h{(_Float16) e0, (_Float16) e1});   // (round to nearest: rtz cost KL)
                 }
@@ -2706,7 +2784,7 @@ __global__ void __launch_bounds__(256) k_pf_attn_w2(const float* __restrict__ QK
             }
 #pragma unroll
             for (int j = 0; j < QT; ++j)
-                if (__any(cf[j] != 1.f))   // (rare after the first tiles)
+                if (fl_any(cf[j] != 1.f))   // (rare after the first tiles)
 #pragma unroll
                     for (int d = 0; d < 8; ++d) o[j][d] = o[j][d] * cf[j];
 #pragma unroll
@@ -2722,7 +2800,7 @@ __global__ void __launch_bounds__(256) k_pf_attn_w2(const float* __restrict__ QK
     }
 #pragma unroll
     for (int j = 0; j < QT; ++j) {
-        const float lt = l[j] + __shfl_xor(l[j], 16, 32);
+        const float lt = l[j] + fl_shfl_xor(l[j], 16, 32);
         if (!live[j]) continue;
         const float sk = sinks[h] * 1.4426950408889634f, M = fmaxf(m[j], sk);   // (log2 domain)
         const float f = exp2f(m[j] - M), L = lt * f + exp2f(sk - M);
@@ -3040,9 +3118,15 @@ struct Model {
             cudaDeviceProp pr;
             CK(cudaGetDevice(&dev));
             CK(cudaGetDeviceProperties(&pr, dev));
+#if FL_HIP
             CK(hipOccupancyMaxActiveBlocksPerMultiprocessor(&per, k_token, 256, kActRows * 4));
             hipFuncAttributes fa;
             CK(hipFuncGetAttributes(&fa, (const void*) k_token));
+#else
+            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, k_token, 256, kActRows * 4));
+            cudaFuncAttributes fa;
+            CK(cudaFuncGetAttributes(&fa, (const void*) k_token));
+#endif
             if (want > 0 && want < kMegaTot && per * pr.multiProcessorCount >= kMegaTot && std::getenv("FLINT_V16")) mega_g = want;   // (fp16 V only)
             if (want > 0) std::fprintf(stderr, "strata-flint: one-launch step %s (%d workers, %d prefetchers; %d blocks fit a unit x %d, %d registers)\n",
                                        mega_g ? "on" : "off", mega_g, kMegaTot - mega_g, per, pr.multiProcessorCount, fa.numRegs);

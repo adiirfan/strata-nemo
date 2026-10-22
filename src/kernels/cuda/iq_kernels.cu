@@ -3808,6 +3808,7 @@ void iq_mmvq_gather(int ggml_type, const unsigned long long* table, const int32_
     }
 }
 
+#if defined(__HIPCC__)
 namespace {
 // IQ2_XXS times FP32 inputs for one position, one input row a slot (row j / x_div): each block stages its input in LDS
 // as FP16 with a power-of-two scale per 32 values and the 256 grid entries as FP16; the weights are decoded by that
@@ -3987,6 +3988,16 @@ void iq2_gather_f16(const unsigned long long* table, const int32_t* idx, int n_s
                     bool relu_out, float* y, int n_in, int n_out, void* stream) {
     iq2_gather_f16(Iq2F16Job{table, idx, n_slots, x, x_div, y, n_in, n_out}, nullptr, relu_in, relu_out, stream);
 }
+#else   // (the IQ2_XXS FP16 gather uses gfx12 instructions; the CUDA build has no such path)
+void iq2_gather_f16(const Iq2F16Job&, const Iq2F16Job*, bool, bool, void*) {
+    std::fprintf(stderr, "iq2_gather_f16: AMD gfx12 only\n");
+    std::exit(1);
+}
+void iq2_gather_f16(const unsigned long long*, const int32_t*, int, const float*, int, bool, bool, float*, int, int, void*) {
+    std::fprintf(stderr, "iq2_gather_f16: AMD gfx12 only\n");
+    std::exit(1);
+}
+#endif
 
 // Grouped routed experts: group g is expert g_exp[g] with g_cnt[g] members (at most 16); member m reads input
 // x + g_xi[g][m] * x_stride blocks and writes row `row` of y[g_slot[g][m]].  Each expert's weights are read once for
@@ -4095,6 +4106,7 @@ void iq_mmvq_rows(int ggml_type, const void* w, const void* x_q8_1, float* y, in
 // result. (llama.cpp's MMQ rounds the activations to 8-bit integers per 32; scaling each 32-value sub-block's partial
 // product instead of rounding the weights cost twice the time - the scaling ran on the same units as the products.)
 // MODE: X rows are x[src[r]] when src is given.
+#if defined(__HIPCC__)
 namespace {
 constexpr int kMwBM = 128, kMwBN = 64, kMwBK = 64, kMwLD = kMwBK + 8;   // outputs, rows, k a step, LDS row (fp16; 128 a step measured slower)
 constexpr int kMwXC = 128;                                         // activation values per scale
@@ -4589,4 +4601,16 @@ void moe_wmma_iq2xxs(const void* w_all, size_t expert_bytes, int n_exp, int n_ou
     check("moe_wmma_iq2xxs");
 }
 
+#else   // (the matrix-core MoE kernels are written for gfx12 WMMA; the CUDA build has no such path)
+int moe_wmma_max_tiles(int64_t rows, int n_exp) { return (int) ((rows + 63) / 64) + n_exp; }
+void moe_x16_rows(const float*, int64_t, uint16_t*, float*, void*) {
+    std::fprintf(stderr, "moe_x16_rows: AMD gfx12 only\n");
+    std::exit(1);
+}
+void moe_wmma_iq2xxs(const void*, size_t, int, int, int, const uint16_t*, const float*, const int32_t*, const int32_t*, int64_t,
+                     int32_t*, int32_t*, bool, float*, uint16_t*, float*, int, void*) {
+    std::fprintf(stderr, "moe_wmma_iq2xxs: AMD gfx12 only\n");
+    std::exit(1);
+}
+#endif
 }  // namespace strata::kernels

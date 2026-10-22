@@ -31,26 +31,26 @@ __device__ __forceinline__ float sp_uniform(uint64_t seed, uint64_t step, int wh
 }
 constexpr int kVocabF = 150144, kSpChunk = (kVocabF + 1023) / 1024;
 __device__ __forceinline__ float sp_bsum(float v, float* sh) {
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o, 32);
+    for (int o = 16; o > 0; o >>= 1) v += fl_shfl_xor(v, o, 32);
     __syncthreads();
     if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = v;
     __syncthreads();
     if (threadIdx.x < 32) {
         float t = sh[threadIdx.x];
-        for (int o = 16; o > 0; o >>= 1) t += __shfl_xor(t, o, 32);
+        for (int o = 16; o > 0; o >>= 1) t += fl_shfl_xor(t, o, 32);
         if (threadIdx.x == 0) sh[32] = t;
     }
     __syncthreads();
     return sh[32];
 }
 __device__ __forceinline__ float sp_bmax(float v, float* sh) {
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor(v, o, 32));
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, fl_shfl_xor(v, o, 32));
     __syncthreads();
     if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = v;
     __syncthreads();
     if (threadIdx.x < 32) {
         float t = sh[threadIdx.x];
-        for (int o = 16; o > 0; o >>= 1) t = fmaxf(t, __shfl_xor(t, o, 32));
+        for (int o = 16; o > 0; o >>= 1) t = fmaxf(t, fl_shfl_xor(t, o, 32));
         if (threadIdx.x == 0) sh[32] = t;
     }
     __syncthreads();
@@ -153,8 +153,8 @@ __device__ void sp_topk(const float* l, int k, float* cv, int* ci) {
         float v = head < nb ? bv[head] : -INFINITY;
         int i = head < nb ? bi[head] : 0x7fffffff, t = tid;
         for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor(v, o, 32);
-            const int oi = __shfl_xor(i, o, 32), ot = __shfl_xor(t, o, 32);
+            const float ov = fl_shfl_xor(v, o, 32);
+            const int oi = fl_shfl_xor(i, o, 32), ot = fl_shfl_xor(t, o, 32);
             if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; t = ot; }
         }
         if ((tid & 31) == 0) { wv[tid >> 5] = v; wi[tid >> 5] = i; wt[tid >> 5] = t; }
