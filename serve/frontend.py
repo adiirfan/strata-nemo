@@ -1350,3 +1350,87 @@ class OutputParser:
         self._reset_scan()
         self.state, self.lead = "content", True
         return [Event("tool_call", call=call)]
+
+
+class FlintParser(OutputParser):
+    """Flint writes a call as `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>` (its chat
+    template). This rewrites that, as it streams, into the template form OutputParser reads
+    (`<tool_call>\\n<function=NAME>\\n<parameter=K>\\nV\\n</parameter>\\n</function>\\n</tool_call>`), so everything after
+    it - streaming arguments, the reasoning rules, schemas - is the same. A tag split across deltas is held back."""
+
+    TAGS = ("<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>")
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.fstate = "text"         # text | name | key | between | value | after
+        self.fbuf = ""
+        self.fname = ""
+
+    def _translate(self, final: bool = False) -> str:
+        out = []
+        while self.fbuf:
+            i = self.fbuf.find("<")
+            if i < 0:
+                out.append(self._text(self.fbuf))
+                self.fbuf = ""
+                break
+            head, rest = self.fbuf[:i], self.fbuf[i:]
+            tag = next((t for t in self.TAGS if rest.startswith(t)), None)
+            if tag is None and not final and any(t.startswith(rest) for t in self.TAGS):
+                out.append(self._text(head))          # (perhaps a tag still arriving: keep it)
+                self.fbuf = rest
+                break
+            out.append(self._text(head))
+            if tag is None:
+                out.append(self._text("<"))
+                self.fbuf = rest[1:]
+            else:
+                out.append(self._tag(tag))
+                self.fbuf = rest[len(tag):]
+        return "".join(out)
+
+    def _text(self, t: str) -> str:
+        if self.fstate in ("between", "after"):
+            return t if t.strip() else ""             # (only whitespace belongs here)
+        if self.fstate == "name":
+            self.fname += t
+            return ""
+        return t
+
+    def _tag(self, tag: str) -> str:
+        st = self.fstate
+        if tag == "<tool_call>" and st == "text":
+            self.fstate, self.fname = "name", ""
+            return "<tool_call>\n<function="
+        if st == "name" and tag in ("<arg_key>", "</tool_call>"):
+            head = self.fname.strip() + ">\n"
+            if tag == "<arg_key>":
+                self.fstate = "key"
+                return head + "<parameter="
+            self.fstate = "text"
+            return head + "</function>\n</tool_call>"
+        if st == "key" and tag == "</arg_key>":
+            self.fstate = "between"
+            return ">\n"
+        if st == "between" and tag == "<arg_value>":
+            self.fstate = "value"
+            return ""
+        if st == "value" and tag == "</arg_value>":
+            self.fstate = "after"
+            return "\n</parameter>\n"
+        if st == "after" and tag == "<arg_key>":
+            self.fstate = "key"
+            return "<parameter="
+        if st == "after" and tag == "</tool_call>":
+            self.fstate = "text"
+            return "</function>\n</tool_call>"
+        return tag                                    # anywhere else: plain text
+
+    def feed(self, delta: str) -> list[Event]:
+        self.fbuf += delta
+        return super().feed(self._translate())
+
+    def finish(self, *a, **kw):
+        tail = self._translate(final=True)
+        out = super().feed(tail) if tail else []
+        return out + super().finish(*a, **kw)

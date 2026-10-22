@@ -54,7 +54,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+from serve.frontend import (THINK_END, ChatTemplate, Event, FlintParser, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, image_details_of, images_of, literal_tags, mark_think_literals,
                             openai_to_messages,
                             tool_choice_of, unmark_think_literals)
@@ -3762,7 +3762,9 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        # (Flint writes its calls in its own form: FlintParser turns them into the template form as they stream)
+        parser = (FlintParser if MODEL_FAMILY == "flint" else OutputParser)(thinking=thinking, tools=tools, stream_tools=True,
+                                                                            recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
