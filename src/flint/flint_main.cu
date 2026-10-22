@@ -572,11 +572,14 @@ __global__ void k_embed(const float* table, const int* state, float* h) {
 // power of two putting the row's largest magnitude in [2^14, 2^15)): hi alone cost KL 0.006 on Flint, hi + lo is near
 // fp32. Weights are unpacked from Q4_1 to fp16 (d * q + m, one rounding: KL 0.0015).
 // rows of x (T x K fp32; rmsnorm * nw first when nw; silu(x) * x2 when x2) to hi / lo fp16 and the row's scale back
+// (input row t at (t / per) * gstride + (t % per) * K: rows packed in groups of per, e.g. a token's 6 expert slots
+// inside its 4096-value act row; the defaults read rows back to back)
 __global__ void __launch_bounds__(256) k_split16(const float* x, const float* x2, const float* nw, int K, uint16_t* xh,
-                                                 uint16_t* xl, float* xs) {
+                                                 uint16_t* xl, float* xs, int per = 1, int gstride = 0) {
     const int t = blockIdx.x;
-    const float* r = x + size_t(t) * K;
-    const float* r2 = x2 ? x2 + size_t(t) * K : nullptr;
+    const size_t off = size_t(t / per) * (gstride ? gstride : K) + size_t(t % per) * K;
+    const float* r = x + off;
+    const float* r2 = x2 ? x2 + off : nullptr;
     __shared__ float red[8], redm[8];
     float ss = 0, mx = 0;
     for (int i = threadIdx.x; i < K; i += 256) {
@@ -1334,6 +1337,183 @@ __global__ void __launch_bounds__(1024) k_argmax_rows(const float* lg, int n, in
     }
 }
 
+
+// ------------------------------------------------ the checking pass on the matrix units
+// T <= 16 tokens as the 16 columns of a WMMA tile: a warp takes 16 weight rows, the inputs (fp16 hi and lo, a scale a
+// token, as on the prompt path) go through LDS 256 values at a time. 4 warps a block, 64 rows.
+constexpr int kVgRows = 64, kVgSlice = 256, kVgLd = kVgSlice + 8;
+struct VgIn { const uint16_t *xh, *xl; const float* xs; int ld; };   // a token's input row t: xh + t * ld ...
+// 16 weight rows x 16 token columns, K split over the block's 4 warps (warp w: values w * K / 4 ..): A from the
+// Q4_1 rows, B straight from the inputs' hi / lo rows (small, cached), no LDS until the 4 partial tiles are added.
+// xrow[t]: input row of column t (-1: none). Returns the sum in warp 0 (C layout: lane l16 = token, rows g * 8 + i).
+__device__ inline pf_v8f vg_tile(const uint8_t* Wrow, int K, const VgIn& in, const int* xrow, float (*red)[32][8]) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, l16 = lane & 15, g = lane >> 4;
+    const int row = xrow[l16];
+    const uint16_t* bh = row >= 0 ? in.xh + size_t(row) * in.ld : nullptr;
+    const uint16_t* bl = row >= 0 ? in.xl + size_t(row) * in.ld : nullptr;
+    pf_v8f acc = pf_v8f{0, 0, 0, 0, 0, 0, 0, 0};
+    const int k0 = warp * (K / 4), k1 = k0 + K / 4;
+#pragma unroll 4
+    for (int k = k0; k < k1; k += 16) {
+        const pf_v8h a = pf_q41_a8(Wrow, k + g * 8);
+        const pf_v8h h = bh ? *(const pf_v8h*) (bh + k + g * 8) : pf_v8h{};
+        const pf_v8h l = bl ? *(const pf_v8h*) (bl + k + g * 8) : pf_v8h{};
+        acc = pf_wmma(a, h, acc);
+        acc = pf_wmma(a, l, acc);
+    }
+    if (warp) for (int i = 0; i < 8; ++i) red[warp][lane][i] = acc[i];
+    pf_sync();
+    if (!warp) for (int w = 1; w < 4; ++w) for (int i = 0; i < 8; ++i) acc[i] += red[w][lane][i];
+    pf_sync();
+    return acc;
+}
+// dense: up to three matrices, 64 rows a block; y[j][t * ldy + r] (= or += when add) for t < T
+struct VgJob { const uint8_t* w[3]; float* y[3]; int rows[3], nmat, K, T, ldy, add; VgIn in; };
+__global__ void __launch_bounds__(128) k_vg(VgJob J) {
+    __shared__ float red[4][32][8];
+    __shared__ int xrow[16];
+    int rb = blockIdx.x * 16, j = 0;
+    while (j < J.nmat - 1 && rb >= J.rows[j]) rb -= J.rows[j++];
+    const int lane = threadIdx.x & 31, l16 = lane & 15, g = lane >> 4, r0 = rb;
+    if (threadIdx.x < 16) xrow[threadIdx.x] = threadIdx.x < J.T ? int(threadIdx.x) : -1;
+    __syncthreads();
+    const size_t rowb = size_t(J.K / 32) * 20;
+    const pf_v8f acc = vg_tile(J.w[j] + size_t(r0 + l16) * rowb, J.K, J.in, xrow, red);
+    if ((threadIdx.x >> 5) || l16 >= J.T) return;
+    const float sc = J.in.xs[l16];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = r0 + g * 8 + i;
+        if (r >= J.rows[j]) break;
+        float* y = J.y[j] + size_t(l16) * J.ldy + r;
+        const float v = acc[i] * sc;
+        *y = J.add ? *y + v : v;
+    }
+}
+// experts' gate/up: grid (row block of 64, distinct expert u or kVUniq = shared); act[t][k * 512 + r] = silu(g) * u for
+// the tokens that chose u (k: their choice index), act[t][3072 + r] for the shared expert
+__global__ void __launch_bounds__(128) k_vg_gu(VgIn in, const uint8_t* ge, const uint8_t* ue_, const uint8_t* gs,
+                                               const uint8_t* us, const int* ue, const int* um, const int* vu,
+                                               const int* un, int T, float* act) {
+    __shared__ float red[4][32][8];
+    __shared__ int xrow[16];
+    const int u = blockIdx.y;
+    const bool shared = u == kVUniq;
+    if (!shared && (u >= *un || blockIdx.x * 16 >= kFfExp)) return;
+    const int lane = threadIdx.x & 31, l16 = lane & 15, g = lane >> 4, r0 = blockIdx.x * 16;
+    const int mask = shared ? (1 << T) - 1 : um[u];
+    if (threadIdx.x < 16) xrow[threadIdx.x] = (threadIdx.x < T && (mask >> threadIdx.x & 1)) ? int(threadIdx.x) : -1;
+    __syncthreads();
+    constexpr size_t rowb = size_t(kHidden / 32) * 20;
+    const uint8_t *G, *U;
+    if (shared) { G = gs + size_t(r0 + l16) * rowb; U = us + size_t(r0 + l16) * rowb; }
+    else { const size_t e = size_t(ue[u]) * kFfExp + r0 + l16; G = ge + e * rowb; U = ue_ + e * rowb; }
+    const pf_v8f ag = vg_tile(G, kHidden, in, xrow, red);
+    const pf_v8f au = vg_tile(U, kHidden, in, xrow, red);
+    if ((threadIdx.x >> 5) || xrow[l16] < 0) return;
+    const int t = l16;
+    int k = 0;
+    if (!shared) while (vu[t * kTopK + k] != u) ++k;
+    const float sc = in.xs[t];
+    float* a = act + size_t(t) * kActRows + (shared ? kTopK * kFfExp : k * kFfExp) + r0 + g * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) a[i] = silu(ag[i] * sc) * (au[i] * sc);
+}
+// experts' down: grid (row block of 64, distinct expert u or kVUniq = shared); Y[t][k][r] (k = 6: shared). The inputs
+// are the act rows split per 512 (expert k of token t: row t * 6 + k) and per 1024 (the shared one: row t), in two sets
+__global__ void __launch_bounds__(128) k_vg_down(VgIn ine, VgIn ins, const uint8_t* de, const uint8_t* ds, const int* ue,
+                                                 const int* um, const int* vu, const int* un, int T, float* Y) {
+    __shared__ float red[4][32][8];
+    __shared__ int xrow[16], kof[16];
+    const int u = blockIdx.y;
+    const bool shared = u == kVUniq;
+    if (!shared && u >= *un) return;
+    const int lane = threadIdx.x & 31, l16 = lane & 15, g = lane >> 4, r0 = blockIdx.x * 16;
+    if (threadIdx.x < 16) {
+        const int t = threadIdx.x;
+        int row = -1, k = kTopK;
+        if (t < T && shared) row = t;
+        else if (t < T && (um[u] >> t & 1)) { k = 0; while (vu[t * kTopK + k] != u) ++k; row = t * kTopK + k; }
+        xrow[t] = row; kof[t] = k;
+    }
+    __syncthreads();
+    const pf_v8f acc = shared ? vg_tile(ds + size_t(r0 + l16) * (kFfShared / 32) * 20, kFfShared, ins, xrow, red)
+                              : vg_tile(de + (size_t(ue[u]) * kHidden + r0 + l16) * (kFfExp / 32) * 20, kFfExp, ine, xrow, red);
+    if ((threadIdx.x >> 5) || xrow[l16] < 0) return;
+    const float sc = (shared ? ins.xs : ine.xs)[xrow[l16]];
+    float* y = Y + (size_t(l16) * (kTopK + 1) + kof[l16]) * kHidden + r0 + g * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) y[i] = acc[i] * sc;
+}
+// H[t] += sum_k w[t][k] * Y[t][k] + Y[t][6] (block t)
+__global__ void k_vg_combine(float* H, const float* Y, const float* wts) {
+    const int t = blockIdx.x;
+    for (int i = threadIdx.x; i < kHidden; i += 256) {
+        float s = Y[(size_t(t) * (kTopK + 1) + kTopK) * kHidden + i];
+        for (int k = 0; k < kTopK; ++k) s += wts[t * kTopK + k] * Y[(size_t(t) * (kTopK + 1) + k) * kHidden + i];
+        H[size_t(t) * kHidden + i] += s;
+    }
+}
+// router logits for T tokens, fp32: a warp an expert row (4 a block), the T normed rows staged 256 values at a time
+template <int T>
+__global__ void __launch_bounds__(128) k_vr(const float* X, const uint16_t* W, float* logits) {
+    __shared__ __align__(16) float sb[T][256];
+    const int lane = threadIdx.x & 31, e = blockIdx.x * 4 + (threadIdx.x >> 5);
+    float acc[T] = {};
+    for (int kc = 0; kc < kHidden; kc += 256) {
+        for (int i = threadIdx.x; i < T * 64; i += 128) { const int t = i >> 6, c = (i & 63) * 4; *(float4*) &sb[t][c] = *(const float4*) (X + size_t(t) * kHidden + kc + c); }
+        __syncthreads();
+        const uint4 w = *(const uint4*) (W + size_t(e) * kHidden + kc + lane * 8);
+        const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+        for (int t = 0; t < T; ++t)
+#pragma unroll
+            for (int k = 0; k < 4; ++k) acc[t] += __uint_as_float(ww[k] << 16) * sb[t][lane * 8 + 2 * k] + __uint_as_float(ww[k] & 0xffff0000u) * sb[t][lane * 8 + 2 * k + 1];
+        __syncthreads();
+    }
+#pragma unroll
+    for (int t = 0; t < T; ++t) { const float v = warp_sum(acc[t]); if (lane == 0) logits[t * kExperts + e] = v; }
+}
+// each token's top 6 and the distinct experts (one block of 128: k_v_router's last-block part)
+__global__ void __launch_bounds__(128) k_vr_pick(const float* logits, int T, int* idx, float* wts, int* ue, int* um, int* vu, int* un) {
+    __shared__ int sidx[kVMax * kTopK], sue[kVUniq], sum_[kVUniq];
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    for (int t = w; t < T; t += 4) {
+        float sc[8];
+        for (int j = 0; j < 8; ++j) sc[j] = 1.f / (1.f + expf(-logits[t * kExperts + lane * 8 + j]));
+        float tot = 0, pv[kTopK];
+        int pi[kTopK];
+        for (int k = 0; k < kTopK; ++k) {
+            float v = -2.f;
+            int i = 0;
+            for (int j = 0; j < 8; ++j) if (sc[j] > v) { v = sc[j]; i = lane * 8 + j; }
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor(v, o, 32);
+                const int oi = __shfl_xor(i, o, 32);
+                if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
+            }
+            if (lane == i / 8) sc[i % 8] = -1.f;
+            pv[k] = v; pi[k] = i; tot += v;
+        }
+        if (lane == 0) for (int k = 0; k < kTopK; ++k) { sidx[t * kTopK + k] = pi[k]; idx[t * kTopK + k] = pi[k]; wts[t * kTopK + k] = pv[k] / tot; }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {   // (in LDS: a loop over global memory here took 60 us)
+        int n = 0;
+        for (int t = 0; t < T; ++t)
+            for (int k = 0; k < kTopK; ++k) {
+                const int x = sidx[t * kTopK + k];
+                int u = 0;
+                while (u < n && sue[u] != x) ++u;
+                if (u == n) { sue[n] = x; sum_[n] = 0; ++n; }
+                sum_[u] |= 1 << t;
+                vu[t * kTopK + k] = u;
+            }
+        for (int u = 0; u < n; ++u) { ue[u] = sue[u]; um[u] = sum_[u]; }
+        *un = n;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------- the model
 struct Layer {
     const float *attn_norm, *ffn_norm, *q_norm, *k_norm, *sinks;
@@ -1504,7 +1684,8 @@ struct Model {
     }
 
     // ------------------------------------------------ checking drafts: T tokens (the current one and T - 1 drafted)
-    float *vH = nullptr, *vX, *vQKV, *vATT, *vG, *vU, *vACT, *vLG, *vRL, *vW, *vPart;
+    float *vH = nullptr, *vX, *vQKV, *vATT, *vG, *vU, *vACT, *vLG, *vRL, *vW, *vPart, *vY, *vXS, *vXS2;
+    uint16_t *vXH, *vXL, *vXH2, *vXL2;
     int *vToks, *vIdx, *vUe, *vUm, *vVu, *vUn, *vBest;
     int* vToksHost = nullptr;
     int* vBestHost = nullptr;
@@ -1519,6 +1700,9 @@ struct Model {
         f(vRL, kVMax * kExperts); f(vW, kVMax * kTopK); f(vPart, size_t(kVMax) * kHeads * kAttnChunks * kPart);
         fi(vToks, kVMax); fi(vIdx, kVMax * kTopK); fi(vUe, kVUniq); fi(vUm, kVUniq); fi(vVu, kVMax * kTopK); fi(vUn, 1);
         fi(vBest, kVMax);
+        f(vY, size_t(kVMax) * (kTopK + 1) * kHidden); f(vXS, kVMax * kTopK); f(vXS2, kVMax);
+        CK(cudaMalloc(&vXH, size_t(kVMax) * kFfDense * 2)); CK(cudaMalloc(&vXL, size_t(kVMax) * kFfDense * 2));
+        CK(cudaMalloc(&vXH2, size_t(kVMax) * kFfShared * 2)); CK(cudaMalloc(&vXL2, size_t(kVMax) * kFfShared * 2));
         CK(cudaMalloc(&vDone, 4));
         CK(cudaMemset(vDone, 0, 4));
         CK(cudaMallocHost(&vToksHost, kVMax * 4));
@@ -1546,7 +1730,56 @@ struct Model {
         J.nmat = j; J.X = X; J.ldx = ldx; J.n_in = n_in; J.T = T; J.ldy = ldy; J.acc = accum;
         vdispatch(T, [&](auto tc) { k_v_mv<decltype(tc)::value><<<total / kMvRows, 256, 0, st>>>(J); });
     }
+    // the matrix-unit version (FLINT_VSIMT=1: the first one, below)
+    void vg(std::initializer_list<std::pair<const uint8_t*, float*>> mats, std::initializer_list<int> rows, int K, int T,
+            int ldy, int add, VgIn in) {
+        VgJob J{};
+        int j = 0, total = 0;
+        for (auto& m_ : mats) { J.w[j] = m_.first; J.y[j] = m_.second; ++j; }
+        j = 0;
+        for (int r : rows) { J.rows[j++] = r; total += r; }
+        J.nmat = j; J.K = K; J.T = T; J.ldy = ldy; J.add = add; J.in = in;
+        k_vg<<<total / 16, 128, 0, st>>>(J);
+    }
+    void v_record_mu(int T) {
+        const int NQKV = kQDim + 2 * kKvDim;
+        k_v_embed<<<T, 256, 0, st>>>(embed, vToks, vH);
+        for (int i = 0; i < kLayers; ++i) {
+            Layer& l = L[i];
+            k_split16<<<T, 256, 0, st>>>(vH, nullptr, l.attn_norm, kHidden, vXH, vXL, vXS);
+            // (k_split16 writes rows of K = 2048 at stride K: the VgIn stride is the split's K)
+            vg({{l.wq, vQKV}, {l.wk, vQKV + kQDim}, {l.wv, vQKV + kQDim + kKvDim}}, {kQDim, kKvDim, kKvDim}, kHidden, T, NQKV, 0, VgIn{vXH, vXL, vXS, kHidden});
+            k_qkv_post<<<dim3(kHeads + kKv, 1, T), kHd, 0, st>>>(vQKV, vQKV + kQDim, vQKV + kQDim + kKvDim, l.q_norm, l.k_norm, l.K, l.V, state, l.swa, l.kv_mask, NQKV);
+            if (l.swa) k_attn_part<<<dim3(kHeads, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV);
+            else k_attn_dec_w<<<dim3(kKv, kAttnChunks, T), 256, 0, st>>>(vQKV, l.K, l.V, vPart, state, l.swa, l.kv_mask, NQKV);
+            k_attn_merge<<<dim3(kHeads, 1, T), kHd, 0, st>>>(vPart, l.sinks, vATT);
+            k_split16<<<T, 256, 0, st>>>(vATT, nullptr, nullptr, kQDim, vXH, vXL, vXS);
+            vg({{l.wo, vH}}, {kHidden}, kQDim, T, kHidden, 1, VgIn{vXH, vXL, vXS, kQDim});
+            if (i < kDense) {
+                k_split16<<<T, 256, 0, st>>>(vH, nullptr, l.ffn_norm, kHidden, vXH, vXL, vXS);
+                vg({{l.gate, vG}, {l.up, vU}}, {kFfDense, kFfDense}, kHidden, T, kFfDense, 0, VgIn{vXH, vXL, vXS, kHidden});
+                k_split16<<<T, 256, 0, st>>>(vG, vU, nullptr, kFfDense, vXH, vXL, vXS);
+                vg({{l.down, vH}}, {kHidden}, kFfDense, T, kHidden, 1, VgIn{vXH, vXL, vXS, kFfDense});
+                continue;
+            }
+            k_v_norm<<<T, 256, 0, st>>>(vH, l.ffn_norm, vX);      // fp32 normed rows for the router
+            vdispatch(T, [&](auto tc) { k_vr<decltype(tc)::value><<<kExperts / 4, 128, 0, st>>>(vX, l.router, vRL); });
+            k_vr_pick<<<1, 128, 0, st>>>(vRL, T, vIdx, vW, vUe, vUm, vVu, vUn);
+            k_split16<<<T, 256, 0, st>>>(vH, nullptr, l.ffn_norm, kHidden, vXH, vXL, vXS);
+            k_vg_gu<<<dim3(kFfShared / 16, kVUniq + 1), 128, 0, st>>>(VgIn{vXH, vXL, vXS, kHidden}, l.gate_e, l.up_e, l.gate_s, l.up_s, vUe, vUm, vVu, vUn, T, vACT);
+            // the act rows split: each expert slot (512) a row, and each token's shared part (1024) a row
+            k_split16<<<T * kTopK, 256, 0, st>>>(vACT, nullptr, nullptr, kFfExp, vXH, vXL, vXS, kTopK, kActRows);
+            k_split16<<<T, 256, 0, st>>>(vACT + kTopK * kFfExp, nullptr, nullptr, kFfShared, vXH2, vXL2, vXS2, 1, kActRows);
+            k_vg_down<<<dim3(kHidden / 16, kVUniq + 1), 128, 0, st>>>(VgIn{vXH, vXL, vXS, kFfExp}, VgIn{vXH2, vXL2, vXS2, kFfShared}, l.down_e, l.down_s, vUe, vUm, vVu, vUn, T, vY);
+            k_vg_combine<<<T, 256, 0, st>>>(vH, vY, vW);
+        }
+        k_split16<<<T, 256, 0, st>>>(vH, nullptr, out_norm, kHidden, vXH, vXL, vXS);
+        vg({{head, vLG}}, {vocab}, kHidden, T, vocab, 0, VgIn{vXH, vXL, vXS, kHidden});
+        k_argmax_rows<<<T, 1024, 0, st>>>(vLG, vocab, vBest);
+    }
     void v_record(int T) {
+        static const bool simt = std::getenv("FLINT_VSIMT") != nullptr;
+        if (!simt) { v_record_mu(T); return; }
         const int NQKV = kQDim + 2 * kKvDim;
         k_v_embed<<<T, 256, 0, st>>>(embed, vToks, vH);
         for (int i = 0; i < kLayers; ++i) {
