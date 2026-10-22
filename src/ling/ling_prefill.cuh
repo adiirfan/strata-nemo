@@ -46,7 +46,7 @@ __global__ void __launch_bounds__(256) k_gemm(Gemm J) {
         {   // weights: 64 rows x 32 values = 256 groups of 8, one a thread
             const int r = tid >> 2, g = tid & 3;
             float v[8];
-            if (n0 + r < J.N) deq8(J.fmt, W + size_t(n0 + r) * rb, (k0 >> 3) + g, v);
+            if (n0 + r < J.N) deq8(J.fmt, W + size_t(n0 + r) * rb, (k0 >> 3) + g, v, J.K);
             else for (int i = 0; i < 8; ++i) v[i] = 0.f;
             for (int i = 0; i < 8; ++i) ws[r][g * 8 + i] = v[i];
         }
@@ -264,47 +264,8 @@ __global__ void __launch_bounds__(256) k_pmla_gate(float* out, const float* gate
 
 // ---- MoE over a chunk: route every token, then group the rows by expert
 __global__ void __launch_bounds__(512) k_proute(const float* logits, const float* bias, int* idx, float* wts, int* count) {
-    // (k_route's rule, one block a token)
-    __shared__ float sel[kExperts], prob[kExperts], gsc[kGroups];
-    __shared__ int keep[kGroups];
-    const int e = threadIdx.x, tok = blockIdx.x;
-    prob[e] = sigmoidf(logits[size_t(tok) * kExperts + e]);
-    sel[e] = prob[e] + bias[e];
-    __syncthreads();
-    if (e < kGroups) {
-        float a = -INFINITY, b = -INFINITY;
-        for (int i = e * 64; i < e * 64 + 64; ++i) {
-            const float v = sel[i];
-            if (v > a) { b = a; a = v; } else if (v > b) b = v;
-        }
-        gsc[e] = a + b;
-    }
-    __syncthreads();
-    if (e == 0) {
-        bool used[kGroups] = {};
-        for (int k = 0; k < kGroupsUsed; ++k) {
-            int bi = -1;
-            for (int gi = 0; gi < kGroups; ++gi) if (!used[gi] && (bi < 0 || gsc[gi] > gsc[bi])) bi = gi;
-            used[bi] = true;
-        }
-        for (int gi = 0; gi < kGroups; ++gi) keep[gi] = used[gi];
-        int top[kTopK];
-        bool taken[kExperts] = {};
-        float tot = 0;
-        for (int k = 0; k < kTopK; ++k) {
-            int bi = -1;
-            for (int i = 0; i < kExperts; ++i)
-                if (keep[i / 64] && !taken[i] && (bi < 0 || sel[i] > sel[bi])) bi = i;
-            taken[bi] = true;
-            top[k] = bi;
-            tot += prob[bi];
-        }
-        for (int k = 0; k < kTopK; ++k) {
-            idx[tok * kTopK + k] = top[k];
-            wts[tok * kTopK + k] = prob[top[k]] / tot * kExpScale;
-            atomicAdd(&count[top[k]], 1);
-        }
-    }
+    const int tok = blockIdx.x;   // (k_route's rule, one block a token)
+    route_block(logits + size_t(tok) * kExperts, bias, idx + tok * kTopK, wts + tok * kTopK, count);
 }
 // bounds (exclusive prefix sums of the counts) and the tiles of 64 rows; one block of 512
 __global__ void __launch_bounds__(512) k_pbounds(const int* count, int* bounds, int* fill, int* tiles, int* n_tiles) {
@@ -348,6 +309,6 @@ __global__ void k_pembed(const uint8_t* table, int fmt, const int* ids, float* h
     const int tok = blockIdx.x, g = threadIdx.x;   // (320 groups of 8 a row)
     if (g >= kHidden / 8) return;
     float v[8];
-    deq8(fmt, table + size_t(ids[tok]) * row_bytes(fmt, kHidden), g, v);
+    deq8(fmt, table + size_t(ids[tok]) * row_bytes(fmt, kHidden), g, v, kHidden);
     for (int i = 0; i < 8; ++i) h[size_t(tok) * kHidden + g * 8 + i] = v[i];
 }

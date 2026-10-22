@@ -48,8 +48,18 @@ constexpr float kEps = 1e-6f, kRopeBase = 6000000.f, kGateLow = -5.f, kExpScale 
 
 // GGUF tensor types used by this file, and their 32- (or 256-) value block sizes in bytes
 constexpr int F32 = 0, Q4_0 = 2, Q4_1 = 3, Q5_0 = 6, Q8_0 = 8, Q6_K = 14;
+// the same, rearranged on the card for aligned vector loads (k_repack): a row holds every block's quants first, then
+// their scales (Q4_0: 16-byte nibbles | fp16 d; Q4_1: nibbles | d | m; Q5_0: nibbles | 4-byte high bits | d; Q8_0:
+// 32 int8 | d), the same bytes a row; Q6_K's 210-byte blocks padded to 224 so each starts 16-aligned
+constexpr int AQ4_0 = 102, AQ4_1 = 103, AQ5_0 = 106, AQ8_0 = 108, AQ6_K = 114;
+__host__ __device__ inline int aligned_fmt(int fmt) { return fmt == F32 ? F32 : fmt + 100; }
 __host__ __device__ inline size_t row_bytes(int fmt, int n) {
     switch (fmt) {
+        case AQ4_0: return size_t(n / 32) * 18;
+        case AQ4_1: return size_t(n / 32) * 20;
+        case AQ5_0: return size_t(n / 32) * 22;
+        case AQ8_0: return size_t(n / 32) * 34;
+        case AQ6_K: return size_t(n / 256) * 224;
         case F32: return size_t(n) * 4;
         case Q4_0: return size_t(n / 32) * 18;
         case Q4_1: return size_t(n / 32) * 20;
@@ -75,11 +85,54 @@ __device__ __forceinline__ float sigmoidf(float x) { return 1.f / (1.f + expf(-x
 __device__ __forceinline__ float siluf(float x) { return x / (1.f + expf(-x)); }
 
 // values 8 g .. 8 g + 7 of a row of format fmt
-__device__ __forceinline__ void deq8(int fmt, const uint8_t* row, int g, float* v) {
+__device__ __forceinline__ void deq8(int fmt, const uint8_t* row, int g, float* v, int K) {
     if (fmt == F32) {
         const float* f = (const float*) row + g * 8;
 #pragma unroll
         for (int i = 0; i < 8; ++i) v[i] = f[i];
+        return;
+    }
+    if (fmt >= 100) {   // the card's aligned forms (see AQ4_0)
+        if (fmt == AQ6_K) {
+            const int e0 = g * 8, sb = e0 >> 8, r = e0 & 255, n = r >> 7, rr = r & 127, qq = rr >> 5, l0 = rr & 31;
+            const uint8_t* B = row + size_t(sb) * 224;
+            const uint2 ql = *(const uint2*) (B + 64 * n + ((qq & 1) ? 32 : 0) + l0);
+            const uint2 qh = *(const uint2*) (B + 128 + 32 * n + l0);
+            const int8_t sc = ((const int8_t*) (B + 192))[8 * n + (l0 >> 4) + 2 * qq];
+            const float d = h2f(B + 208) * float(sc);
+            const int shl = (qq >> 1) ? 4 : 0;
+            const uint8_t* qlb = (const uint8_t*) &ql;
+            const uint8_t* qhb = (const uint8_t*) &qh;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) v[i] = d * float((((qlb[i] >> shl) & 15) | (((qhb[i] >> (2 * qq)) & 3) << 4)) - 32);
+            return;
+        }
+        const int b = g >> 2, j0 = (g & 3) * 8, sh = j0 >= 16 ? 4 : 0, o = j0 & 15, nb = K / 32;
+        if (fmt == AQ8_0) {
+            const uint2 q = *(const uint2*) (row + size_t(b) * 32 + j0);
+            const int8_t* qb = (const int8_t*) &q;
+            const float d = h2f(row + size_t(nb) * 32 + b * 2);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) v[i] = d * float(qb[i]);
+            return;
+        }
+        const uint2 q = *(const uint2*) (row + size_t(b) * 16 + o);
+        const uint8_t* qb = (const uint8_t*) &q;
+        const uint8_t* sc = row + size_t(nb) * 16;
+        if (fmt == AQ4_0) {
+            const float d = h2f(sc + b * 2);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) v[i] = d * float(((qb[i] >> sh) & 15) - 8);
+        } else if (fmt == AQ4_1) {
+            const float d = h2f(sc + b * 4), m = h2f(sc + b * 4 + 2);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) v[i] = d * float((qb[i] >> sh) & 15) + m;
+        } else {   // AQ5_0: nibbles | the blocks' 4-byte high bits | d
+            const uint32_t qh = *(const uint32_t*) (sc + b * 4);
+            const float d = h2f(sc + size_t(nb) * 4 + b * 2);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) v[i] = d * float(int(((qb[i] >> sh) & 15) | (((qh >> (j0 + i)) & 1u) << 4)) - 16);   // (int: qh is unsigned)
+        }
         return;
     }
     if (fmt == Q6_K) {
@@ -145,7 +198,7 @@ __device__ __forceinline__ float row_dot(int fmt, const uint8_t* row, const floa
     float acc = 0.f;
     for (int g = lane; g < K / 8; g += 32) {
         float v[8];
-        deq8(fmt, row, g, v);
+        deq8(fmt, row, g, v, K);
 #pragma unroll
         for (int i = 0; i < 8; ++i) acc += v[i] * x[g * 8 + i];
     }
@@ -184,9 +237,23 @@ __global__ void __launch_bounds__(256) k_mv(Mv J) {
     while (j < J.nmat - 1 && rb >= J.rows[j]) rb -= J.rows[j++];
     const int lane = threadIdx.x & 31, r0 = rb + (threadIdx.x >> 5) * 4;
     const size_t rbytes = row_bytes(J.fmt[j], J.K);
-    for (int r = r0; r < r0 + 4 && r < J.rows[j]; ++r) {
-        const float v = row_dot(J.fmt[j], J.w[j] + size_t(r) * rbytes, xs, J.K, lane);
-        if (lane == 0) J.y[j][r] = J.acc ? J.y[j][r] + v : v;
+    // the warp's 4 rows together (their loads in flight at once, not one row after another)
+    const int fmt = J.fmt[j];
+    const uint8_t* W = J.w[j] + size_t(r0) * rbytes;
+    float acc[4] = {};
+    for (int g = lane; g < J.K / 8; g += 32) {
+        float v[4][8];
+#pragma unroll
+        for (int r = 0; r < 4; ++r) deq8(fmt, W + size_t(r) * rbytes, g, v[r], J.K);
+#pragma unroll
+        for (int r = 0; r < 4; ++r)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[r] += v[r][i] * xs[g * 8 + i];
+    }
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const float v = warp_sum(acc[r]);
+        if (lane == 0) J.y[j][r0 + r] = J.acc ? J.y[j][r0 + r] + v : v;
     }
 }
 
@@ -339,44 +406,68 @@ __global__ void __launch_bounds__(256) k_mla_out(const float* ol, const uint8_t*
 }
 
 // ---- routing: p = sigmoid(logits); pick on p + bias (8 groups of 64 scored by their top-2 sum, best 4, then top 8);
-// weights p normalized x 2.5. One block of 512 threads (thread = expert)
-__global__ void __launch_bounds__(512) k_route(const float* logits, const float* bias, int* idx, float* wts) {
-    __shared__ float sel[kExperts], prob[kExperts], gsc[kGroups];
-    __shared__ int keep[kGroups];
-    const int e = threadIdx.x;
+// weights p normalized x 2.5. A block of 512 threads (thread = expert): each group's top 2 by one warp, the 8 picks by
+// 8 rounds of a block-wide maximum (lowest index on ties, as a stable sort)
+__device__ void route_block(const float* logits, const float* bias, int* idx, float* wts, int* count) {
+    __shared__ float sel[kExperts], prob[kExperts], gsc[kGroups], wv[16];
+    __shared__ int wi[16], top[kTopK], keep[kGroups];
+    const int e = threadIdx.x, lane = e & 31, w = e >> 5;
     prob[e] = sigmoidf(logits[e]);
     sel[e] = prob[e] + bias[e];
     __syncthreads();
-    if (e < kGroups) {   // a group's top-2 sum
-        float a = -INFINITY, b = -INFINITY;
-        for (int i = e * 64; i < e * 64 + 64; ++i) {
-            const float v = sel[i];
-            if (v > a) { b = a; a = v; } else if (v > b) b = v;
+    if (w < kGroups) {   // warp w: group w's top-2 sum (lane: experts lane, lane + 32 of the group)
+        const float a = sel[w * 64 + lane], b = sel[w * 64 + 32 + lane];
+        float m1 = fmaxf(a, b), m2 = fminf(a, b);   // this lane's best two
+        for (int o = 16; o > 0; o >>= 1) {
+            const float o1 = fl_shfl_xor(m1, o, 32), o2 = fl_shfl_xor(m2, o, 32);
+            const float n1 = fmaxf(m1, o1), n2 = fmaxf(fminf(m1, o1), fmaxf(m2, o2));
+            m1 = n1; m2 = n2;
         }
-        gsc[e] = a + b;
+        if (lane == 0) gsc[w] = m1 + m2;
     }
     __syncthreads();
     if (e == 0) {
-        bool used[kGroups] = {};
-        for (int k = 0; k < kGroupsUsed; ++k) {   // the best groups (lowest index on ties, as a stable sort)
+        int used = 0;
+        for (int k = 0; k < kGroupsUsed; ++k) {
             int bi = -1;
-            for (int gi = 0; gi < kGroups; ++gi) if (!used[gi] && (bi < 0 || gsc[gi] > gsc[bi])) bi = gi;
-            used[bi] = true;
+            for (int gi = 0; gi < kGroups; ++gi) if (!(used >> gi & 1) && (bi < 0 || gsc[gi] > gsc[bi])) bi = gi;
+            used |= 1 << bi;
         }
-        for (int gi = 0; gi < kGroups; ++gi) keep[gi] = used[gi];
-        int top[kTopK];
-        bool taken[kExperts] = {};
-        float tot = 0;
-        for (int k = 0; k < kTopK; ++k) {
-            int bi = -1;
-            for (int i = 0; i < kExperts; ++i)
-                if (keep[i / 64] && !taken[i] && (bi < 0 || sel[i] > sel[bi])) bi = i;
-            taken[bi] = true;
-            top[k] = bi;
-            tot += prob[bi];
-        }
-        for (int k = 0; k < kTopK; ++k) { idx[k] = top[k]; wts[k] = prob[top[k]] / tot * kExpScale; }
+        for (int gi = 0; gi < kGroups; ++gi) keep[gi] = used >> gi & 1;
     }
+    __syncthreads();
+    float v = keep[e >> 6] ? sel[e] : -INFINITY;
+    for (int k = 0; k < kTopK; ++k) {
+        float bv = v;
+        int bi = e;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = fl_shfl_xor(bv, o, 32);
+            const int oi = fl_shfl_xor(bi, o, 32);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) { wv[w] = bv; wi[w] = bi; }
+        __syncthreads();
+        if (e == 0) {
+            float b = wv[0];
+            int ib = wi[0];
+            for (int j = 1; j < 16; ++j) if (wv[j] > b || (wv[j] == b && wi[j] < ib)) { b = wv[j]; ib = wi[j]; }
+            top[k] = ib;
+        }
+        __syncthreads();
+        if (e == top[k]) v = -INFINITY;
+    }
+    if (e == 0) {
+        float tot = 0;
+        for (int k = 0; k < kTopK; ++k) tot += prob[top[k]];
+        for (int k = 0; k < kTopK; ++k) {
+            idx[k] = top[k];
+            wts[k] = prob[top[k]] / tot * kExpScale;
+            if (count) atomicAdd(&count[top[k]], 1);
+        }
+    }
+}
+__global__ void __launch_bounds__(512) k_route(const float* logits, const float* bias, int* idx, float* wts) {
+    route_block(logits, bias, idx, wts, nullptr);
 }
 
 // ---- experts on the card (the plan's: slot >= 0) and the shared expert. gate/up: act rows [k * 768] for the routed,
@@ -457,8 +548,39 @@ __global__ void k_embed(const uint8_t* table, int fmt, const int* state, float* 
     const int g = blockIdx.x * blockDim.x + threadIdx.x;   // 8-value group
     if (g >= kHidden / 8) return;
     float v[8];
-    deq8(fmt, table + size_t(state[1]) * row_bytes(fmt, kHidden), g, v);
+    deq8(fmt, table + size_t(state[1]) * row_bytes(fmt, kHidden), g, v, kHidden);
     for (int i = 0; i < 8; ++i) h[g * 8 + i] = v[i];
+}
+// the GGUF block layout of `rows` rows of K values into the aligned form (one thread a block; Q6_K: a 210 -> 224 copy)
+__global__ void k_repack(const uint8_t* src, uint8_t* dst, size_t rows, int K, int fmt) {
+    const int nb = fmt == Q6_K ? K / 256 : K / 32;
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= rows * nb) return;
+    const size_t r = i / nb;
+    const int b = int(i % nb);
+    const uint8_t* s = src + r * row_bytes(fmt, K);
+    uint8_t* d = dst + r * row_bytes(aligned_fmt(fmt), K);
+    switch (fmt) {
+        case Q4_0: for (int j = 0; j < 16; ++j) d[b * 16 + j] = s[b * 18 + 2 + j];
+                   d[nb * 16 + b * 2] = s[b * 18]; d[nb * 16 + b * 2 + 1] = s[b * 18 + 1]; break;
+        case Q4_1: for (int j = 0; j < 16; ++j) d[b * 16 + j] = s[b * 20 + 4 + j];
+                   for (int j = 0; j < 4; ++j) d[nb * 16 + b * 4 + j] = s[b * 20 + j]; break;
+        case Q5_0: for (int j = 0; j < 16; ++j) d[b * 16 + j] = s[b * 22 + 6 + j];
+                   for (int j = 0; j < 4; ++j) d[nb * 16 + b * 4 + j] = s[b * 22 + 2 + j];
+                   d[nb * 20 + b * 2] = s[b * 22]; d[nb * 20 + b * 2 + 1] = s[b * 22 + 1]; break;
+        case Q8_0: for (int j = 0; j < 32; ++j) d[b * 32 + j] = s[b * 34 + 2 + j];
+                   d[nb * 32 + b * 2] = s[b * 34]; d[nb * 32 + b * 2 + 1] = s[b * 34 + 1]; break;
+        case Q6_K: for (int j = 0; j < 210; ++j) d[b * 224 + j] = s[b * 210 + j]; break;
+    }
+}
+// (checking) rows 0 .. 3 of a tensor decoded from the GGUF layout and from the aligned one
+__global__ void k_fmt_test(const uint8_t* raw, const uint8_t* al, int fmt, int K, float* out) {
+    const int r = blockIdx.x, g = threadIdx.x;
+    if (g >= K / 8) return;
+    float a[8], b[8];
+    deq8(fmt, raw + size_t(r) * row_bytes(fmt, K), g, a, K);
+    deq8(aligned_fmt(fmt), al + size_t(r) * row_bytes(aligned_fmt(fmt), K), g, b, K);
+    for (int i = 0; i < 8; ++i) { out[(size_t(r) * K + g * 8 + i) * 2] = a[i]; out[(size_t(r) * K + g * 8 + i) * 2 + 1] = b[i]; }
 }
 __global__ void k_swiglu(float* g, const float* u, int n) {   // g = silu(g) * u
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -581,7 +703,7 @@ struct Model {
     uint32_t* hy_ctr = nullptr;
     uint32_t hy_seq = 0;
     cudaGraphExec_t graph = nullptr;
-    size_t hy_cpu_experts = 0, hy_card_experts = 0;
+    size_t hy_cpu_experts = 0, hy_card_experts = 0, n_steps = 0;
     double hy_t_wait = 0, hy_t_cpu = 0;
     std::vector<std::vector<int>> plan;
     float* hy_h = nullptr;   // pinned: the layer's MoE input (host side of the CPU's experts)
@@ -611,10 +733,38 @@ struct Model {
         }
         const size_t bytes = strata::tensor_payload_bytes(*t);
         void* d = nullptr;
-        CK(cudaMalloc(&d, bytes));
-        CK(cudaMemcpy(d, o->tensor_data(*t), bytes, cudaMemcpyHostToDevice));
-        loaded += bytes;
-        return {(const uint8_t*) d, fmt};
+        if (fmt == F32) {
+            CK(cudaMalloc(&d, bytes));
+            CK(cudaMemcpy(d, o->tensor_data(*t), bytes, cudaMemcpyHostToDevice));
+            loaded += bytes;
+            return {(const uint8_t*) d, fmt};
+        }
+        // quantized: to the card as it is, then rearranged into the aligned form (LING_RAW_FMTS=6,14: those GGUF types
+        // stay as they are - for checking)
+        static const std::string raw_fmts = std::getenv("LING_RAW_FMTS") ? std::string(",") + std::getenv("LING_RAW_FMTS") + "," : "";
+        if (raw_fmts.find("," + std::to_string(fmt) + ",") != std::string::npos) {
+            CK(cudaMalloc(&d, bytes));
+            CK(cudaMemcpy(d, o->tensor_data(*t), bytes, cudaMemcpyHostToDevice));
+            loaded += bytes;
+            return {(const uint8_t*) d, fmt};
+        }
+        const int K = int(t->shape[0]);
+        const size_t rows = bytes / row_bytes(fmt, K);
+        const size_t abytes = rows * row_bytes(aligned_fmt(fmt), K);
+        void* raw = nullptr;
+        CK(cudaMalloc(&raw, bytes));
+        CK(cudaMemcpy(raw, o->tensor_data(*t), bytes, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&d, abytes));
+        repack((const uint8_t*) raw, (uint8_t*) d, rows, K, fmt);
+        CK(cudaDeviceSynchronize());
+        CK(cudaFree(raw));
+        loaded += abytes;
+        return {(const uint8_t*) d, aligned_fmt(fmt)};
+    }
+    void repack(const uint8_t* raw, uint8_t* dst, size_t rows, int K, int fmt, cudaStream_t s = 0) {
+        const int nb = fmt == Q6_K ? K / 256 : K / 32;
+        const size_t n = rows * nb;
+        k_repack<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(raw, dst, rows, K, fmt);
     }
     const float* upf(const std::string& n) {
         const Tensor t = up(n);
@@ -712,13 +862,20 @@ struct Model {
                 l.ge = l.ue = l.de = nullptr;
                 if (!R.empty()) {
                     const size_t eg = size_t(kFfExp) * row_bytes(l.fmt_eg, kHidden), ed = size_t(kHidden) * row_bytes(l.fmt_ed, kFfExp);
-                    uint8_t *cg, *cu, *cd;
+                    // (to the card as they are, then rearranged into the aligned form: same sizes)
+                    uint8_t *cg, *cu, *cd, *raw;
                     CK(cudaMalloc(&cg, R.size() * eg)); CK(cudaMalloc(&cu, R.size() * eg)); CK(cudaMalloc(&cd, R.size() * ed));
-                    for (size_t j = 0; j < R.size(); ++j) {
-                        CK(cudaMemcpy(cg + j * eg, l.ge_h + size_t(R[j]) * eg, eg, cudaMemcpyHostToDevice));
-                        CK(cudaMemcpy(cu + j * eg, l.ue_h + size_t(R[j]) * eg, eg, cudaMemcpyHostToDevice));
-                        CK(cudaMemcpy(cd + j * ed, l.de_h + size_t(R[j]) * ed, ed, cudaMemcpyHostToDevice));
+                    CK(cudaMalloc(&raw, R.size() * std::max(eg, ed)));
+                    const uint8_t* src[3] = {l.ge_h, l.ue_h, l.de_h};
+                    uint8_t* dst[3] = {cg, cu, cd};
+                    for (int m = 0; m < 3; ++m) {
+                        const size_t eb = m < 2 ? eg : ed;
+                        for (size_t j = 0; j < R.size(); ++j) CK(cudaMemcpy(raw + j * eb, src[m] + size_t(R[j]) * eb, eb, cudaMemcpyHostToDevice));
+                        if (m < 2) repack(raw, dst[m], R.size() * kFfExp, kHidden, l.fmt_eg);
+                        else repack(raw, dst[m], R.size() * kHidden, kFfExp, l.fmt_ed);
+                        CK(cudaDeviceSynchronize());
                     }
+                    CK(cudaFree(raw));
                     loaded += R.size() * (2 * eg + ed);
                     l.ge = cg; l.ue = cu; l.de = cd;
                 }
@@ -781,6 +938,7 @@ struct Model {
         hy_serve();
         flint_cpu::set_active(false);
         ++pos;
+        ++n_steps;
     }
     void record() {
         k_embed<<<(kHidden / 8 + 63) / 64, 64, 0, st>>>(embed.d, embed.fmt, state, h);
@@ -791,9 +949,9 @@ struct Model {
             mv({{Tensor{(const uint8_t*) l.router, F32}, rl}}, {kExperts}, h, kHidden, l.ffn_norm);
             k_route<<<1, kExperts, 0, st>>>(rl, l.bias, idx, wts);
             k_hy_post<<<1, 256, 0, st>>>(h, idx, wts, hy_s_dev, hy_ctr);
-            k_moe_gu<<<kActRows / 8, 256, 0, st>>>(MoeGu{h, l.ffn_norm, l.ge, l.ue, l.gs.d, l.us.d, l.fmt_eg, l.gs.fmt, idx, l.slot,
-                                                         l.clamp_e, l.clamp_s, act});
-            k_moe_down<<<kHidden / 8, 256, 0, st>>>(MoeDown{h, act, l.de, l.ds.d, l.fmt_ed, l.ds.fmt, idx, l.slot, wts});
+            k_moe_gu<<<kActRows / 8, 256, 0, st>>>(MoeGu{h, l.ffn_norm, l.ge, l.ue, l.gs.d, l.us.d, aligned_fmt(l.fmt_eg), l.gs.fmt, idx,
+                                                         l.slot, l.clamp_e, l.clamp_s, act});
+            k_moe_down<<<kHidden / 8, 256, 0, st>>>(MoeDown{h, act, l.de, l.ds.d, aligned_fmt(l.fmt_ed), l.ds.fmt, idx, l.slot, wts});
             k_hy_wait_add<<<kHidden / 256, 256, 0, st>>>(h, hy_s_dev, hy_ctr);
         }
         mv({{head, logits}}, {157184}, h, kHidden, out_norm);
@@ -889,9 +1047,9 @@ struct Model {
             CK(cudaMemcpyAsync(hy_h, h, kHidden * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaMemcpyAsync(hy_idx, idx, kTopK * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaMemcpyAsync(hy_w, wts, kTopK * 4, cudaMemcpyDeviceToHost, st));
-            k_moe_gu<<<kActRows / 8, 256, 0, st>>>(MoeGu{h, l.ffn_norm, l.ge, l.ue, l.gs.d, l.us.d, l.fmt_eg, l.gs.fmt, idx, l.slot,
-                                                         l.clamp_e, l.clamp_s, act});
-            k_moe_down<<<kHidden / 8, 256, 0, st>>>(MoeDown{h, act, l.de, l.ds.d, l.fmt_ed, l.ds.fmt, idx, l.slot, wts});
+            k_moe_gu<<<kActRows / 8, 256, 0, st>>>(MoeGu{h, l.ffn_norm, l.ge, l.ue, l.gs.d, l.us.d, aligned_fmt(l.fmt_eg), l.gs.fmt, idx,
+                                                         l.slot, l.clamp_e, l.clamp_s, act});
+            k_moe_down<<<kHidden / 8, 256, 0, st>>>(MoeDown{h, act, l.de, l.ds.d, aligned_fmt(l.fmt_ed), l.ds.fmt, idx, l.slot, wts});
             CK(cudaStreamSynchronize(st));
             // LING_ROUTE_DUMP=FILE: each token's 8 experts a layer, as int16 records [layer, 1, 8 ids] (tools/flint/make_plan.py)
             static FILE* route_f = std::getenv("LING_ROUTE_DUMP") ? std::fopen(std::getenv("LING_ROUTE_DUMP"), "ab") : nullptr;
@@ -928,6 +1086,7 @@ struct Model {
     const uint8_t** wptr = nullptr;      // the grouped products' expert pointers: gate, up, down (3 x 512), device
     const uint8_t** wptr_h = nullptr;    // (pinned host copy)
     uint8_t* stg = nullptr;              // the chunk's routed experts the card does not hold, copied from the mapping
+    uint8_t* stg_raw = nullptr;          // (as copied, before the rearrangement into stg)
     size_t stg_bytes = 0;
     void pf_alloc(int T) {
         if (T <= pf_t) return;
@@ -1019,16 +1178,31 @@ struct Model {
             k_pscatter<<<(T * kTopK + 255) / 256, 256, 0, st>>>(pIdx, T, pBounds, pFill, pSrc, pSlot);
             CK(cudaMemcpyAsync(hCount, pCount, kExperts * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
+            static FILE* route_f = std::getenv("LING_ROUTE_DUMP") ? std::fopen(std::getenv("LING_ROUTE_DUMP"), "ab") : nullptr;
+            if (route_f) {   // [layer, T, T x 8 ids] (as the writing path's records)
+                std::vector<int> ix(size_t(T) * kTopK);
+                CK(cudaMemcpy(ix.data(), pIdx, ix.size() * 4, cudaMemcpyDeviceToHost));
+                std::vector<int16_t> rec(2 + ix.size());
+                rec[0] = int16_t(i); rec[1] = int16_t(T);
+                for (size_t j = 0; j < ix.size(); ++j) rec[2 + j] = int16_t(ix[j]);
+                std::fwrite(rec.data(), 2, rec.size(), route_f);
+            }
             // each used expert's three matrices: on the card already, or copied into the staging area
             const size_t eg = size_t(kFfExp) * row_bytes(l.fmt_eg, kHidden), ed = size_t(kHidden) * row_bytes(l.fmt_ed, kFfExp);
-            size_t need = 0;
-            for (int e = 0; e < kExperts; ++e) if (hCount[e] && l.slot_h[e] < 0) need += 2 * eg + ed;
+            int nst = 0;
+            for (int e = 0; e < kExperts; ++e) if (hCount[e] && l.slot_h[e] < 0) ++nst;
+            const size_t need = size_t(nst) * (2 * eg + ed);
             if (need > stg_bytes) {
-                if (stg) CK(cudaFree(stg));
+                if (stg) { CK(cudaFree(stg)); CK(cudaFree(stg_raw)); }
                 stg_bytes = std::max(need, size_t(64) << 20);
                 CK(cudaMalloc(&stg, stg_bytes));
+                CK(cudaMalloc(&stg_raw, stg_bytes));
             }
-            size_t off = 0;
+            // staged experts: gates, then ups, then downs, each a contiguous run (raw copies, then one rearrangement a run)
+            uint8_t* rg = stg_raw;
+            uint8_t* ru = rg + size_t(nst) * eg;
+            uint8_t* rd = ru + size_t(nst) * eg;
+            int j = 0;
             for (int e = 0; e < kExperts; ++e) {
                 wptr_h[e] = wptr_h[kExperts + e] = wptr_h[2 * kExperts + e] = nullptr;
                 if (!hCount[e]) continue;
@@ -1037,16 +1211,24 @@ struct Model {
                     wptr_h[e] = l.ge + sl * eg; wptr_h[kExperts + e] = l.ue + sl * eg; wptr_h[2 * kExperts + e] = l.de + sl * ed;
                     continue;
                 }
-                CK(cudaMemcpyAsync(stg + off, l.ge_h + size_t(e) * eg, eg, cudaMemcpyHostToDevice, st)); wptr_h[e] = stg + off; off += eg;
-                CK(cudaMemcpyAsync(stg + off, l.ue_h + size_t(e) * eg, eg, cudaMemcpyHostToDevice, st)); wptr_h[kExperts + e] = stg + off; off += eg;
-                CK(cudaMemcpyAsync(stg + off, l.de_h + size_t(e) * ed, ed, cudaMemcpyHostToDevice, st)); wptr_h[2 * kExperts + e] = stg + off; off += ed;
+                CK(cudaMemcpyAsync(rg + j * eg, l.ge_h + size_t(e) * eg, eg, cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(ru + j * eg, l.ue_h + size_t(e) * eg, eg, cudaMemcpyHostToDevice, st));
+                CK(cudaMemcpyAsync(rd + j * ed, l.de_h + size_t(e) * ed, ed, cudaMemcpyHostToDevice, st));
+                wptr_h[e] = stg + (rg - stg_raw) + j * eg;
+                wptr_h[kExperts + e] = stg + (ru - stg_raw) + j * eg;
+                wptr_h[2 * kExperts + e] = stg + (rd - stg_raw) + j * ed;
+                ++j;
+            }
+            if (nst) {
+                repack(rg, stg + (rg - stg_raw), size_t(2 * nst) * kFfExp, kHidden, l.fmt_eg, st);   // (gates and ups together)
+                repack(rd, stg + (rd - stg_raw), size_t(nst) * kHidden, kFfExp, l.fmt_ed, st);
             }
             CK(cudaMemcpyAsync(wptr, wptr_h, 3 * kExperts * sizeof(void*), cudaMemcpyHostToDevice, st));
             const int S = T * kTopK;
-            gemm_grp(wptr, l.fmt_eg, kFfExp, kHidden, pX, kHidden, pSrc, pAG, kFfExp, S);
-            gemm_grp(wptr + kExperts, l.fmt_eg, kFfExp, kHidden, pX, kHidden, pSrc, pAU, kFfExp, S);
+            gemm_grp(wptr, aligned_fmt(l.fmt_eg), kFfExp, kHidden, pX, kHidden, pSrc, pAG, kFfExp, S);
+            gemm_grp(wptr + kExperts, aligned_fmt(l.fmt_eg), kFfExp, kHidden, pX, kHidden, pSrc, pAU, kFfExp, S);
             k_pswiglu<<<(unsigned) ((size_t(S) * kFfExp + 255) / 256), 256, 0, st>>>(pAG, pAU, size_t(S) * kFfExp, l.clamp_e);
-            gemm_grp(wptr + 2 * kExperts, l.fmt_ed, kHidden, kFfExp, pAG, kFfExp, nullptr, pY, kHidden, S);
+            gemm_grp(wptr + 2 * kExperts, aligned_fmt(l.fmt_ed), kHidden, kFfExp, pAG, kFfExp, nullptr, pY, kHidden, S);
             k_pcombine<<<T, 256, 0, st>>>(pH, pY, pSlot, pW);
             CK(cudaStreamSynchronize(st));   // (wptr_h and the staging area are reused by the next layer)
         }
@@ -1109,6 +1291,28 @@ int main(int argc, char** argv) {
     { std::stringstream ss(ids_s); for (std::string v; std::getline(ss, v, ',');) if (v.find_first_not_of(" \n\r\t") != std::string::npos) ids.push_back(std::stoi(v)); }
     if (path.empty() || ids.empty()) { std::fprintf(stderr, "strata-ling: --model and --ids are needed\n"); return 2; }
     const auto t0 = std::chrono::steady_clock::now();
+    if (const char* tn = std::getenv("LING_FMT_TEST")) {   // (checking) one tensor's rows 0..3, both layouts
+        strata::GgufFile g1(path);
+        std::string p2 = path; p2.replace(p2.find("-00001-of-"), 10, "-00002-of-");
+        strata::GgufFile g2(p2);
+        const strata::GgufFile* o = g1.find(tn) ? &g1 : &g2;
+        const auto* t = o->find(tn);
+        const int fmt = int(t->type), K = int(t->shape[0]);
+        const size_t rb = row_bytes(fmt, K) * 4;
+        uint8_t *raw, *al;
+        float* out;
+        CK(cudaMalloc(&raw, rb)); CK(cudaMalloc(&al, rb)); CK(cudaMalloc(&out, size_t(4) * K * 8));
+        CK(cudaMemcpy(raw, o->tensor_data(*t), rb, cudaMemcpyHostToDevice));
+        k_repack<<<(4 * (fmt == Q6_K ? K / 256 : K / 32) + 255) / 256, 256>>>(raw, al, 4, K, fmt);
+        k_fmt_test<<<4, (K / 8 + 31) / 32 * 32>>>(raw, al, fmt, K, out);
+        std::vector<float> h(size_t(4) * K * 2);
+        CK(cudaMemcpy(h.data(), out, h.size() * 4, cudaMemcpyDeviceToHost));
+        int bad = 0;
+        for (size_t i = 0; i < size_t(4) * K; ++i)
+            if (h[2 * i] != h[2 * i + 1] && bad++ < 8) std::printf("value %zu (row %zu, col %zu): %g vs %g\n", i, i / K, i % K, h[2 * i], h[2 * i + 1]);
+        std::printf("%s (type %d, K %d): %d of %d values differ\n", tn, fmt, K, bad, 4 * K);
+        return 0;
+    }
     Model m(path, ctx);
     std::fprintf(stderr, "strata-ling: %.1f GB on the card in %.1f s\n", m.loaded / 1e9,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
@@ -1152,7 +1356,7 @@ int main(int argc, char** argv) {
                  ids.size() / read_s, n_new, write_s, n_new / std::max(write_s, 1e-9));
     if (m.hy_card_experts + m.hy_cpu_experts)
         std::fprintf(stderr, "strata-ling: %.0f%% of the chosen experts on the card; a token: %.2f ms waiting for the card, %.2f ms on the CPU\n",
-                     100.0 * m.hy_card_experts / double(m.hy_card_experts + m.hy_cpu_experts), m.hy_t_wait * 1e3 / std::max<int>(1, m.pos),
-                     m.hy_t_cpu * 1e3 / std::max<int>(1, m.pos));
+                     100.0 * m.hy_card_experts / double(m.hy_card_experts + m.hy_cpu_experts), m.hy_t_wait * 1e3 / std::max<size_t>(1, m.n_steps),
+                     m.hy_t_cpu * 1e3 / std::max<size_t>(1, m.n_steps));
     return 0;
 }
