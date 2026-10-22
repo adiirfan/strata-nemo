@@ -11,7 +11,7 @@ R9700 and low-RAM patches from [strata-patches](https://github.com/adiirfan/stra
 now [README-STRATA.md](README-STRATA.md). The new code is in `src/nemotron/`, with some new kernels in
 `src/kernels/cuda/iq_kernels.cu` and `src/prefill/`.
 
-This `flint` branch adds a second program for [Recursive Flint](https://huggingface.co/RecursiveSI/flint): see
+A second program runs [Recursive Flint](https://huggingface.co/RecursiveSI/flint): see
 [Recursive Flint](#recursive-flint) below.
 
 ## Recursive Flint
