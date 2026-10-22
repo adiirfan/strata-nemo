@@ -1012,6 +1012,7 @@ struct Layer {
     const uint8_t *ge = nullptr, *ue = nullptr, *de = nullptr;         // the card's (by slot)
     int* slot = nullptr;
     std::vector<int> slot_h;
+    std::vector<float> heat;              // the adaptive tier: each expert's recent routing (Model::adapt)
     std::vector<float> ffn_norm_h;
 };
 
@@ -1185,6 +1186,7 @@ struct Model {
                 l.clamp_s = i < int(clamp_shexp.size()) ? clamp_shexp[i] : 0.f;
                 // the plan's experts packed on the card (slot order); the rest stay in the file mapping for the CPU
                 l.slot_h.assign(kExperts, -1);
+                l.heat.assign(kExperts, 0.f);
                 const std::vector<int>& R = plan[i];
                 for (size_t j = 0; j < R.size(); ++j) l.slot_h[R[j]] = int(j);
                 CK(cudaMalloc(&l.slot, kExperts * 4));
@@ -1270,6 +1272,7 @@ struct Model {
         flint_cpu::set_active(false);
         ++pos;
         ++n_steps;
+        adapt_after_step();
     }
     void record() {
         k_embed<<<(kHidden / 8 + 63) / 64, 64, 0, st>>>(embed.d, embed.fmt, state, h);
@@ -1318,7 +1321,9 @@ struct Model {
             const size_t eb_gu = size_t(kFfExp) * row_bytes(l.fmt_eg, kHidden), eb_d = size_t(kHidden) * row_bytes(l.fmt_ed, kFfExp);
             for (int k = 0; k < kTopK; ++k) {
                 const int e = S->idx[k];
+                heat_l(i)[e] += heat_inc;
                 if (l.slot_h[e] >= 0) { ++hy_card_experts; continue; }
+                missed.push_back({i, e});
                 ex[n] = {l.ge_h + size_t(e) * eb_gu, l.ue_h + size_t(e) * eb_gu, l.de_h + size_t(e) * eb_d};
                 w[n++] = S->w[k];
             }
@@ -1639,6 +1644,21 @@ struct Model {
                 gemm_grp_w(wptr + 2 * kExperts, aligned_fmt(l.fmt_ed), kHidden, kFfExp, nullptr, pY, kHidden, S);
             }
             k_pcombine<<<T, 256, 0, st>>>(pH, pY, pSlot, pW);
+            // the adaptive tier: this chunk's routing counted, then its hottest staged experts promoted (copied on the card)
+            for (int e = 0; e < kExperts; ++e) l.heat[e] += float(hCount[e]) * heat_inc;
+            if (adapt_on() && l.ge) {
+                static const int budget = std::getenv("LING_SWAPS_PROMPT") ? std::atoi(std::getenv("LING_SWAPS_PROMPT")) : 64;
+                std::sort(pend.begin(), pend.end(), [&](int a, int b) { return l.heat[a] > l.heat[b]; });
+                int done = 0;
+                for (int e : pend) {
+                    if (done >= budget) break;
+                    const int c = coldest(l);
+                    if (c < 0 || !worth(l, e, c)) break;
+                    swap_in(l, e, c, wptr_h[e], wptr_h[kExperts + e], wptr_h[2 * kExperts + e]);
+                    ++done;
+                }
+                if (done) push_slots(l);
+            }
             CK(cudaStreamSynchronize(st));   // (wptr_h and the staging area are reused by the next layer)
         }
         // the last row through the head (the writing path's kernel), its argmax the next token
@@ -1648,6 +1668,75 @@ struct Model {
         k_argmax<<<1, 1024, 0, st>>>(logits, 157184, state);
         CK(cudaStreamSynchronize(st));
         pos = p0 + T;
+        heat_tick(T);
+    }
+    // ---- the adaptive tier (as Strata's for Qwen Next): the card's expert slots follow the routing. Each layer keeps
+    // its plan's number of slots; an expert the CPU computed that is now hotter than the layer's coldest resident one
+    // takes that one's slot. heat decays (the increment grows 0.2% a token: a half-life of about 350 tokens). Writing:
+    // up to LING_SWAPS (2) swaps after a token, copied from the file mapping. The prompt path: up to LING_SWAPS_PROMPT
+    // (64) a layer a chunk, copied from its staging area on the card. LING_ADAPT=0 keeps the plan fixed.
+    float heat_inc = 1.f;
+    std::vector<std::pair<int, int>> missed;            // this token's CPU experts (layer, expert)
+    size_t n_swaps = 0;
+    std::vector<float>& heat_l(int i) { return L[i].heat; }
+    bool adapt_on() const { static const bool on = !(std::getenv("LING_ADAPT") && std::atoi(std::getenv("LING_ADAPT")) == 0); return on; }
+    void heat_tick(int tokens) {
+        heat_inc *= std::pow(1.002f, float(tokens));
+        if (heat_inc > 1e20f) {   // (rescaled before it overflows)
+            for (auto& l : L) for (auto& v : l.heat) v /= heat_inc;
+            heat_inc = 1.f;
+        }
+    }
+    // the layer's coldest resident expert, or -1 (no slots)
+    int coldest(const Layer& l) const {
+        int c = -1;
+        for (int e = 0; e < kExperts; ++e) if (l.slot_h[e] >= 0 && (c < 0 || l.heat[e] < l.heat[c])) c = e;
+        return c;
+    }
+    bool worth(const Layer& l, int e_in, int e_out) const { return l.heat[e_in] > 1.25f * l.heat[e_out] + 2.f * heat_inc; }
+    // e_in into e_out's slot: its three matrices from the device copies given (aligned already), or from the mapping
+    void swap_in(Layer& l, int e_in, int e_out, const uint8_t* dg = nullptr, const uint8_t* du = nullptr, const uint8_t* dd = nullptr) {
+        const int sl = l.slot_h[e_out];
+        const size_t eg = size_t(kFfExp) * row_bytes(l.fmt_eg, kHidden), ed = size_t(kHidden) * row_bytes(l.fmt_ed, kFfExp);
+        uint8_t* g = (uint8_t*) l.ge + size_t(sl) * eg;
+        uint8_t* u = (uint8_t*) l.ue + size_t(sl) * eg;
+        uint8_t* d = (uint8_t*) l.de + size_t(sl) * ed;
+        if (dg) {
+            CK(cudaMemcpyAsync(g, dg, eg, cudaMemcpyDeviceToDevice, st));
+            CK(cudaMemcpyAsync(u, du, eg, cudaMemcpyDeviceToDevice, st));
+            CK(cudaMemcpyAsync(d, dd, ed, cudaMemcpyDeviceToDevice, st));
+        } else {
+            stage_alloc();
+            CK(cudaMemcpyAsync(stg_raw, l.ge_h + size_t(e_in) * eg, eg, cudaMemcpyHostToDevice, st));
+            CK(cudaMemcpyAsync(stg_raw + eg, l.ue_h + size_t(e_in) * eg, eg, cudaMemcpyHostToDevice, st));
+            CK(cudaMemcpyAsync(stg_raw + 2 * eg, l.de_h + size_t(e_in) * ed, ed, cudaMemcpyHostToDevice, st));
+            repack(stg_raw, g, kFfExp, kHidden, l.fmt_eg, st);
+            repack(stg_raw + eg, u, kFfExp, kHidden, l.fmt_eg, st);
+            repack(stg_raw + 2 * eg, d, kHidden, kFfExp, l.fmt_ed, st);
+        }
+        l.slot_h[e_in] = sl;
+        l.slot_h[e_out] = -1;
+        ++n_swaps;
+    }
+    void push_slots(Layer& l) { CK(cudaMemcpyAsync(l.slot, l.slot_h.data(), kExperts * 4, cudaMemcpyHostToDevice, st)); }
+    void adapt_after_step() {
+        heat_tick(1);
+        if (!adapt_on() || missed.empty()) { missed.clear(); return; }
+        static const int budget = std::getenv("LING_SWAPS") ? std::atoi(std::getenv("LING_SWAPS")) : 2;
+        // the hottest of this token's misses first
+        std::sort(missed.begin(), missed.end(), [&](const auto& a, const auto& b) { return L[a.first].heat[a.second] > L[b.first].heat[b.second]; });
+        int done = 0;
+        for (const auto& m : missed) {
+            if (done >= budget) break;
+            Layer& l = L[m.first];
+            if (l.slot_h[m.second] >= 0) continue;
+            const int c = coldest(l);
+            if (c < 0 || !worth(l, m.second, c)) continue;
+            swap_in(l, m.second, c);
+            push_slots(l);
+            ++done;
+        }
+        missed.clear();
     }
     std::vector<float> dumped;
     void dump_h() {
@@ -1803,6 +1892,7 @@ int main(int argc, char** argv) {
     const double write_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count();
     std::fprintf(stderr, "strata-ling: read %zu in %.3f s (%.1f per second), wrote %d in %.2f s (%.2f per second)\n", ids.size(), read_s,
                  ids.size() / read_s, n_new, write_s, n_new / std::max(write_s, 1e-9));
+    if (m.n_swaps) std::fprintf(stderr, "strata-ling: %zu experts moved onto the card\n", m.n_swaps);
     if (m.hy_card_experts + m.hy_cpu_experts)
         std::fprintf(stderr, "strata-ling: %.0f%% of the chosen experts on the card; a token: %.2f ms waiting for the card, %.2f ms on the CPU\n",
                      100.0 * m.hy_card_experts / double(m.hy_card_experts + m.hy_cpu_experts), m.hy_t_wait * 1e3 / std::max<size_t>(1, m.n_steps),
